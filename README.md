@@ -1,1 +1,1 @@
-# JuniorProject-Optimization-For-Scheduling
+# scheduling-optimization-tool
