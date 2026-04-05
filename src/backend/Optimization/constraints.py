@@ -1,5 +1,5 @@
 #function to check instructor conflicts
-def checkInstructors(schedule):
+def check_instructors(schedule,data=None):
 
     seen = set()
 
@@ -14,7 +14,7 @@ def checkInstructors(schedule):
     return True  #no conflicts
 
 #function to check room confilct
-def checkRoom(schedule):
+def check_room(schedule,data=None):
 
     seen = set()
 
@@ -57,7 +57,7 @@ def get_building_campus(building):
 
     return "MEDICAL"
 
-def checkCampus(schedule,rooms):
+def check_campus(schedule,rooms):
 
     # Build room lookup
     room_map = {room.room_id: room for room in rooms}
@@ -67,7 +67,7 @@ def checkCampus(schedule,rooms):
 
         room = room_map.get(item.room_id)
         if not room:
-            continue
+            raise KeyError(f"Room ID {item.room_id} not found")
 
         building_campus = get_building_campus(room.building)
 
@@ -76,3 +76,6 @@ def checkCampus(schedule,rooms):
             return False
 
     return True
+#check all constraints
+def check_constraints(schedule, data, constraints):
+    return all(constraint(schedule, data) for constraint in constraints)
