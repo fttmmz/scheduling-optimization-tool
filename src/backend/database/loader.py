@@ -1,6 +1,15 @@
 from models.models import Course, Instructor, Room, TimeSlot, ScheduleDetail
 from database.db import supabase 
 
+#scheduling data
+class SchedulingData:
+    def __init__(self, courses, rooms, timeslots, instructors, mapping):
+        self.courses = courses
+        self.rooms = rooms
+        self.timeslots = timeslots
+        self.instructors = instructors
+        self.mapping = mapping
+
 class DataLoader:
 
     def load_courses(self):
@@ -38,22 +47,21 @@ class DataLoader:
 
         return mapping
 
-    def load_all(self):
+    def getSchedulingData(self):
         courses = self.load_courses()
-        instructors = self.load_instructors()
         rooms = self.load_rooms()
         timeslots = self.load_timeslots()
+        instructors = self.load_instructors()
         schedule_details = self.load_schedule_details()
 
-        course_instructor_map = self.build_course_instructor_map(schedule_details)
+        mapping =self.build_course_instructor_map(schedule_details)
 
-        return {
-            "courses": courses,
-            "instructors": instructors,
-            "rooms": rooms,
-            "timeslots": timeslots,
-            "schedule_details": schedule_details,
-            "course_instructor_map": course_instructor_map
-    }
+        return SchedulingData(
+            courses,
+            rooms,
+            timeslots,
+            instructors,
+            mapping
+        )
 
 
