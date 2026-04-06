@@ -4,14 +4,9 @@ from algorithms.genetic import genetic_schedule
 
 
 class SchedulingEngine:
-    #engine to select algorithm, apply constraints, and return schedule
-
     def __init__(self, algorithm_name, constraints):
-        #store algorithm name and constraints checker
         self.algorithm_name = algorithm_name
         self.constraints = constraints
-
-        #select the algorithm function
         self.algorithm = self.select_algorithm()
 
     #choose the scheduling algorithm
@@ -21,20 +16,29 @@ class SchedulingEngine:
         elif self.algorithm_name == "genetic":
             return genetic_schedule
         else:
-            #invalid algorithm
-            raise ValueError(f"Invalid algorithm: {self.algorithm_name}")
+            raise ValueError("Invalid algorithm")
 
     #run the scheduling process
     def run(self, data):
-        #check if data is missing or empty
-        if not data:
-            raise ValueError("Data is empty or not provided")
 
-        #check required keys exist
-        required_keys = ["courses", "rooms", "timeslots", "instructors", "course_instructor_map"]
-        if not all(key in data for key in required_keys):
-            missing = [key for key in required_keys if key not in data]
-            raise ValueError(f"Missing data: {missing}")
+        #check all required data is provided
+        if not data:
+            raise ValueError("No data provided")
+
+        if "courses" not in data:
+            raise ValueError("Courses missing")
+
+        if "rooms" not in data:
+            raise ValueError("Rooms missing")
+
+        if "timeslots" not in data:
+            raise ValueError("Timeslots missing")
+
+        if "instructors" not in data:
+            raise ValueError("Instructors missing")
+
+        if "course_instructor_map" not in data:
+            raise ValueError("Course-instructor map missing")
 
         #print which algorithm is used
         print(f"Using {self.algorithm_name} algorithm")
