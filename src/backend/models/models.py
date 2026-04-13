@@ -1,39 +1,44 @@
 class Course:
-    def __init__(self, data):
-        self.course_id = data["course_id"]
-        self.name = data["name"]
-        self.credits = data["credits"]
-        self.dept_id = data["dept_id"]
-
-
+    def __init__(self, id, name, type):
+        self.id =id
+        self.name =name
+        self.type = type
 class Room:
     def __init__(self, data):
-        self.room_id = data["room_id"]
+        self.id = data["room_id"]
         self.capacity = data["capacity"]
-        self.room_type = data["room_type"]
+        self.type = data["room_type"]
+        self.building = data["building"]
 
-
-class TimeSlot:
+class Timeslot:
     def __init__(self, data):
-        self.timeslot_id = data["timeslot_id"]
+        self.id = data["timeslot_id"]
         self.day = data["day"]
         self.start = data["start_time"]
         self.end = data["end_time"]
-class Instructor:
-    def __init__(self, data):
-        self.inst_id = data["inst_id"]
-        self.name = data["name"]
-        self.dept_id=data["dept_id"]
-class ScheduleDetail:
-    def __init__(self, data):
-        self.course_id = data["course_id"]
-        self.instructor_id = data["instructor_id"]
-        self.section=data["section"]
 
-class ScheduleItem:
-    def __init__(self, course_id, instructor_id, room_id, timeslot_id,section):
-        self.course_id = course_id
-        self.instructor_id = instructor_id
-        self.room_id = room_id
-        self.timeslot_id = timeslot_id
+class Section:
+    def __init__(self, data):
+        self.course = Course(
+            id=data["courses"]["course_id"],
+            name=data["courses"]["name"],
+            type=data["courses"]["course_type"],
+            )
+        self.instructor_id = data["instructor_id"]
+        self.no = data["section"]
+        self.capacity=data["sec_capacity"]
+
+class scheduled_item:
+    def __init__(self, section, room, timeslot):
         self.section = section
+        self.room = room
+        self.timeslot = timeslot
+
+    def __repr__(self):
+        return (
+            f"scheduled_item(course={self.section.course.id}, "
+            f"section={self.section.no}, "
+            f"instructor={self.section.instructor_id}, "
+            f"room={self.room.id}, "
+            f"timeslot={self.timeslot.id})"
+        )

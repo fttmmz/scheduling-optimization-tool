@@ -1,67 +1,44 @@
-from models.models import Course, Instructor, Room, TimeSlot, ScheduleDetail
+import os
+import sys
+
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if ROOT_DIR not in sys.path:
+    sys.path.insert(0, ROOT_DIR)
+
+from models.models import Timeslot, Room, Section
 from database.db import supabase 
 
-#scheduling data
-class SchedulingData:
-    def __init__(self, courses, rooms, timeslots, instructors, mapping):
-        self.courses = courses
-        self.rooms = rooms
-        self.timeslots = timeslots
-        self.instructors = instructors
-        self.mapping = mapping
+def load_rooms():
+    res = supabase.table("room").select("*").execute()
+    return [Room(row) for row in res.data]
 
-class DataLoader:
-
-    def load_courses(self):
-        res = supabase.table("courses").select("*").execute()
-        return [Course(row) for row in res.data]
-
-    def load_rooms(self):
-        res = supabase.table("room").select("*").execute()
-        return [Room(row) for row in res.data]
-
-    def load_timeslots(self):
-        res = supabase.table("timeslot").select("*").execute()
-        return [TimeSlot(row) for row in res.data]
+def load_timeslots():
+    res = supabase.table("timeslot").select("*").execute()
+    return [Timeslot(row) for row in res.data]
     
-    def load_instructors(self):
-        res=supabase.table("instructor").select("*").execute()
-        return [Instructor(row) for row in res.data]
     
-    def load_schedule_details(self):  
-        res = supabase.table("schedule_details").select("*").execute()
-        return [ScheduleDetail(row) for row in res.data]
     
-    def build_course_instructor_map(self, schedule_details):
-        mapping = {}
+def load_section_details():  
+    sections_data = []
+    page_size = 1000
+    offset = 0
 
-        for detail in schedule_details:
-            c_id = detail.course_id
-            i_id = detail.instructor_id
+    while True:
+        res = supabase.table("schedule_detailes").select("*, courses(*)").range(offset, offset + page_size - 1).execute()
+        sections_data.extend(res.data)
+        
+        if len(res.data) < page_size:  # no more rows left
+            break
+        offset += page_size
 
-            if c_id not in mapping:
-                mapping[c_id] = set()
+    return [Section(row) for row in sections_data]     
 
-            if i_id is not None:
-                mapping[c_id].add(i_id)
+def get_scheduling_data():
+    rooms = load_rooms()
+    timeslots = load_timeslots()
+    sections = load_section_details()
+    return rooms, timeslots, sections
 
-        return mapping
 
-    def getSchedulingData(self):
-        courses = self.load_courses()
-        rooms = self.load_rooms()
-        timeslots = self.load_timeslots()
-        instructors = self.load_instructors()
-        schedule_details = self.load_schedule_details()
-
-        mapping =self.build_course_instructor_map(schedule_details)
-
-        return SchedulingData(
-            courses,
-            rooms,
-            timeslots,
-            instructors,
-            mapping
-        )
 
 
