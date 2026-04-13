@@ -7,8 +7,8 @@ from dotenv import load_dotenv
 #connect to database via supabase
 load_dotenv()
 
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+SUPABASE_URL = os.getenv("NEXT_PUBLIC_SUPABASE_URL")
+SUPABASE_KEY = os.getenv("NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY")
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 print("Connected to Supabase!")
@@ -22,7 +22,7 @@ tables = [
 ]
 
 #loop thorough all tables 
-for table in tables:
-    print(f"\nTable: {table}")
-    data = supabase.table(table).select("*").execute()
-print("\ndone")
+# for table in tables:
+#     print(f"\nTable: {table}")
+#     data = supabase.table(table).select("*").execute()
+# print("\ndone")
