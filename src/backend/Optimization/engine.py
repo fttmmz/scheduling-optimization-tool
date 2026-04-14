@@ -1,59 +1,81 @@
-#import scheduling algorithms
-from algorithms.greedy import greedy_schedule
-from algorithms.genetic import genetic_schedule
+from backend.Optimization.Algorithims.code3 import greedy_schedule
+from backend.Optimization.constraints import classify_section
+
+# Registry:  new algorithms are added here
+ALGORITHM_REGISTRY = {
+    "greedy": greedy_schedule,
+    # "genetic": genetic_schedule,
+    
+}
 
 
 class SchedulingEngine:
-    def __init__(self, algorithm_name, constraints):
+    """
+    All algorithms must accept (sections, timeslots, rooms) and return a list
+    of ScheduleItem.  Any algorithm-specific pre/post processing lives in its
+    own module  not here.
+    """
+
+    def __init__(self, algorithm_name: str):
+        if algorithm_name not in ALGORITHM_REGISTRY:
+            raise ValueError(
+                f"Unknown algorithm '{algorithm_name}'. "
+                f"Available: {list(ALGORITHM_REGISTRY.keys())}"
+            )
         self.algorithm_name = algorithm_name
-        self.constraints = constraints
-        self.algorithm = self.select_algorithm()
+        self.algorithm = ALGORITHM_REGISTRY[algorithm_name]
+        self.last_graph = None  # exposed so callers (e.g. main.py) can render it
 
-    #choose the scheduling algorithm
-    def select_algorithm(self):
-        if self.algorithm_name == "greedy":
-            return greedy_schedule
-        elif self.algorithm_name == "genetic":
-            return genetic_schedule
-        else:
-            raise ValueError("Invalid algorithm")
+    def run(self, data: dict) -> list:
+        """
+        Run the selected algorithm against the scheduling data dict.
 
-    #run the scheduling process
-    def run(self, data):
+        Expected keys in `data`:
+            sections  — list of Section objects
+            timeslots — list of Timeslot objects
+            rooms     — list of Room objects
 
-        #check all required data is provided
-        if not data:
+        Returns a list of ScheduleItem.
+        """
+        if data is None:
             raise ValueError("No data provided")
 
-        if "courses" not in data:
-            raise ValueError("Courses missing")
+        missing = [k for k in ("sections", "timeslots", "rooms") if k not in data]
+        if missing:
+            raise ValueError(f"Data dict is missing required keys: {missing}")
 
-        if "rooms" not in data:
-            raise ValueError("Rooms missing")
+        sections = data["sections"]
+        timeslots = data["timeslots"]
+        rooms = data["rooms"]
 
-        if "timeslots" not in data:
-            raise ValueError("Timeslots missing")
-
-        if "instructors" not in data:
-            raise ValueError("Instructors missing")
-
-        if "course_instructor_map" not in data:
-            raise ValueError("Course-instructor map missing")
-
-        #print which algorithm is used
-        print(f"Using {self.algorithm_name} algorithm")
-
-        #run the algorithm with data and constraints
-        result = self.algorithm(
-            courses=data["courses"],
-            rooms=data["rooms"],
-            timeslots=data["timeslots"],
-            instructors=data["instructors"],
-            mapping=data["course_instructor_map"],
-            constraints=self.constraints
+        print(
+            f"[SchedulingEngine] Running '{self.algorithm_name}' "
+            f"on {len(sections)} sections, "
+            f"{len(timeslots)} timeslots, "
+            f"{len(rooms)} rooms"
         )
 
-        print("Schedule completed")
+        
+        # self.last_graph = build_conflict_graph(sections)
 
-        #return final schedule
-        return result
+        result = self.algorithm(sections, timeslots, rooms)
+
+        section_lookup = {
+            (section.course.id, section.no): section for section in sections
+        }
+        scheduled = 0
+        for item in result:
+            if item.room_id is not None or item.timeslot_id is not None:
+                scheduled += 1
+                continue
+
+            section = section_lookup.get((item.course_id, item.section))
+            if section is not None and classify_section(section) == "NEEDS_NOTHING":
+                scheduled += 1
+
+        unscheduled = len(result) - scheduled
+        print(
+            f"[SchedulingEngine] Done — {scheduled} scheduled, {unscheduled} unscheduled"
+        )
+
+        return result, scheduled, unscheduled
