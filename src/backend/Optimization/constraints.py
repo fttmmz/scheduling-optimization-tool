@@ -145,7 +145,7 @@ def get_building_campus(building) -> str:
             return "MEDICAL"
         if 1 <= num <= 6:
             return "MEN"
-        if 7 <= num <= 10:
+        if 7 <= num <= 12:
             return "MAIN"
 
     elif building.startswith("W"):
@@ -155,7 +155,7 @@ def get_building_campus(building) -> str:
             return "MEDICAL"
         if 1 <= num <= 6:
             return "WOMEN"
-        if 7 <= num <= 10:
+        if 7 <= num <= 12:
             return "MAIN"
 
     return "MEDICAL"
@@ -246,6 +246,20 @@ def is_room_free(schedule: list, room_id, timeslot_id) -> bool:
     return True
 
 
+def is_instructor_free_map(occupied_instructors: set, instructor_id, timeslot_id) -> bool:
+    """instructor availability check using a prebuilt set."""
+    if instructor_id is None or timeslot_id is None:
+        return True
+    return (instructor_id, timeslot_id) not in occupied_instructors
+
+
+def is_room_free_map(occupied_rooms: set, room_id, timeslot_id) -> bool:
+    """room availability check using a prebuilt set."""
+    if room_id is None or timeslot_id is None:
+        return True
+    return (room_id, timeslot_id) not in occupied_rooms
+
+
 def is_room_type_match(section, room) -> bool:
     """
     The required room type (derived from course type) must equal the
@@ -297,20 +311,45 @@ def is_campus_match(section, room) -> bool:
     return section_campus == building_campus
 
 
-def passes_hard_constraints(section, room, timeslot, schedule: list) -> bool:
+def passes_hard_constraints(
+    section,
+    room,
+    timeslot,
+    schedule: list = None,
+    occupied_instructors: set = None,
+    occupied_rooms: set = None,
+) -> bool:
     """
-    Convenience: run ALL hard constraints for a candidate (section, room, timeslot)
-    against the partial schedule already built.
+    Convenience: run ALL hard constraints for a candidate (section, room, timeslot).
 
-    Returns True only if every hard constraint is satisfied.
+    If occupancy maps are provided, use those for instructor/room checks
+    instead of scanning the partial schedule.
     """
-    return (
-        is_instructor_free(
+    if occupied_instructors is not None:
+        instructor_free = is_instructor_free_map(
+            occupied_instructors,
+            section.instructor_id,
+            timeslot.id if timeslot else None,
+        )
+    else:
+        instructor_free = is_instructor_free(
             schedule, section.instructor_id, timeslot.id if timeslot else None
         )
-        and is_room_free(
+
+    if occupied_rooms is not None:
+        room_free = is_room_free_map(
+            occupied_rooms,
+            room.id if room else None,
+            timeslot.id if timeslot else None,
+        )
+    else:
+        room_free = is_room_free(
             schedule, room.id if room else None, timeslot.id if timeslot else None
         )
+
+    return (
+        instructor_free
+        and room_free
         and is_room_type_match(section, room)
         and is_department_match(section, room)
         and is_capacity_ok(section, room)

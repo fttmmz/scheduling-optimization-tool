@@ -1,11 +1,12 @@
-from backend.Optimization.Algorithims.code3 import greedy_schedule
+from backend.Optimization.Algorithims.code3 import greedy1_schedule
+from backend.Optimization.Algorithims.greedy import greedy2_schedule
 from backend.Optimization.constraints import classify_section
-
+from backend.Optimization.Algorithims.genetic import genetic_schedule
 # Registry:  new algorithms are added here
 ALGORITHM_REGISTRY = {
-    "greedy": greedy_schedule,
-    # "genetic": genetic_schedule,
-    
+    "greedy1": greedy1_schedule,
+    "greedy2": greedy2_schedule,
+    "genetic": genetic_schedule,
 }
 
 
@@ -24,7 +25,7 @@ class SchedulingEngine:
             )
         self.algorithm_name = algorithm_name
         self.algorithm = ALGORITHM_REGISTRY[algorithm_name]
-        self.last_graph = None  # exposed so callers (e.g. main.py) can render it
+        #self.last_graph = None  # exposed so callers (e.g. main.py) can render it
 
     def run(self, data: dict) -> list:
         """
