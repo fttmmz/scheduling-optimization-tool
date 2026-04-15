@@ -1,70 +1,95 @@
-from models import ScheduleItem
+from backend.Optimization.constraints import (
+    get_valid_timeslots,
+    passes_hard_constraints,
+    is_room_type_match,
+    is_department_match,
+    is_capacity_ok,
+    is_campus_match,
+)
+from backend.models.models import ScheduleItem
 
 
-def greedy_schedule(courses, rooms, timeslots, instructors, mapping, constraints):
-    """
-    Greedy scheduling algorithm.
-    Assigns each course the first available room + timeslot
-    that satisfies all constraints (instructor, room, campus).
+def get_viable_rooms(section, rooms):
+    """Return rooms that satisfy the section's static constraints."""
+    return [
+        room
+        for room in rooms
+        if is_room_type_match(section, room)
+        and is_department_match(section, room)
+        and is_capacity_ok(section, room)
+        and is_campus_match(section, room)
+    ]
 
-    Parameters:
-        courses    : list of Course objects
-        rooms      : list of Room objects
-        timeslots  : list of TimeSlot objects
-        instructors: list of Instructor objects
-        mapping    : dict mapping course_id -> instructor_id or dict with instructor_id + section
-        constraints: list of constraint functions
 
-    Returns:
-        schedule   : list of ScheduleItem objects
-    """
+def greedy2_schedule(sections, timeslots, rooms):
+    """Greedy schedule builder using Section model fields."""
     schedule = []
-    data = {"rooms": rooms}
+    occupied_instructors = set()
+    occupied_rooms = set()
 
-    for course in courses:
-        # Get instructor_id and section from mapping
-        mapped = mapping.get(course.course_id)
-        if mapped is None:
-            print(f"No instructor mapped for course {course.course_id}, skipping.")
-            continue
+    for section in sections:
+        course_id = section.course.id
+        course_name = section.course.name
+        course_type = section.course.type
+        course_dept = section.course.dept
+        capacity = section.capacity
+        instructor_id = section.instructor_id
+        section_label = str(section.no)
 
-        # mapping value can be a dict {instructor_id, section} or just instructor_id
-        if isinstance(mapped, dict):
-            instructor_id = mapped["instructor_id"]
-            section = str(mapped["section"])
-        else:
-            instructor_id = mapped
-            section = "1"  # default section if not provided
+        viable_rooms = get_viable_rooms(section, rooms)
+        candidate_timeslots = get_valid_timeslots(section, timeslots)
 
         assigned = False
+        for timeslot in candidate_timeslots:
+            if instructor_id is not None and (instructor_id, timeslot.id) in occupied_instructors:
+                continue
 
-        for timeslot in timeslots:
-            for room in rooms:
-                # Build a candidate ScheduleItem (matches models.py exactly)
-                candidate = ScheduleItem(
-                    course_id=course.course_id,
-                    instructor_id=instructor_id,
-                    room_id=room.room_id,
-                    timeslot_id=timeslot.timeslot_id,
-                    section=section
-                )
+            for room in viable_rooms:
+                if (room.id, timeslot.id) in occupied_rooms:
+                    continue
 
-                # Temporarily add candidate to schedule
-                schedule.append(candidate)
-
-                # Run all constraint checks (instructor, room, campus)
-                valid = all(constraint(schedule, data) for constraint in constraints)
-
-                if valid:
+                if passes_hard_constraints(
+                    section,
+                    room,
+                    timeslot,
+                    occupied_instructors=occupied_instructors,
+                    occupied_rooms=occupied_rooms,
+                ):
+                    schedule.append(
+                        ScheduleItem(
+                            course_id=course_id,
+                            course_name=course_name,
+                            course_type=course_type,
+                            course_dept=course_dept,
+                            capacity=capacity,
+                            instructor_id=instructor_id,
+                            room_id=room.id,
+                            timeslot_id=timeslot.id,
+                            section=section_label,
+                        )
+                    )
+                    occupied_rooms.add((room.id, timeslot.id))
+                    if instructor_id is not None:
+                        occupied_instructors.add((instructor_id, timeslot.id))
                     assigned = True
-                    break  # valid combo found, move to next course
-                else:
-                    schedule.pop()  # remove and try next combo
+                    break
 
             if assigned:
-                break  # stop trying rooms/timeslots for this course
+                break
 
         if not assigned:
-            print(f"Could not assign course {course.course_id} — no valid slot found.")
+            schedule.append(
+                ScheduleItem(
+                    course_id=course_id,
+                    course_name=course_name,
+                    course_type=course_type,
+                    course_dept=course_dept,
+                    capacity=capacity,
+                    instructor_id=instructor_id,
+                    room_id=None,
+                    timeslot_id=None,
+                    section=section_label,
+                )
+            )
 
     return schedule

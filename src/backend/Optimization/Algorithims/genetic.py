@@ -1,7 +1,67 @@
 import random
 import copy
-from constraints import check_all
-from models import ScheduleItem
+from backend.Optimization.constraints import (
+    check_all,
+    check_instructors,
+    check_room,
+    check_capacity,
+    check_room_type,
+    check_department,
+    check_campus,
+    get_valid_timeslots,
+    passes_hard_constraints,
+    is_room_type_match,
+    is_department_match,
+    is_capacity_ok,
+    is_campus_match,
+)
+from backend.models.models import ScheduleItem
+
+
+def get_viable_rooms(section, rooms):
+    """Return rooms that satisfy the section's static constraints."""
+    return [
+        room
+        for room in rooms
+        if is_room_type_match(section, room)
+        and is_department_match(section, room)
+        and is_capacity_ok(section, room)
+        and is_campus_match(section, room)
+    ]
+
+
+def choose_random_assignment(
+    section,
+    rooms,
+    timeslots,
+    occupied_instructors,
+    occupied_rooms,
+):
+    if not rooms or not timeslots:
+        return (
+            random.choice(rooms) if rooms else None,
+            random.choice(timeslots) if timeslots else None,
+        )
+
+    for ts in timeslots:
+        if section.instructor_id is not None and (section.instructor_id, ts.id) in occupied_instructors:
+            continue
+
+        for room in rooms:
+            if (room.id, ts.id) in occupied_rooms:
+                continue
+
+            if passes_hard_constraints(
+                section,
+                room,
+                ts,
+                occupied_instructors=occupied_instructors,
+                occupied_rooms=occupied_rooms,
+            ):
+                return room, ts
+
+    # Fallback: if no fully valid pair exists, still return a random choice
+    return random.choice(rooms), random.choice(timeslots)
 
 
 # Create Population
@@ -9,31 +69,48 @@ from models import ScheduleItem
 def create_population(size, sections, rooms, timeslots):
     population = []
 
+    # precompute static room/timeslot viability for each section
+    section_candidates = [
+        (
+            section,
+            get_viable_rooms(section, rooms),
+            get_valid_timeslots(section, timeslots),
+        )
+        for section in sections
+    ]
+
     # repeat to create many schedules
     for i in range(size):
         schedule = []
+        occupied_instructors = set()
+        occupied_rooms = set()
 
         # go through each section and assign random room + timeslot
-        for section in sections:
+        for section, viable_rooms, valid_timeslots in section_candidates:
+            room, timeslot = choose_random_assignment(
+                section,
+                viable_rooms,
+                valid_timeslots,
+                occupied_instructors,
+                occupied_rooms,
+            )
             item = ScheduleItem(
-                course_id = section.course.id,
-                course_name = section.course.name,
-                course_type = section.course.type,
-                course_dept = section.course.dept,
-                capacity = section.capacity,
-                instructor_id = section.instructor_id,
-
-                # randomly choose a room for this section
-                room_id = random.choice(rooms).id,
-
-                # randomly choose a timeslot for this section
-                timeslot_id = random.choice(timeslots).id,
-
-                # convert section number to string for consistency
-                section = str(section.no)
+                course_id=section.course.id,
+                course_name=section.course.name,
+                course_type=section.course.type,
+                course_dept=section.course.dept,
+                capacity=section.capacity,
+                instructor_id=section.instructor_id,
+                room_id=room.id if room else None,
+                timeslot_id=timeslot.id if timeslot else None,
+                section=str(section.no),
             )
 
             schedule.append(item)
+            if room is not None and timeslot is not None:
+                occupied_rooms.add((room.id, timeslot.id))
+            if section.instructor_id is not None and timeslot is not None:
+                occupied_instructors.add((section.instructor_id, timeslot.id))
 
         # add this full schedule to population
         population.append(schedule)
@@ -48,9 +125,23 @@ def fitness(schedule, rooms):
 
     # check if schedule follows all constraints
     if check_all(schedule, data):
-        return 10   # good schedule
-    else:
-        return -5   # bad schedule
+        return 10
+
+    score = 0
+    if check_instructors(schedule, data):
+        score += 2
+    if check_room(schedule, data):
+        score += 2
+    if check_capacity(schedule, data):
+        score += 2
+    if check_room_type(schedule, data):
+        score += 2
+    if check_department(schedule, data):
+        score += 1
+    if check_campus(schedule, data):
+        score += 1
+
+    return score
 
 
 # Selection
