@@ -134,7 +134,7 @@ def _viable_rooms(dept_typed, open_typed, room_type, course_dept, section_campus
 
 # Greedy scheduler
 
-def greedy_schedule(sections, timeslots, rooms):
+def greedy1_schedule(sections, timeslots, rooms):
     
     G = build_conflict_graph(sections)
     dept_typed, open_typed = _build_room_lookup(rooms)
