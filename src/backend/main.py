@@ -29,9 +29,24 @@ def main():
     preview_objects("Timeslots", data["timeslots"])
     preview_objects("Sections", data["sections"])
 
-    engine = SchedulingEngine(algorithm_name="greedy")
+    # Choose an algorithm via buttons and store selection in Streamlit session state
+    if "algorithm_name" not in st.session_state:
+        st.session_state.algorithm_name = "greedy1"
 
-    with st.spinner("Running greedy scheduling..."):
+    col1, col2, col3 = st.columns(3)
+    if col1.button("greedy1"):
+        st.session_state.algorithm_name = "greedy1"
+    if col2.button("greedy2"):
+        st.session_state.algorithm_name = "greedy2"
+    if col3.button("genetic"):
+        st.session_state.algorithm_name = "genetic"
+
+    algorithm_name = st.session_state.algorithm_name
+    st.markdown(f"**Selected algorithm:** {algorithm_name}")
+    engine = SchedulingEngine(algorithm_name)
+
+
+    with st.spinner(f"Running {algorithm_name} scheduling..."):
         start_time = time.perf_counter()
         schedule_items, scheduled, unscheduled = engine.run(data)
         exec_time = time.perf_counter() - start_time
@@ -74,9 +89,10 @@ def main():
         file_name="schedule.csv",
     )
     # admin base credits
+    
     schedule_details = {
-        "sch_name": "greedy schedule 1",
-        "alg": "greedy",
+        "sch_name": input("enter a name for schedule"),
+        "alg": algorithm_name,
         "semester": "202510",
         "fitness_score": fitness_score,
         "conflicts": conflict_count,

@@ -1,6 +1,5 @@
 # models.py
 
-
 class Course:
     def __init__(self, id, name, type, dept_id):
         self.id = id
