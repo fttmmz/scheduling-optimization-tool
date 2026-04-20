@@ -95,3 +95,50 @@ def save_schedule(schedule_items, schedule_detailes):
         "schedule": saved_schedule,
         "details_saved": len(detail_records),
     }
+
+
+def load_schedule(schedule_id):
+    """Load a saved schedule from the database."""
+    from backend.models.models import ScheduleItem
+
+    all_rows = []
+    page_size = 1000
+    offset = 0
+
+    while True:
+        res = (
+            supabase.table("schedule_detailes")
+            .select("*, courses(*)")
+            .eq("schedule_id", schedule_id)
+            .range(offset, offset + page_size - 1)
+            .execute()
+        )
+
+        if not res.data:
+            break
+
+        all_rows.extend(res.data)
+
+        # if we got less than a full page, we're done
+        if len(res.data) < page_size:
+            break
+
+        offset += page_size
+
+    schedule_items = []
+    for row in all_rows:
+        course = row["courses"]
+        item = ScheduleItem(
+            course_id=row["course_id"],
+            course_name=course["name"],
+            course_type=course["course_type"],
+            course_dept=course["dept_id"],
+            capacity=row["sec_capacity"],
+            instructor_id=row["instructor_id"],
+            room_id=row["room_id"],
+            timeslot_id=row["timeslot_id"],
+            section=row["section"],
+        )
+        schedule_items.append(item)
+
+    return schedule_items
