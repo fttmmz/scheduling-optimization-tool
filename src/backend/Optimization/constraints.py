@@ -387,72 +387,8 @@ def score_tutorial_links(schedule: list, sections_by_id: dict) -> int:
     return violations
 
 
-# 8. CONFLICT COUNTING  (for schedule scoring / comparison)
 
-
-def count_instructor_conflicts(schedule: list) -> int:
-    seen, conflicts = set(), 0
-    for item in schedule:
-        if item.instructor_id is None or item.timeslot_id is None:
-            continue
-        key = (item.instructor_id, item.timeslot_id)
-        if key in seen:
-            conflicts += 1
-        else:
-            seen.add(key)
-    return conflicts
-
-
-def count_room_conflicts(schedule: list) -> int:
-    seen, conflicts = set(), 0
-    for item in schedule:
-        if item.room_id is None or item.timeslot_id is None:
-            continue
-        key = (item.room_id, item.timeslot_id)
-        if key in seen:
-            conflicts += 1
-        else:
-            seen.add(key)
-    return conflicts
-
-
-def count_campus_conflicts(schedule: list, rooms: list) -> int:
-    room_map = {room.id: room for room in rooms}
-    conflicts = 0
-    for item in schedule:
-        room = room_map.get(item.room_id)
-        if not room:
-            continue
-        if get_section_campus(item.section) != get_building_campus(room.building):
-            conflicts += 1
-    return conflicts
-
-
-def count_conflicts(schedule: list, rooms: list) -> int:
-    """Total hard-constraint violation score (lower = better)."""
-    return (
-        count_instructor_conflicts(schedule)
-        + count_room_conflicts(schedule)
-        + count_campus_conflicts(schedule, rooms)
-    )
-
-
-def calculate_fitness(
-    schedule: list,
-    rooms: list,
-    scheduled_count: int,
-    total_sections: int,
-) -> float:
-    """Compute a higher-is-better fitness score for the schedule."""
-    conflict_penalty = count_conflicts(schedule, rooms) * 10
-    unscheduled_penalty = max(0, total_sections - scheduled_count) * 20
-
-    # Base fitness gives strong preference to a complete, conflict-free schedule.
-    fitness = 1000.0 - conflict_penalty - unscheduled_penalty
-    return max(0.0, fitness)
-
-
-# 9. FULL-SCHEDULE VALIDATORS  (used for final verification / testing)
+#  FULL-SCHEDULE VALIDATORS  (used for final verification / testing)
 
 
 def check_instructors(schedule: list, data=None) -> bool:
