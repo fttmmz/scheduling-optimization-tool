@@ -156,11 +156,16 @@ def selection(population, rooms):
 
 # Crossover
 # This mixes two parent schedules to create a new one
+CROSSOVER_RATE = 0.85
 def crossover(parent1, parent2):
 
     # if schedule is empty, return empty
     if len(parent1) == 0:
         return []
+
+    # decide if crossover happens
+    if random.random() > CROSSOVER_RATE:
+        return copy.deepcopy(parent1)
 
     # pick a random split point
     point = random.randint(1, len(parent1) - 1)
@@ -174,10 +179,15 @@ def crossover(parent1, parent2):
 
 # Mutation
 # This randomly changes small parts of a schedule
-def mutate(schedule, rooms, timeslots):
+MUTATION_RATE = 0.03
+def mutation(schedule, rooms, timeslots):
 
     # if schedule is empty, do nothing
     if len(schedule) == 0:
+        return schedule
+
+    # decide if mutation happens
+    if random.random() > MUTATION_RATE:
         return schedule
 
     # randomly pick one item from schedule
@@ -224,7 +234,7 @@ def genetic_schedule(sections, timeslots, rooms):
             child = crossover(p1, p2)
 
             # mutation (small random change)
-            child = mutate(child, rooms, timeslots)
+            child = mutation(child, rooms, timeslots)
 
             new_population.append(child)
 
