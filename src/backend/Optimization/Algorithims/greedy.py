@@ -8,7 +8,8 @@ from backend.Optimization.constraints import (
     get_required_room_type,
     get_valid_timeslots,
     get_section_campus,
-    get_building_campus,
+    _build_room_lookup,
+    _viable_rooms
 )
 
 
@@ -46,41 +47,6 @@ def build_conflict_graph(sections):
     return G
 
 
-# Room pre-filtering  
-
-def _build_room_lookup(rooms):
-    """
-    Returns a dict:
-        (room_type, course_dept, section_campus) → [room, ...]
-
-    Rooms are ordered dept-match first, then open (dept_id=None).
-    Type, department, and campus are all static properties — checking them
-    once here means the inner loop only sees genuinely viable candidates and
-    only needs to check availability (O(1) set lookup) and capacity.
-    """
-    # Intermediate buckets
-    dept_typed = defaultdict(list)  # (room_type, dept_id, campus) → rooms
-    open_typed = defaultdict(list)  # (room_type, campus) → rooms
-
-    for room in rooms:
-        campus = get_building_campus(room.building)
-        if room.dept_id:
-            dept_typed[(room.type, room.dept_id, campus)].append(room)
-        else:
-            open_typed[(room.type, campus)].append(room)
-
-    # Collect all (room_type, course_dept, campus) combos that will be queried
-    # We can't know course_dept ahead of time, so we build on first access via cache
-    return dept_typed, open_typed
-
-
-def _viable_rooms(dept_typed, open_typed, room_type, course_dept, section_campus):
-    """Yield rooms in priority order for a given (type, dept, campus) triple."""
-    # 1. dept-assigned rooms matching this course's department
-    yield from dept_typed.get((room_type, course_dept, section_campus), [])
-    # 2. open rooms (no dept restriction) — fallback for classrooms, also valid for labs
-    yield from open_typed.get((room_type, section_campus), [])
-
 
 # Greedy scheduler
 
@@ -90,21 +56,21 @@ def greedy_schedule(sections, timeslots, rooms):
     dept_typed, open_typed = _build_room_lookup(rooms)
 
     
-    occupied_rooms = set()  # (room_id, timeslot_id)
-    occupied_instructors = set()  # (instructor_id, timeslot_id)
-    assigned_timeslots = {}  # node_id → timeslot_id  (int, not object)
+    occupied_rooms = set() 
+    occupied_instructors = set() 
+    assigned_timeslots = {} 
 
     room_list_cache: dict = {}
-
     def cached_viable_rooms(room_type, course_dept, section_campus):
-        key = (room_type, course_dept, section_campus)
-        if key not in room_list_cache:
-            room_list_cache[key] = list(
-                _viable_rooms(
-                    dept_typed, open_typed, room_type, course_dept, section_campus
+            key = (room_type, course_dept, section_campus)
+            if key not in room_list_cache:
+                room_list_cache[key] = list(
+                    _viable_rooms(
+                        dept_typed, open_typed, room_type, course_dept, section_campus
+                    )
                 )
-            )
-        return room_list_cache[key]
+            return room_list_cache[key]
+
 
     schedule = []
     nodes_by_priority = sorted(G.nodes, key=lambda n: G.degree[n], reverse=True)

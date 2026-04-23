@@ -1,33 +1,14 @@
 import random
 import copy
+import statistics
 from backend.Optimization.constraints import (
-    check_all,
-    check_instructors,
-    check_room,
-    check_capacity,
-    check_room_type,
-    check_department,
-    check_campus,
     get_valid_timeslots,
     passes_hard_constraints,
-    is_room_type_match,
-    is_department_match,
-    is_capacity_ok,
-    is_campus_match,
+    get_viable_rooms,
+    get_viable_rooms_for_schedule_item,
 )
 from backend.models.models import ScheduleItem
-
-
-def get_viable_rooms(section, rooms):
-    """Return rooms that satisfy the section's static constraints."""
-    return [
-        room
-        for room in rooms
-        if is_room_type_match(section, room)
-        and is_department_match(section, room)
-        and is_capacity_ok(section, room)
-        and is_campus_match(section, room)
-    ]
+from Optimization.evaluation import calculate_fitness
 
 
 def choose_random_assignment(
@@ -37,12 +18,11 @@ def choose_random_assignment(
     occupied_instructors,
     occupied_rooms,
 ):
+    # If no viable rooms or timeslots, return None for that section
     if not rooms or not timeslots:
-        return (
-            random.choice(rooms) if rooms else None,
-            random.choice(timeslots) if timeslots else None,
-        )
+        return None, None
 
+    # Try to find a valid assignment that passes all constraints
     for ts in timeslots:
         if section.instructor_id is not None and (section.instructor_id, ts.id) in occupied_instructors:
             continue
@@ -60,8 +40,12 @@ def choose_random_assignment(
             ):
                 return room, ts
 
-    # Fallback: if no fully valid pair exists, still return a random choice
-    return random.choice(rooms), random.choice(timeslots)
+    # Fallback: if no fully valid pair exists, return random valid pair from viable options
+    # This ensures we at least try to assign from rooms/timeslots that match static constraints
+    if rooms and timeslots:
+        return random.choice(rooms), random.choice(timeslots)
+    
+    return None, None
 
 
 # Create Population
@@ -118,37 +102,11 @@ def create_population(size, sections, rooms, timeslots):
     return population
 
 
-# Fitness
-# This checks how good a schedule is
-def fitness(schedule, rooms):
-    data = {"rooms": rooms}
-
-    # check if schedule follows all constraints
-    if check_all(schedule, data):
-        return 10
-
-    score = 0
-    if check_instructors(schedule, data):
-        score += 2
-    if check_room(schedule, data):
-        score += 2
-    if check_capacity(schedule, data):
-        score += 2
-    if check_room_type(schedule, data):
-        score += 2
-    if check_department(schedule, data):
-        score += 1
-    if check_campus(schedule, data):
-        score += 1
-
-    return score
-
-
 # Selection
 # This keeps the better half of the population
 def selection(population, rooms):
     # sort schedules from best to worst using fitness score
-    population.sort(key=lambda s: fitness(s, rooms), reverse=True)
+    population.sort(key=lambda s: calculate_fitness(s, rooms), reverse=True)
 
     # keep only top 50%
     return population[:len(population)//2]
@@ -180,7 +138,7 @@ def crossover(parent1, parent2):
 # Mutation
 # This randomly changes small parts of a schedule
 MUTATION_RATE = 0.03
-def mutation(schedule, rooms, timeslots):
+def mutation(schedule, rooms, timeslots, sections=None):
 
     # if schedule is empty, do nothing
     if len(schedule) == 0:
@@ -192,12 +150,38 @@ def mutation(schedule, rooms, timeslots):
 
     # randomly pick one item from schedule
     selected_item = random.choice(schedule)
+    
+    # check for conflicts before
+    occupied_instructors = set()
+    occupied_rooms = set()
+    
+    for item in schedule:
+        if item != selected_item:  # Don't include the item we're about to mutate
+            if item.instructor_id is not None and item.timeslot_id is not None:
+                occupied_instructors.add((item.instructor_id, item.timeslot_id))
+            if item.room_id is not None and item.timeslot_id is not None:
+                occupied_rooms.add((item.room_id, item.timeslot_id))
 
     # 50% chance to change room or timeslot
     if random.random() < 0.5:
-        selected_item.room_id = random.choice(rooms).id
+        # Try to assign a new room that doesn't create conflicts
+        viable_rooms = get_viable_rooms_for_schedule_item(selected_item, rooms)
+        if viable_rooms and selected_item.timeslot_id is not None:
+            # Find a room that doesn't conflict with the current timeslot
+            for room in random.sample(viable_rooms, len(viable_rooms)):
+                if (room.id, selected_item.timeslot_id) not in occupied_rooms:
+                    selected_item.room_id = room.id
+                    break
     else:
-        selected_item.timeslot_id = random.choice(timeslots).id
+        # Try to assign a new timeslot that doesn't create conflicts
+        # Check BOTH instructor AND room are free at new timeslot
+        for ts in random.sample(timeslots, len(timeslots)):
+            instructor_free = (selected_item.instructor_id, ts.id) not in occupied_instructors
+            room_free       = (selected_item.room_id, ts.id) not in occupied_rooms
+            
+            if instructor_free and room_free:
+                selected_item.timeslot_id = ts.id
+                break
 
     return schedule
 
@@ -234,7 +218,7 @@ def genetic_schedule(sections, timeslots, rooms):
             child = crossover(p1, p2)
 
             # mutation (small random change)
-            child = mutation(child, rooms, timeslots)
+            child = mutation(child, rooms, timeslots, sections)
 
             new_population.append(child)
 
@@ -242,6 +226,41 @@ def genetic_schedule(sections, timeslots, rooms):
         population = new_population
 
     # step 3: get best schedule from final population
-    best = max(population, key=lambda s: fitness(s, rooms))
+    best = max(population, key=lambda s: calculate_fitness(s, rooms))
 
     return best
+
+
+def genetic_runs(sections, timeslots, rooms, num_runs=30):
+    fitness_scores = []
+    best_overall_schedule = None
+    best_overall_fitness = -1
+    
+    print(f"\n=== Genetic Algorithm: {num_runs} runs ===")
+    print(f"Total sections: {len(sections)}, rooms: {len(rooms)}, timeslots: {len(timeslots)}")
+    
+    for run in range(num_runs):
+        best_schedule = genetic_schedule(sections, timeslots, rooms)
+        score = calculate_fitness(best_schedule, rooms)
+        fitness_scores.append(score)
+        
+        # Count how many sections are actually scheduled
+        scheduled = sum(1 for item in best_schedule if item.room_id is not None and item.timeslot_id is not None)
+        
+        
+        if score > best_overall_fitness:
+            best_overall_fitness = score
+            best_overall_schedule = best_schedule
+    
+    best_score = max(fitness_scores)
+    worst_score = min(fitness_scores)
+    avg_score = sum(fitness_scores) / len(fitness_scores)
+    std_dev = statistics.stdev(fitness_scores) if len(fitness_scores) > 1 else 0
+    
+    print(f"\n=== Results ===")
+    print(f"Best fitness: {best_score}")
+    print(f"Worst fitness: {worst_score}")
+    print(f"Average fitness: {avg_score:.4f}")
+    print(f"Standard deviation: {std_dev:.4f}")
+    
+    return best_overall_schedule

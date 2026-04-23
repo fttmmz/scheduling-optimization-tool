@@ -5,7 +5,7 @@ import pandas as pd
 import networkx as nx
 
 from backend.database.loader import get_scheduling_data, save_schedule, load_schedule
-from backend.Optimization.constraints import tag_section_links
+from backend.Optimization.constraints import tag_section_links, tag_intro_it_pairs
 from backend.Optimization.evaluation import calculate_fitness, count_conflicts, debug_conflicts_ui
 from backend.Optimization.engine import SchedulingEngine
 
@@ -44,10 +44,12 @@ def schedule_to_dataframe(schedule, rooms, timeslots):
                 "course_name": item.course_name,
                 "section": item.section,
                 "instructor_id": item.instructor_id,
-                "room_id": item.room_id,
                 "room_type": room.type if room else None,
+                "course_type":item.course_type,
+                "room_no":room.no if room else None,
+                "course_dept":item.course_dept,
+                "room_dept":room.dept_id if room else None,
                 "room_building": room.building if room else None,
-                "timeslot_id": item.timeslot_id,
                 "day": timeslot.day if timeslot else None,
                 "start": timeslot.start if timeslot else None,
                 "end": timeslot.end if timeslot else None,
@@ -68,6 +70,7 @@ def main():
 
     # Run soft-constraint linking once after load (annotates section objects in-place)
     tag_section_links(data["sections"])
+    tag_intro_it_pairs(data["sections"])
 
     st.markdown("## Loaded Database Data")
     preview_objects("Rooms", data["rooms"])
@@ -112,14 +115,14 @@ def main():
         data["timeslots"],
     )
 
-    conflict_count = count_conflicts(schedule_items, data["rooms"])
+    conflict_count = count_conflicts(schedule_items, data["rooms"], data["sections"], data["timeslots"])
     fitness_score = calculate_fitness(
         schedule_items,
         data["rooms"],
-        scheduled,
-        len(data["sections"]),
+        sections=data["sections"],
+        timeslots=data["timeslots"],
     )
-    debug_conflicts_ui(schedule_items, data["rooms"])
+    debug_conflicts_ui(schedule_items, data["rooms"], data["sections"], data["timeslots"])
     st.success(
         f"Done — {scheduled} items scheduled, "
         f"{unscheduled} unscheduled, "
