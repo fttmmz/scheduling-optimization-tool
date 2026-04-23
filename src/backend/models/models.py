@@ -15,7 +15,7 @@ class Room:
         self.type = data["room_type"]
         self.building = data["building"]
         self.dept_id = data["dept_id"]
-
+        self.no=data["room_num"]
 
 class Timeslot:
     def __init__(self, data):
