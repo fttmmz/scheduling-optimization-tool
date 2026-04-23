@@ -1,11 +1,12 @@
 from backend.Optimization.Algorithims.greedy import greedy_schedule
 from backend.Optimization.constraints import classify_section
-from backend.Optimization.Algorithims.genetic import run_genetic_schedule
+from backend.Optimization.Algorithims.genetic import genetic_runs
+from backend.Optimization.evaluation import count_scheduled_sections
 
 # Registry:  new algorithms are added here
 ALGORITHM_REGISTRY = {
     "greedy": greedy_schedule,
-    "genetic": run_genetic_schedule,
+    "genetic": genetic_runs,
 }
 
 
@@ -60,19 +61,7 @@ class SchedulingEngine:
 
         result = self.algorithm(sections, timeslots, rooms)
 
-        section_lookup = {
-            (section.course.id, section.no): section for section in sections
-        }
-        scheduled = 0
-        for item in result:
-            if item.room_id is not None or item.timeslot_id is not None:
-                scheduled += 1
-                continue
-
-            section = section_lookup.get((item.course_id, item.section))
-            if section is not None and classify_section(section) == "NEEDS_NOTHING":
-                scheduled += 1
-
+        scheduled = count_scheduled_sections(result, sections)
         unscheduled = len(result) - scheduled
         print(
             f"[SchedulingEngine] Done — {scheduled} scheduled, {unscheduled} unscheduled"
