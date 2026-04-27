@@ -8,7 +8,10 @@ from backend.Optimization.constraints import (
     get_viable_rooms_for_schedule_item,
 )
 from backend.models.models import ScheduleItem
-from Optimization.evaluation import calculate_fitness
+from backend.Optimization.evaluation import (
+    calculate_fitness,
+    build_timeslot_guideline_cache,
+)
 
 
 def choose_random_assignment(
@@ -104,9 +107,19 @@ def create_population(size, sections, rooms, timeslots):
 
 # Selection
 # This keeps the better half of the population
-def selection(population, rooms):
+# and evaluates fitness using section/timeslot-aware penalties.
+def selection(population, rooms, sections, timeslots, valid_timeslot_cache=None):
     # sort schedules from best to worst using fitness score
-    population.sort(key=lambda s: calculate_fitness(s, rooms), reverse=True)
+    population.sort(
+        key=lambda s: calculate_fitness(
+            s,
+            rooms,
+            sections=sections,
+            timeslots=timeslots,
+            valid_timeslot_cache=valid_timeslot_cache,
+        ),
+        reverse=True,
+    )
 
     # keep only top 50%
     return population[:len(population)//2]
@@ -188,7 +201,10 @@ def mutation(schedule, rooms, timeslots, sections=None):
 
 # Genetic Algorithm
 # Main function that runs the whole process
-def genetic_schedule(sections, timeslots, rooms):
+def genetic_schedule(sections, timeslots, rooms, valid_timeslot_cache=None):
+
+    if valid_timeslot_cache is None:
+        valid_timeslot_cache = build_timeslot_guideline_cache(sections, timeslots)
 
     # step 1: create initial random population
     population = create_population(
@@ -204,7 +220,13 @@ def genetic_schedule(sections, timeslots, rooms):
     for i in range(generations):
 
         # select best schedules
-        selected = selection(population, rooms)
+        selected = selection(
+            population,
+            rooms,
+            sections,
+            timeslots,
+            valid_timeslot_cache=valid_timeslot_cache,
+        )
 
         new_population = []
 
@@ -226,7 +248,16 @@ def genetic_schedule(sections, timeslots, rooms):
         population = new_population
 
     # step 3: get best schedule from final population
-    best = max(population, key=lambda s: calculate_fitness(s, rooms))
+    best = max(
+        population,
+        key=lambda s: calculate_fitness(
+            s,
+            rooms,
+            sections=sections,
+            timeslots=timeslots,
+            valid_timeslot_cache=valid_timeslot_cache,
+        ),
+    )
 
     return best
 
@@ -239,9 +270,22 @@ def genetic_runs(sections, timeslots, rooms, num_runs=30):
     print(f"\n=== Genetic Algorithm: {num_runs} runs ===")
     print(f"Total sections: {len(sections)}, rooms: {len(rooms)}, timeslots: {len(timeslots)}")
     
+    valid_timeslot_cache = build_timeslot_guideline_cache(sections, timeslots)
+
     for run in range(num_runs):
-        best_schedule = genetic_schedule(sections, timeslots, rooms)
-        score = calculate_fitness(best_schedule, rooms)
+        best_schedule = genetic_schedule(
+            sections,
+            timeslots,
+            rooms,
+            valid_timeslot_cache=valid_timeslot_cache,
+        )
+        score = calculate_fitness(
+            best_schedule,
+            rooms,
+            sections=sections,
+            timeslots=timeslots,
+            valid_timeslot_cache=valid_timeslot_cache,
+        )
         fitness_scores.append(score)
         
         # Count how many sections are actually scheduled
