@@ -62,6 +62,8 @@ def save_schedule(schedule_items, schedule_detailes):
         "exec_time": schedule_detailes.get("exec_time"),
         "user_id": schedule_detailes.get("user_id"),
         "rule_set_id": schedule_detailes.get("rule_set"),
+        "Scheduled": schedule_detailes.get("Scheduled"),
+        "unscheduled":schedule_detailes.get("unscheduled")
     }
 
     schedule_res = supabase.table("schedule").insert(metadata).execute()
