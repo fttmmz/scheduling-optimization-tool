@@ -377,7 +377,7 @@ def tag_intro_it_pairs(all_sections: list) -> None:
             sec.intro_it_pair_id = None
             continue
 
-        base_no = _base_section_no(sec.no)
+        base_no = _base_section_no(str(sec.no))
         key     = (sec.course.id, base_no)
         suffix  = _section_suffix(sec.no)
 
@@ -463,9 +463,13 @@ def get_building_campus(building) -> str:
 
 
 
-def _base_section_no(section_no: str) -> str:
-    """Strip trailing letter(s) to get the base section number string."""
-    return re.sub(r"[A-Za-z]+$", "", str(section_no)).strip()
+def _base_section_no(section_no: str) -> int:
+    """Strip trailing letter(s) to get the base section number as an integer."""
+    base_str = re.sub(r"[A-Za-z]+$", "", str(section_no)).strip()
+    try:
+        return int(base_str) if base_str else 0
+    except ValueError:
+        return 0
 
 
 def tag_section_links(all_sections: list) -> None:
@@ -488,10 +492,13 @@ def tag_section_links(all_sections: list) -> None:
     # Build lookup: (course_id, base_section_no) → Section
     base_lookup: dict[tuple, object] = {}
     for sec in all_sections:
-        base_no = _base_section_no(sec.no)
+        sno = str(sec.no)
+        base_no = _base_section_no(sno)
         key = (sec.course.id, base_no)
+        # Extract base string to check if section has no suffix
+        base_str = re.sub(r"[A-Za-z]+$", "", sno).strip()
         # Only index sections that are themselves "base" (no trailing letter)
-        if str(sec.no) == base_no:
+        if sno.strip() == base_str:
             base_lookup[key] = sec
 
     for sec in all_sections:
@@ -500,7 +507,8 @@ def tag_section_links(all_sections: list) -> None:
 
         sno = str(sec.no)
         base_no = _base_section_no(sno)
-        suffix = sno[len(base_no):]  # whatever was stripped
+        base_str = re.sub(r"[A-Za-z]+$", "", sno).strip()
+        suffix = sno[len(base_str):]  # whatever was stripped
 
         if not suffix:
             continue  # base section — no link needed
@@ -659,29 +667,7 @@ def passes_hard_constraints(
 
 
 
-def score_tutorial_links(schedule: list, sections_by_id: dict) -> int:
-    """
-    Returns the number of tutorial sections whose room differs from their
-    parent lecture's room.  0 = perfect.
-    """
-    scheduled_room = {item.course_id: item.room_id for item in schedule}
-    # Build map: section_id → room_id from schedule
-    room_by_section: dict = {}
-    for item in schedule:
-        room_by_section[(item.course_id, item.section)] = item.room_id
 
-    violations = 0
-    for sec in sections_by_id.values():
-        if not getattr(sec, "tutorial_parent_id", None):
-            continue
-        parent = sections_by_id.get(sec.tutorial_parent_id)
-        if not parent:
-            continue
-        tutorial_room = room_by_section.get((sec.course.id, sec.no))
-        parent_room = room_by_section.get((parent.course.id, parent.no))
-        if tutorial_room and parent_room and tutorial_room != parent_room:
-            violations += 1
-    return violations
 
 
 

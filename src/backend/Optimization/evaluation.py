@@ -83,7 +83,22 @@ def count_capacity_conflicts(schedule: list, rooms: list) -> int:
     return conflicts
 
 
-def count_timeslot_guideline_conflicts(schedule: list, sections: list, timeslots: list) -> int:
+def build_timeslot_guideline_cache(sections: list, timeslots: list) -> dict:
+    """Build a cache of valid timeslot IDs for each section."""
+    cache = {}
+    for sec in sections:
+        key = (sec.course.id, str(sec.no))
+        valid = get_valid_timeslots_for_section(sec, timeslots)
+        cache[key] = {ts.id for ts in valid}
+    return cache
+
+
+def count_timeslot_guideline_conflicts(
+    schedule: list,
+    sections: list,
+    timeslots: list,
+    valid_timeslot_cache: dict = None,
+) -> int:
     """
     Count sections assigned to timeslots that violate course-type guidelines.
     
@@ -94,8 +109,11 @@ def count_timeslot_guideline_conflicts(schedule: list, sections: list, timeslots
     Returns the count of sections violating timeslot guidelines.
     """
     # Build lookup maps for fast access
-    section_map = {(sec.course.id, sec.no): sec for sec in sections}
+    section_map = {(sec.course.id, str(sec.no)): sec for sec in sections}
     timeslot_map = {ts.id: ts for ts in timeslots}
+    
+    if valid_timeslot_cache is None:
+        valid_timeslot_cache = build_timeslot_guideline_cache(sections, timeslots)
     
     conflicts = 0
     for item in schedule:
@@ -110,17 +128,20 @@ def count_timeslot_guideline_conflicts(schedule: list, sections: list, timeslots
         if not section or not timeslot:
             continue
         
-        # Get valid timeslots for this section based on course type
-        valid_timeslots = get_valid_timeslots_for_section(section, timeslots)
-        
-        # Check if assigned timeslot is in the valid list
-        if timeslot not in valid_timeslots:
+        valid_ids = valid_timeslot_cache.get((item.course_id, item.section), set())
+        if item.timeslot_id not in valid_ids:
             conflicts += 1
     
     return conflicts
 
 
-def count_conflicts(schedule: list, rooms: list, sections: list = None, timeslots: list = None) -> int:
+def count_conflicts(
+    schedule: list,
+    rooms: list,
+    sections: list = None,
+    timeslots: list = None,
+    valid_timeslot_cache: dict = None,
+) -> int:
     """
     Count all conflicts in a schedule.
     
@@ -138,7 +159,12 @@ def count_conflicts(schedule: list, rooms: list, sections: list = None, timeslot
     
     # Add timeslot guideline conflicts if data provided
     if sections is not None and timeslots is not None:
-        total += count_timeslot_guideline_conflicts(schedule, sections, timeslots)
+        total += count_timeslot_guideline_conflicts(
+            schedule,
+            sections,
+            timeslots,
+            valid_timeslot_cache=valid_timeslot_cache,
+        )
     
     return total
 
@@ -164,6 +190,7 @@ def calculate_fitness(
     sections: list = None,
     total_sections: int = None,
     timeslots: list = None,
+    valid_timeslot_cache: dict = None,
 ) -> float:
     """
     Normalized weighted penalty fitness function.
@@ -189,7 +216,13 @@ def calculate_fitness(
     if total_sections == 0:
         return 0.0
 
-    conflicts   = count_conflicts(schedule, rooms, sections, timeslots)
+    conflicts   = count_conflicts(
+        schedule,
+        rooms,
+        sections,
+        timeslots,
+        valid_timeslot_cache=valid_timeslot_cache,
+    )
     unscheduled = max(0, total_sections - scheduled_count)
 
     # --- Normalize both by total sections ---
@@ -209,7 +242,7 @@ def calculate_fitness(
 
     return round(fitness, 4)
 
-def debug_conflicts_ui(schedule, rooms, sections=None, timeslots=None):
+def debug_conflicts_ui(schedule, rooms, sections=None, timeslots=None, valid_timeslot_cache=None):
     st.subheader("Conflict Breakdown")
 
     instructor  = count_instructor_conflicts(schedule)
@@ -222,7 +255,12 @@ def debug_conflicts_ui(schedule, rooms, sections=None, timeslots=None):
     
     # Include timeslot guideline conflicts if data available
     if sections is not None and timeslots is not None:
-        timeslot_violations = count_timeslot_guideline_conflicts(schedule, sections, timeslots)
+        timeslot_violations = count_timeslot_guideline_conflicts(
+            schedule,
+            sections,
+            timeslots,
+            valid_timeslot_cache=valid_timeslot_cache,
+        )
     
     total = instructor + room + campus + room_type + department + capacity + timeslot_violations
 
