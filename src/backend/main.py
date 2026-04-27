@@ -148,6 +148,8 @@ def main():
         "user_id": 3,
         "exec_time": exec_time,
         "rule_set": None,
+        "Scheduled": scheduled,
+        "unscheduled":unscheduled
     }
 
     if st.button("Save Schedule"):
