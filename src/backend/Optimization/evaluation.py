@@ -1,6 +1,5 @@
 # CONFLICT COUNTING  (for schedule scoring / comparison)
-import streamlit as st
-from Optimization.constraints import (
+from backend.Optimization.constraints import (
     classify_section,
     get_required_room_type,
     get_section_campus,
@@ -243,6 +242,11 @@ def calculate_fitness(
     return round(fitness, 4)
 
 def debug_conflicts_ui(schedule, rooms, sections=None, timeslots=None, valid_timeslot_cache=None):
+    try:
+        import streamlit as st
+    except ImportError:
+        return
+
     st.subheader("Conflict Breakdown")
 
     instructor  = count_instructor_conflicts(schedule)
