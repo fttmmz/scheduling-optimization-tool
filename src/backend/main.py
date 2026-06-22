@@ -18,7 +18,7 @@ app = FastAPI()
 class TimetableRequest(BaseModel):
     algorithm: str = Field(
         "greedy",
-        description="The scheduling algorithm to run. Available values: greedy, genetic.",
+        description="The scheduling algorithm to run. Available values: greedy, genetic, hybrid.",
     )
 
 
