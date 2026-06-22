@@ -1,0 +1,16 @@
+# Environment variables
+.env
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+.ruff_cache/
+
+# Vercel
+.vercel/
+
+# IDE
+.vscode/
+.idea/
