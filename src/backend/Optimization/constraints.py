@@ -1,8 +1,7 @@
 # constraints.py
-# ─────────────────────────────────────────────────────────────────────────────
 # Single source of truth for ALL scheduling constraints and preprocessing.
 # Every algorithm (greedy, genetic, etc.) imports from here 
-# ─────────────────────────────────────────────────────────────────────────────
+
 
 import re
 from collections import defaultdict
@@ -461,8 +460,6 @@ def get_building_campus(building) -> str:
 
 # 5. SECTION-LINKING PREPROCESSING  (run once, before any algorithm)
 
-
-
 def _base_section_no(section_no: str) -> int:
     """Strip trailing letter(s) to get the base section number as an integer."""
     base_str = re.sub(r"[A-Za-z]+$", "", str(section_no)).strip()
@@ -520,8 +517,6 @@ def tag_section_links(all_sections: list) -> None:
             sec.tutorial_parent_id = parent_id
         elif suffix.upper() in {"X", "Y"}:
             sec.lab_parent_id = parent_id
-
-
 
 # 6. HARD CONSTRAINT VALIDATORS  (item-level — used inside algorithm loops)
 # Each function returns True / False (violation).
@@ -625,7 +620,7 @@ def passes_hard_constraints(
     occupied_rooms: set = None,
 ) -> bool:
     """
-    Convenience: run ALL hard constraints for a candidate (section, room, timeslot).
+    run ALL hard constraints for a candidate (section, room, timeslot).
 
     If occupancy maps are provided, use those for instructor/room checks
     instead of scanning the partial schedule.
@@ -661,18 +656,7 @@ def passes_hard_constraints(
         and is_campus_match(section, room)
     )
 
-
-
-# 7. SOFT CONSTRAINT SCORERS  (schedule-level — used for evaluation)
-
-
-
-
-
-
-
 #  FULL-SCHEDULE VALIDATORS  (used for final verification / testing)
-
 
 def check_instructors(schedule: list, data=None) -> bool:
     seen = set()
