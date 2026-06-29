@@ -612,22 +612,24 @@ async def delete_prerequisite(course_id: int, req_course_id: int, user_id: int =
 
 @app.get("/api/departments")
 async def list_departments(user_id: int = Depends(get_current_user_id)):
-    return crud_list("dept", order_by="dept_id")
+    # Table is "department" in Supabase; no assumed order_by since column name may vary
+    res = supabase.table("department").select("*").execute()
+    return res.data or []
 
 
 @app.post("/api/departments")
 async def create_department(dept: DeptIn, user_id: int = Depends(get_current_user_id)):
-    return crud_insert("dept", dept.model_dump())
+    return crud_insert("department", dept.model_dump())
 
 
 @app.put("/api/departments/{dept_id}")
 async def update_department(dept_id: int, dept: DeptIn, user_id: int = Depends(get_current_user_id)):
-    return crud_update("dept", "dept_id", dept_id, dept.model_dump())
+    return crud_update("department", "dept_id", dept_id, dept.model_dump())
 
 
 @app.delete("/api/departments/{dept_id}")
 async def delete_department(dept_id: int, user_id: int = Depends(get_current_user_id)):
-    return crud_delete("dept", "dept_id", dept_id)
+    return crud_delete("department", "dept_id", dept_id)
 
 
 @app.get("/api/health")
