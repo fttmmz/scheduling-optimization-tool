@@ -1,24 +1,49 @@
 # main.py
 import time
+import uuid
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional
 
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from backend.Optimization.constraints import tag_intro_it_pairs, tag_section_links
 from backend.Optimization.engine import SchedulingEngine
-from backend.Optimization.evaluation import calculate_fitness, count_conflicts
+from backend.Optimization.evaluation import (
+    calculate_fitness,
+    count_conflicts,
+    count_instructor_conflicts,
+    count_room_conflicts,
+    count_campus_conflicts,
+    count_room_type_conflicts,
+    count_department_conflicts,
+    count_capacity_conflicts,
+    count_timeslot_guideline_conflicts,
+    build_timeslot_guideline_cache,
+)
 from backend.database.db import supabase
 from backend.database.loader import get_scheduling_data, load_schedule, save_schedule
 
 app = FastAPI()
+
+# In-memory job store for async optimization runs.
+# Keys are job_id strings; values are dicts with "status" and optionally "result"/"error".
+_jobs: Dict[str, Dict[str, Any]] = {}
+_executor = ThreadPoolExecutor(max_workers=2)
 
 
 class TimetableRequest(BaseModel):
     algorithm: str = Field(
         "greedy",
         description="The scheduling algorithm to run. Available values: greedy, genetic, hybrid.",
+    )
+    num_runs: int = Field(
+        1,
+        ge=1,
+        le=30,
+        description="Number of independent runs for genetic/hybrid algorithms (1–30). Higher values improve quality but take longer.",
     )
 
 
@@ -82,6 +107,11 @@ class PrerequisiteIn(BaseModel):
     req_type: str
 
 
+class DeptIn(BaseModel):
+    dept_id: Optional[int] = None
+    name: str
+
+
 def get_schedule_for_user(schedule_id: int, user_id: int):
     res = (
         supabase.table("schedule")
@@ -131,7 +161,7 @@ async def get_current_user_id(
     return profile_res.data["user_id"]
 
 
-def run_optimization(algorithm: str) -> Dict[str, Any]:
+def run_optimization(algorithm: str, num_runs: int = 1) -> Dict[str, Any]:
     scheduling_data = get_scheduling_data()
     if scheduling_data is None:
         raise RuntimeError("Unable to load scheduling data from the database.")
@@ -140,12 +170,12 @@ def run_optimization(algorithm: str) -> Dict[str, Any]:
     tag_intro_it_pairs(scheduling_data["sections"])
 
     try:
-        engine = SchedulingEngine(algorithm)
+        engine = SchedulingEngine(algorithm, num_runs=num_runs)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     t0 = time.perf_counter()
-    schedule_items, scheduled, unscheduled = engine.run(scheduling_data)
+    schedule_items, scheduled, unscheduled_count = engine.run(scheduling_data)
     exec_time = time.perf_counter() - t0
 
     rooms = scheduling_data["rooms"]
@@ -179,16 +209,27 @@ def run_optimization(algorithm: str) -> Dict[str, Any]:
             }
         )
 
-    conflict_count = count_conflicts(schedule_items, rooms, sections, timeslots)
+    ts_cache = build_timeslot_guideline_cache(sections, timeslots)
+    conflict_count = count_conflicts(schedule_items, rooms, sections, timeslots, valid_timeslot_cache=ts_cache)
+    conflict_detail = {
+        "instructor": count_instructor_conflicts(schedule_items),
+        "room": count_room_conflicts(schedule_items),
+        "campus": count_campus_conflicts(schedule_items, rooms),
+        "room_type": count_room_type_conflicts(schedule_items, rooms),
+        "department": count_department_conflicts(schedule_items, rooms),
+        "capacity": count_capacity_conflicts(schedule_items, rooms),
+        "timeslot_guidelines": count_timeslot_guideline_conflicts(schedule_items, sections, timeslots, ts_cache),
+    }
     fitness_score = calculate_fitness(
-        schedule_items, rooms, sections=sections, timeslots=timeslots
+        schedule_items, rooms, sections=sections, timeslots=timeslots, valid_timeslot_cache=ts_cache,
     )
 
     return {
         "schedule": enriched,
         "scheduled": scheduled,
-        "unscheduled": unscheduled,
+        "unscheduled": unscheduled_count,
         "conflicts": conflict_count,
+        "conflict_detail": conflict_detail,
         "fitness": fitness_score,
         "exec_time": exec_time,
         "total_sections": len(sections),
@@ -315,8 +356,51 @@ async def optimize(
     request: TimetableRequest,
     user_id: int = Depends(get_current_user_id),
 ):
-    result = run_optimization(request.algorithm)
+    """Synchronous optimize — fine for greedy and quick single-run genetic/hybrid."""
+    result = run_optimization(request.algorithm, num_runs=request.num_runs)
     return {"status": "success", "timetable": result}
+
+
+def _run_job(job_id: str, algorithm: str, num_runs: int) -> None:
+    """Worker function executed in a thread pool for async optimization jobs."""
+    try:
+        result = run_optimization(algorithm, num_runs=num_runs)
+        _jobs[job_id] = {"status": "done", "result": result}
+    except Exception as exc:
+        _jobs[job_id] = {"status": "error", "error": str(exc)}
+
+
+@app.post("/api/optimize/async")
+async def optimize_async(
+    request: TimetableRequest,
+    background_tasks: BackgroundTasks,
+    user_id: int = Depends(get_current_user_id),
+):
+    """
+    Async optimize — starts the job in a background thread and returns a job_id
+    immediately. Use GET /api/jobs/{job_id} to poll for the result.
+    Intended for multi-run genetic/hybrid experiments (num_runs up to 30).
+    """
+    job_id = str(uuid.uuid4())
+    _jobs[job_id] = {"status": "running"}
+    loop = asyncio.get_event_loop()
+    loop.run_in_executor(_executor, _run_job, job_id, request.algorithm, request.num_runs)
+    return {"job_id": job_id, "status": "running"}
+
+
+@app.get("/api/jobs/{job_id}")
+async def get_job(job_id: str, user_id: int = Depends(get_current_user_id)):
+    """Poll the result of an async optimization job."""
+    job = _jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job["status"] == "running":
+        return {"status": "running"}
+    if job["status"] == "error":
+        raise HTTPException(status_code=500, detail=job["error"])
+    result = job["result"]
+    del _jobs[job_id]
+    return {"status": "done", "timetable": result}
 
 
 @app.post("/api/schedules")
@@ -524,6 +608,26 @@ async def delete_prerequisite(course_id: int, req_course_id: int, user_id: int =
     if not res.data:
         raise HTTPException(status_code=404, detail="Prerequisite not found")
     return {"status": "deleted"}
+
+
+@app.get("/api/departments")
+async def list_departments(user_id: int = Depends(get_current_user_id)):
+    return crud_list("dept", order_by="dept_id")
+
+
+@app.post("/api/departments")
+async def create_department(dept: DeptIn, user_id: int = Depends(get_current_user_id)):
+    return crud_insert("dept", dept.model_dump())
+
+
+@app.put("/api/departments/{dept_id}")
+async def update_department(dept_id: int, dept: DeptIn, user_id: int = Depends(get_current_user_id)):
+    return crud_update("dept", "dept_id", dept_id, dept.model_dump())
+
+
+@app.delete("/api/departments/{dept_id}")
+async def delete_department(dept_id: int, user_id: int = Depends(get_current_user_id)):
+    return crud_delete("dept", "dept_id", dept_id)
 
 
 @app.get("/api/health")
