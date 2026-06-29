@@ -228,10 +228,9 @@ def crud_delete(table: str, id_col: str, id_val: Any):
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "https://v0-university-timetable-tool-2-oj.vercel.app",
-    ],
+    allow_origins=["http://localhost:3000"],
+    # Matches any Vercel deployment of this project regardless of preview suffix
+    allow_origin_regex=r"https://v0-university-timetable-tool-2[^.]*\.vercel\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
