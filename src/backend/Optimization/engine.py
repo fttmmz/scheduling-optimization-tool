@@ -1,14 +1,16 @@
+from functools import partial
 from backend.Optimization.Algorithims.greedy import greedy_schedule
 from backend.Optimization.constraints import classify_section
 from backend.Optimization.Algorithims.genetic import genetic_runs
 from backend.Optimization.Algorithims.hybrid import genetic_runs as hybrid_runs
 from backend.Optimization.evaluation import count_scheduled_sections
 
-# Registry:  new algorithms are added here
+# greedy is fast; genetic/hybrid cap at 1 run so the API responds
+# in seconds rather than timing out on the deployed server.
 ALGORITHM_REGISTRY = {
     "greedy": greedy_schedule,
-    "genetic": genetic_runs,
-    "hybrid": hybrid_runs,
+    "genetic": partial(genetic_runs, num_runs=1),
+    "hybrid": partial(hybrid_runs, num_runs=1),
 }
 
 
