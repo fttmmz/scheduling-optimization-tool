@@ -19,13 +19,13 @@ from backend.Optimization.evaluation import (
 # PARAMETERS
 # =========================
 POPULATION_SIZE = 10
-GENERATIONS = 20
+GENERATIONS = 10
 
 CROSSOVER_RATE = 0.85
 MUTATION_RATE = 0.03
 
 # Tabu Search parameters
-TABU_ITERATIONS = 5
+TABU_ITERATIONS = 3
 TABU_TENURE = 5
 
 # Apply TS to top 10% of solutions
@@ -209,7 +209,7 @@ def mutation(schedule, rooms, timeslots):
 
             for room in random.sample(
                 viable_rooms,
-                len(viable_rooms),
+                min(20, len(viable_rooms)),
             ):
 
                 if (
@@ -224,7 +224,7 @@ def mutation(schedule, rooms, timeslots):
 
         for ts in random.sample(
             timeslots,
-            len(timeslots),
+            min(30, len(timeslots)),
         ):
 
             instructor_free = (
@@ -306,9 +306,10 @@ def tabu_search(
                 timeslots,
             )
 
-            random.shuffle(valid_times)
-
-            for ts in valid_times:
+            for ts in random.sample(
+                valid_times,
+                min(30, len(valid_times)),
+            ):
 
                 instructor_free = (
                     selected_item.instructor_id,
@@ -341,9 +342,10 @@ def tabu_search(
                 rooms,
             )
 
-            random.shuffle(valid_rooms)
-
-            for room in valid_rooms:
+            for room in random.sample(
+                valid_rooms,
+                min(20, len(valid_rooms)),
+            ):
 
                 if (
                     room.id,
@@ -442,21 +444,23 @@ def genetic_schedule(sections, timeslots, rooms, cache=None):
             reverse=True,
         )
 
-        # apply TS to best individuals only
-        top_k = max(
-            1,
-            int(len(new_population) * TS_APPLY_RATE)
-        )
+        # Apply Tabu Search only during the final generation
+        if i == GENERATIONS - 1:
 
-        for j in range(top_k):
-
-            new_population[j] = tabu_search(
-                new_population[j],
-                rooms,
-                timeslots,
-                sections,
-                cache,
+            top_k = max(
+                1,
+                int(len(new_population) * TS_APPLY_RATE)
             )
+
+            for j in range(top_k):
+
+                new_population[j] = tabu_search(
+                    new_population[j],
+                    rooms,
+                    timeslots,
+                    sections,
+                    cache,
+                )
 
         population = new_population
 
