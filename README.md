@@ -19,13 +19,15 @@ This repository contains work for the **Junior Project** phase and is intended f
 
 ---
 
-## Current Project Phase
+## Project Phases
 **Junior Project**
 
-The current phase emphasizes requirements analysis, system design, algorithm research, and prototype development rather than a fully functional application.
+This phase emphasizes requirements analysis, system design, algorithm research, and prototype development rather than a fully functional application.
+
+**Senior Project**
+to be added
 
 ---
-
 ## Features
 
 
@@ -35,6 +37,9 @@ The current phase emphasizes requirements analysis, system design, algorithm res
 - Frontend: React
 - Backend: Python
 - Version Control: GitHub
+- Database: supabase
+- Deployment: Vercel, Render
+- AI agents: V0, Claude
 
 ---
 
@@ -44,6 +49,6 @@ This project is in its **early development stage** and is subject to ongoing ref
 ---
 
 ## Credits
-Junior Project Team  
+Senior Project Team  
 University of Sharjah  
 Supervisor: Dr. Saber Elsayed
