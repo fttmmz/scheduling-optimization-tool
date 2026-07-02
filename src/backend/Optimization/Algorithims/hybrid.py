@@ -18,18 +18,33 @@ from backend.Optimization.evaluation import (
 # =========================
 # PARAMETERS
 # =========================
-POPULATION_SIZE = 10
-GENERATIONS = 10
+POPULATION_SIZE = 20          # was 10 -> more diversity to select from
+GENERATIONS = 20              # was 10 -> more time to converge
 
 CROSSOVER_RATE = 0.85
-MUTATION_RATE = 0.03
+MUTATION_RATE = 0.02          # now applied PER GENE (see mutation()), not per chromosome
+
+# Elitism: best individuals are copied unchanged into the next generation.
+# This guarantees fitness never regresses generation-to-generation.
+ELITISM_COUNT = 2
+
+# Random immigrants: brand new random individuals injected each generation
+# to fight premature convergence / loss of diversity.
+RANDOM_IMMIGRANT_RATE = 0.10
+
+# Tournament selection
+TOURNAMENT_SIZE = 3
 
 # Tabu Search parameters
-TABU_ITERATIONS = 3
-TABU_TENURE = 5
+TABU_TENURE = 7
 
-# Apply TS to top 10% of solutions
-TS_APPLY_RATE = 0.1
+# Tabu search is now run EVERY generation on the elites (memetic algorithm),
+# with a light budget, plus a much deeper pass at the very end.
+TS_ITERATIONS_PER_GEN = 12
+TS_ITERATIONS_FINAL = 60
+
+# Apply per-generation TS to this fraction of the (sorted) population
+TS_APPLY_RATE = 0.2
 
 
 # =========================
@@ -134,23 +149,46 @@ def create_population(size, sections, rooms, timeslots):
     return population
 
 
-# =========================
-# SELECTION
-# =========================
-def selection(population, rooms, sections, timeslots, cache):
+def create_single_random_individual(sections, rooms, timeslots):
+    """Used for random-immigrant diversity injection."""
+    return create_population(1, sections, rooms, timeslots)[0]
 
-    population.sort(
-        key=lambda s: calculate_fitness(
-            s,
-            rooms,
-            sections=sections,
-            timeslots=timeslots,
-            valid_timeslot_cache=cache,
-        ),
-        reverse=True,
+
+# =========================
+# FITNESS HELPERS
+# =========================
+def _score(schedule, rooms, sections, timeslots, cache):
+    return calculate_fitness(
+        schedule,
+        rooms,
+        sections=sections,
+        timeslots=timeslots,
+        valid_timeslot_cache=cache,
     )
 
-    return population[: len(population) // 2]
+
+def _sorted_by_fitness(population, rooms, sections, timeslots, cache):
+    scored = [
+        (ind, _score(ind, rooms, sections, timeslots, cache))
+        for ind in population
+    ]
+    scored.sort(key=lambda pair: pair[1], reverse=True)
+    return scored
+
+
+# =========================
+# SELECTION (tournament)
+# =========================
+def tournament_select(scored_population, k=TOURNAMENT_SIZE):
+    """
+    scored_population: list of (individual, fitness) tuples.
+    Picks k at random, returns the fittest of that sample.
+    Keeps selection pressure without fully discarding weaker
+    individuals the way pure truncation does.
+    """
+    sample = random.sample(scored_population, min(k, len(scored_population)))
+    sample.sort(key=lambda pair: pair[1], reverse=True)
+    return sample[0][0]
 
 
 # =========================
@@ -169,34 +207,27 @@ def crossover(parent1, parent2):
 
 
 # =========================
-# MUTATION
+# MUTATION (per-gene)
 # =========================
-def mutation(schedule, rooms, timeslots):
-
-    if len(schedule) == 0:
-        return schedule
-
-    if random.random() > MUTATION_RATE:
-        return schedule
-
-    selected_item = random.choice(schedule)
+def _mutate_single_item(selected_item, schedule, rooms, timeslots):
 
     occupied_instructors = set()
     occupied_rooms = set()
 
     for item in schedule:
 
-        if item != selected_item:
+        if item is selected_item:
+            continue
 
-            if item.instructor_id and item.timeslot_id:
-                occupied_instructors.add(
-                    (item.instructor_id, item.timeslot_id)
-                )
+        if item.instructor_id and item.timeslot_id:
+            occupied_instructors.add(
+                (item.instructor_id, item.timeslot_id)
+            )
 
-            if item.room_id and item.timeslot_id:
-                occupied_rooms.add(
-                    (item.room_id, item.timeslot_id)
-                )
+        if item.room_id and item.timeslot_id:
+            occupied_rooms.add(
+                (item.room_id, item.timeslot_id)
+            )
 
     if random.random() < 0.5:
 
@@ -241,12 +272,31 @@ def mutation(schedule, rooms, timeslots):
                 selected_item.timeslot_id = ts.id
                 break
 
+
+def mutation(schedule, rooms, timeslots):
+    """
+    Per-gene mutation: every item in the schedule independently has a
+    MUTATION_RATE chance of being reassigned. This gives far more
+    exploration than mutating a single random gene per individual,
+    while MUTATION_RATE stays low enough not to destroy good schedules.
+    """
+
+    if len(schedule) == 0:
+        return schedule
+
+    for item in schedule:
+        if random.random() < MUTATION_RATE:
+            _mutate_single_item(item, schedule, rooms, timeslots)
+
     return schedule
 
 
 # =========================
 # TABU SEARCH
-# This improves good solutions produced by GA
+# Real tabu search: accepts sideways/worse moves to escape local
+# optima, uses an attribute-based tabu list (tabu the *reverting*
+# move) with an aspiration criterion that overrides tabu status
+# whenever a move produces a new best-ever solution.
 # =========================
 def tabu_search(
     schedule,
@@ -254,28 +304,27 @@ def tabu_search(
     timeslots,
     sections,
     cache,
+    iterations=TS_ITERATIONS_PER_GEN,
 ):
 
     current = copy.deepcopy(schedule)
     best = copy.deepcopy(schedule)
 
-    best_score = calculate_fitness(
-        best,
-        rooms,
-        sections=sections,
-        timeslots=timeslots,
-        valid_timeslot_cache=cache,
-    )
+    current_score = _score(current, rooms, sections, timeslots, cache)
+    best_score = current_score
 
-    tabu_list = []
+    # move_key -> iteration index at which the tabu status expires
+    tabu_list = {}
 
-    for i in range(TABU_ITERATIONS):
+    for it in range(iterations):
 
-        # choose one random course
         idx = random.randint(0, len(current) - 1)
 
         neighbor = copy.deepcopy(current)
         selected_item = neighbor[idx]
+
+        old_ts = selected_item.timeslot_id
+        old_room = selected_item.room_id
 
         # build occupied instructor and room sets
         occupied_instructors = set()
@@ -306,10 +355,13 @@ def tabu_search(
                 timeslots,
             )
 
-            for ts in random.sample(
-                valid_times,
-                min(30, len(valid_times)),
-            ):
+            candidates = (
+                random.sample(valid_times, min(30, len(valid_times)))
+                if valid_times
+                else []
+            )
+
+            for ts in candidates:
 
                 instructor_free = (
                     selected_item.instructor_id,
@@ -326,11 +378,8 @@ def tabu_search(
                     selected_item.timeslot_id = ts.id
                     break
 
-            move = (
-                "ts",
-                idx,
-                selected_item.timeslot_id,
-            )
+            # tabu the move that would UNDO this change (revert to old_ts)
+            move_key = ("ts", idx, old_ts)
 
         # --------------------------------
         # Change room
@@ -342,10 +391,13 @@ def tabu_search(
                 rooms,
             )
 
-            for room in random.sample(
-                valid_rooms,
-                min(20, len(valid_rooms)),
-            ):
+            candidates = (
+                random.sample(valid_rooms, min(20, len(valid_rooms)))
+                if valid_rooms
+                else []
+            )
+
+            for room in candidates:
 
                 if (
                     room.id,
@@ -355,39 +407,38 @@ def tabu_search(
                     selected_item.room_id = room.id
                     break
 
-            move = (
-                "room",
-                idx,
-                selected_item.room_id,
-            )
+            # tabu the move that would UNDO this change (revert to old_room)
+            move_key = ("room", idx, old_room)
 
-        # skip tabu moves
-        if move in tabu_list:
+        # nothing actually changed (no free slot found) -> skip
+        if (
+            selected_item.timeslot_id == old_ts
+            and selected_item.room_id == old_room
+        ):
             continue
 
-        score = calculate_fitness(
-            neighbor,
-            rooms,
-            sections=sections,
-            timeslots=timeslots,
-            valid_timeslot_cache=cache,
-        )
+        score = _score(neighbor, rooms, sections, timeslots, cache)
 
-        # accept better neighbor
+        is_tabu = tabu_list.get(move_key, -1) > it
+        aspiration = score > best_score  # override tabu if new global best
+
+        if is_tabu and not aspiration:
+            continue
+
+        # accept the move regardless of whether it improves on `current`
+        # (this is what lets tabu search escape local optima, unlike
+        # a plain greedy hill-climb)
+        current = neighbor
+        current_score = score
+
+        tabu_list[move_key] = it + TABU_TENURE
+
         if score > best_score:
-
             best_score = score
             best = copy.deepcopy(neighbor)
-            current = neighbor
-
-        # add move to tabu list
-        tabu_list.append(move)
-
-        # maintain tabu tenure
-        if len(tabu_list) > TABU_TENURE:
-            tabu_list.pop(0)
 
     return best
+
 
 # =========================
 # HYBRID GA + TABU SEARCH
@@ -407,75 +458,90 @@ def genetic_schedule(sections, timeslots, rooms, cache=None):
         timeslots,
     )
 
-    for i in range(GENERATIONS):
+    # track the best individual ever seen, independent of what
+    # survives into the final generation's population
+    global_best = None
+    global_best_score = float("-inf")
 
-        selected = selection(
-            population,
-            rooms,
-            sections,
-            timeslots,
-            cache,
+    for gen in range(GENERATIONS):
+
+        scored = _sorted_by_fitness(
+            population, rooms, sections, timeslots, cache
         )
 
+        if scored[0][1] > global_best_score:
+            global_best_score = scored[0][1]
+            global_best = copy.deepcopy(scored[0][0])
+
+        is_final_gen = gen == GENERATIONS - 1
+
+        # ---- Memetic step: polish a slice of the fitter individuals
+        # every generation (not just the last one), so improvements
+        # compound across generations instead of being a one-shot
+        # end-of-run polish.
+        ts_budget = TS_ITERATIONS_FINAL if is_final_gen else TS_ITERATIONS_PER_GEN
+        top_k = max(1, int(len(scored) * TS_APPLY_RATE))
+
+        for j in range(top_k):
+            ind, _ = scored[j]
+            improved = tabu_search(
+                ind, rooms, timeslots, sections, cache, iterations=ts_budget
+            )
+            improved_score = _score(improved, rooms, sections, timeslots, cache)
+            scored[j] = (improved, improved_score)
+
+        scored.sort(key=lambda pair: pair[1], reverse=True)
+
+        if scored[0][1] > global_best_score:
+            global_best_score = scored[0][1]
+            global_best = copy.deepcopy(scored[0][0])
+
+        if is_final_gen:
+            population = [ind for ind, _ in scored]
+            break
+
+        # ---- Build next generation ----
         new_population = []
 
+        # Elitism: carry the best individuals over untouched
+        elite_count = min(ELITISM_COUNT, len(scored))
+        for j in range(elite_count):
+            new_population.append(copy.deepcopy(scored[j][0]))
+
+        # Random immigrants: fresh random individuals for diversity
+        n_immigrants = int(POPULATION_SIZE * RANDOM_IMMIGRANT_RATE)
+        for _ in range(n_immigrants):
+            if len(new_population) >= POPULATION_SIZE:
+                break
+            new_population.append(
+                create_single_random_individual(sections, rooms, timeslots)
+            )
+
+        # Fill the rest via tournament selection + crossover + mutation
         while len(new_population) < POPULATION_SIZE:
 
-            p1, p2 = random.sample(selected, 2)
+            p1 = tournament_select(scored)
+            p2 = tournament_select(scored)
 
             child = crossover(p1, p2)
-
-            child = mutation(
-                child,
-                rooms,
-                timeslots,
-            )
+            child = mutation(child, rooms, timeslots)
 
             new_population.append(child)
 
-        new_population.sort(
-            key=lambda s: calculate_fitness(
-                s,
-                rooms,
-                sections=sections,
-                timeslots=timeslots,
-                valid_timeslot_cache=cache,
-            ),
-            reverse=True,
-        )
-
-        # Apply Tabu Search only during the final generation
-        if i == GENERATIONS - 1:
-
-            top_k = max(
-                1,
-                int(len(new_population) * TS_APPLY_RATE)
-            )
-
-            for j in range(top_k):
-
-                new_population[j] = tabu_search(
-                    new_population[j],
-                    rooms,
-                    timeslots,
-                    sections,
-                    cache,
-                )
-
         population = new_population
 
-    best = max(
+    best_final = max(
         population,
-        key=lambda s: calculate_fitness(
-            s,
-            rooms,
-            sections=sections,
-            timeslots=timeslots,
-            valid_timeslot_cache=cache,
-        ),
+        key=lambda s: _score(s, rooms, sections, timeslots, cache),
     )
+    best_final_score = _score(best_final, rooms, sections, timeslots, cache)
 
-    return best
+    # return whichever is truly best: the final population's best,
+    # or the best ever observed during the run
+    if global_best_score > best_final_score:
+        return global_best
+
+    return best_final
 
 
 # =========================
@@ -491,7 +557,7 @@ def genetic_runs(
     fitness_scores = []
 
     best_overall_schedule = None
-    best_overall_fitness = -1
+    best_overall_fitness = float("-inf")
 
     print(
         f"\n=== Hybrid GA + Tabu Search: {num_runs} runs ==="
