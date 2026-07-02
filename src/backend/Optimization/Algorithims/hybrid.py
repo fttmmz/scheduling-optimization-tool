@@ -296,42 +296,20 @@ def crossover(parent1, parent2, sections, viability_cache):
         p1_gene = parent1[i]
         p2_gene = parent2[i]
 
-        assigned = False
-
-        # Try parent1 gene
         if (
                 p1_gene.room_id is not None and
                 p1_gene.timeslot_id is not None
         ):
-            if passes_hard_constraints(
-                    sections[i],
-                    p1_gene.room_id,
-                    p1_gene.timeslot_id,
-                    set(),
-                    set()
-            ):
-                child[i] = copy.deepcopy(p1_gene)
-                assigned = True
+            child[i] = copy.deepcopy(p1_gene)
 
-        # Try parent2 gene
-        if (
-                not assigned and
+        elif (
                 p2_gene.room_id is not None and
                 p2_gene.timeslot_id is not None
         ):
-            if passes_hard_constraints(
-                    sections[i],
-                    p2_gene.room_id,
-                    p2_gene.timeslot_id,
-                    set(),
-                    set()
-            ):
-                child[i] = copy.deepcopy(p2_gene)
-                assigned = True
+            child[i] = copy.deepcopy(p2_gene)
 
-        # If neither works → fallback
-        if not assigned:
-            child[i] = copy.deepcopy(p1_gene if random.random() < 0.5 else p2_gene)
+        else:
+            child[i] = copy.deepcopy(p1_gene)
 
     return child
 
