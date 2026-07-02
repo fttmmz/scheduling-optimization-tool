@@ -275,31 +275,17 @@ def tournament_selection(
 # CROSSOVER
 # =========================
 def crossover(parent1, parent2, sections, viability_cache):
+    if random.random() > CROSSOVER_RATE:
+        return copy.deepcopy(parent1)
+
     child = []
 
-    for i in range(len(sections)):
-
-        section = sections[i]
+    for i in range(len(parent1)):
 
         if random.random() < 0.5:
-            source = parent1[i]
+            child.append(copy.deepcopy(parent1[i]))
         else:
-            source = parent2[i]
-
-        # rebuild gene based on section constraints
-        item = ScheduleItem(
-            course_id=section.course.id,
-            course_name=section.course.name,
-            course_type=section.course.type,
-            course_dept=section.course.dept,
-            capacity=section.capacity,
-            instructor_id=section.instructor_id,
-            room_id=source.room_id,
-            timeslot_id=source.timeslot_id,
-            section=str(section.no),
-        )
-
-        child.append(item)
+            child.append(copy.deepcopy(parent2[i]))
 
     return child
 
