@@ -57,6 +57,10 @@ class SignupRequest(BaseModel):
     password: str
 
 
+class RefreshRequest(BaseModel):
+    refresh_token: str
+
+
 class ScheduleSaveRequest(BaseModel):
     name: str
     algorithm: str
@@ -307,6 +311,7 @@ async def login(request: LoginRequest):
         "email": profile_res.data["email"],
         "role": profile_res.data["role"],
         "access_token": auth_response.session.access_token,
+        "refresh_token": auth_response.session.refresh_token,
     }
 
 
@@ -340,6 +345,7 @@ async def signup(request: SignupRequest):
             "email": profile["email"],
             "role": profile["role"],
             "access_token": None,
+            "refresh_token": None,
             "message": "Account created. Please check your email to confirm before logging in.",
         }
 
@@ -348,6 +354,29 @@ async def signup(request: SignupRequest):
         "email": profile["email"],
         "role": profile["role"],
         "access_token": auth_response.session.access_token,
+        "refresh_token": auth_response.session.refresh_token,
+    }
+
+
+@app.post("/api/auth/refresh")
+async def refresh_token(request: RefreshRequest):
+    """Exchange a refresh token for a new access/refresh token pair.
+
+    Access tokens expire (commonly after 1 hour); long-running optimization
+    jobs poll for longer than that, so the frontend calls this to stay
+    logged in instead of being kicked out mid-run.
+    """
+    try:
+        auth_response = supabase.auth.refresh_session(request.refresh_token)
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid or expired refresh token")
+
+    if not auth_response or not auth_response.session:
+        raise HTTPException(status_code=401, detail="Invalid or expired refresh token")
+
+    return {
+        "access_token": auth_response.session.access_token,
+        "refresh_token": auth_response.session.refresh_token,
     }
 
 
