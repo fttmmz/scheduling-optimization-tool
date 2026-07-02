@@ -18,18 +18,21 @@ from backend.Optimization.evaluation import (
 # =========================
 # PARAMETERS
 # =========================
-POPULATION_SIZE = 10
-GENERATIONS = 10
+POPULATION_SIZE = 15
+GENERATIONS = 15
 
-CROSSOVER_RATE = 0.85
-MUTATION_RATE = 0.03
+CROSSOVER_RATE = 0.90
+MUTATION_RATE = 0.08
 
-# Tabu Search parameters
-TABU_ITERATIONS = 3
-TABU_TENURE = 5
+# Tabu Search
+TABU_ITERATIONS = 5
+TABU_TENURE = 7
 
-# Apply TS to top 10% of solutions
-TS_APPLY_RATE = 0.1
+# Apply Tabu Search to top 20%
+TS_APPLY_RATE = 0.2
+
+# Keep the best schedules each generation
+ELITE_SIZE = 2
 
 
 # =========================
@@ -153,6 +156,32 @@ def selection(population, rooms, sections, timeslots, cache):
     return population[: len(population) // 2]
 
 
+def tournament_selection(
+    population,
+    rooms,
+    sections,
+    timeslots,
+    cache,
+    tournament_size=3,
+):
+
+    competitors = random.sample(
+        population,
+        tournament_size,
+    )
+
+    return max(
+        competitors,
+        key=lambda s: calculate_fitness(
+            s,
+            rooms,
+            sections=sections,
+            timeslots=timeslots,
+            valid_timeslot_cache=cache,
+        ),
+    )
+
+
 # =========================
 # CROSSOVER
 # =========================
@@ -161,11 +190,16 @@ def crossover(parent1, parent2):
     if random.random() > CROSSOVER_RATE:
         return copy.deepcopy(parent1)
 
-    point = random.randint(1, len(parent1) - 1)
+    child = []
 
-    child = parent1[:point] + parent2[point:]
+    for i in range(len(parent1)):
 
-    return copy.deepcopy(child)
+        if random.random() < 0.5:
+            child.append(copy.deepcopy(parent1[i]))
+        else:
+            child.append(copy.deepcopy(parent2[i]))
+
+    return child
 
 
 # =========================
@@ -272,7 +306,12 @@ def tabu_search(
     for i in range(TABU_ITERATIONS):
 
         # choose one random course
-        idx = random.randint(0, len(current) - 1)
+        candidate_indices = random.sample(
+            range(len(current)),
+            min(20, len(current)),
+        )
+
+        idx = random.choice(candidate_indices)
 
         neighbor = copy.deepcopy(current)
         selected_item = neighbor[idx]
@@ -407,6 +446,10 @@ def genetic_schedule(sections, timeslots, rooms, cache=None):
         timeslots,
     )
 
+    best_generation_score = 0
+    stagnation = 0
+    NO_IMPROVEMENT_LIMIT = 5
+
     for i in range(GENERATIONS):
 
         selected = selection(
@@ -417,11 +460,27 @@ def genetic_schedule(sections, timeslots, rooms, cache=None):
             cache,
         )
 
-        new_population = []
+        elites = copy.deepcopy(selected[:ELITE_SIZE])
+
+        new_population = elites
 
         while len(new_population) < POPULATION_SIZE:
 
-            p1, p2 = random.sample(selected, 2)
+            p1 = tournament_selection(
+                selected,
+                rooms,
+                sections,
+                timeslots,
+                cache,
+            )
+
+            p2 = tournament_selection(
+                selected,
+                rooms,
+                sections,
+                timeslots,
+                cache,
+            )
 
             child = crossover(p1, p2)
 
@@ -444,9 +503,41 @@ def genetic_schedule(sections, timeslots, rooms, cache=None):
             reverse=True,
         )
 
+        current_best = calculate_fitness(
+            new_population[0],
+            rooms,
+            sections=sections,
+            timeslots=timeslots,
+            valid_timeslot_cache=cache,
+            )
+
+        if current_best > best_generation_score:
+            best_generation_score = current_best
+            stagnation = 0
+        else:
+            stagnation += 1
+
+        if stagnation >= NO_IMPROVEMENT_LIMIT:
+            top_k = max(
+                1,
+                int(len(new_population) * TS_APPLY_RATE)
+            )
+
+            for j in range(top_k):
+
+                new_population[j] = tabu_search(
+                    new_population[j],
+                    rooms,
+                    timeslots,
+                    sections,
+                    cache,
+                )
+
+            population = new_population
+            break
+
         # Apply Tabu Search only during the final generation
         if i == GENERATIONS - 1:
-
             top_k = max(
                 1,
                 int(len(new_population) * TS_APPLY_RATE)
