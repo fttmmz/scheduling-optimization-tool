@@ -15,6 +15,19 @@ from backend.Optimization.evaluation import (
     build_timeslot_guideline_cache,
 )
 
+
+def build_viability_cache(sections, rooms, timeslots):
+    cache = {}
+
+    for i, section in enumerate(sections):
+        cache[i] = {
+            "rooms": get_viable_rooms(section, rooms),
+            "timeslots": get_valid_timeslots(section, timeslots),
+        }
+
+    return cache
+
+
 # =========================
 # PARAMETERS
 # =========================
@@ -136,7 +149,8 @@ def create_population(size, sections, rooms, timeslots):
                     (section.instructor_id, ts.id)
                 )
 
-        repair_schedule(schedule, sections, rooms, timeslots)
+        viability_cache = build_viability_cache(sections, rooms, timeslots)
+        repair_schedule(schedule, sections, rooms, timeslots, viability_cache)
 
         population.append(schedule)
 
@@ -146,103 +160,73 @@ def create_population(size, sections, rooms, timeslots):
 # =========================
 # CONFLICT REPAIR
 # =========================
-def repair_schedule(schedule, sections, rooms, timeslots):
+def repair_schedule(schedule, sections, rooms, timeslots, viability_cache=None):
     occupied_instructors = set()
     occupied_rooms = set()
 
-    order = list(range(len(schedule)))
-    random.shuffle(order)
+    order = sorted(
+        range(len(schedule)),
+        key=lambda i: (
+            len(viability_cache[i]["rooms"]) if viability_cache else 0
+        )
+    )
 
     for idx in order:
 
         item = schedule[idx]
-        section = sections[idx] if idx < len(sections) else None
+        section = sections[idx]
 
-        has_conflict = False
+        if item.room_id and item.timeslot_id:
 
-        if item.instructor_id is not None and item.timeslot_id is not None:
-            if (item.instructor_id, item.timeslot_id) in occupied_instructors:
-                has_conflict = True
-
-        if item.room_id is not None and item.timeslot_id is not None:
-            if (item.room_id, item.timeslot_id) in occupied_rooms:
-                has_conflict = True
-
-        needs_assignment = (
-                item.room_id is None
-                or item.timeslot_id is None
-                or has_conflict
-        )
-
-        if not needs_assignment:
-            if item.instructor_id is not None and item.timeslot_id is not None:
-                occupied_instructors.add(
-                    (item.instructor_id, item.timeslot_id)
-                )
-            if item.room_id is not None and item.timeslot_id is not None:
+            if (
+                    (item.instructor_id, item.timeslot_id) in occupied_instructors
+                    or (item.room_id, item.timeslot_id) in occupied_rooms
+            ):
+                item.room_id = None
+                item.timeslot_id = None
+            else:
+                occupied_instructors.add((item.instructor_id, item.timeslot_id))
                 occupied_rooms.add((item.room_id, item.timeslot_id))
-            continue
+                continue
 
-        viable_rooms = (
-            get_viable_rooms(section, rooms)
-            if section is not None
-            else get_viable_rooms_for_schedule_item(item, rooms)
-        )
-        valid_timeslots = (
-            get_valid_timeslots(section, timeslots)
-            if section is not None
-            else timeslots
-        )
-
-        if not viable_rooms or not valid_timeslots:
-            item.room_id = None
-            item.timeslot_id = None
-            continue
-
-        shuffled_rooms = viable_rooms[:]
-        shuffled_timeslots = valid_timeslots[:]
-        random.shuffle(shuffled_rooms)
-        random.shuffle(shuffled_timeslots)
+        rooms_viable = viability_cache[idx]["rooms"] if viability_cache else get_viable_rooms(section, rooms)
+        times_viable = viability_cache[idx]["timeslots"] if viability_cache else get_valid_timeslots(section, timeslots)
 
         assigned = False
 
-        for ts in shuffled_timeslots:
+        for ts in random.sample(times_viable, min(len(times_viable), 20)):
 
-            if (
-                    item.instructor_id is not None
-                    and (item.instructor_id, ts.id) in occupied_instructors
-            ):
+            if section.instructor_id and (section.instructor_id, ts.id) in occupied_instructors:
                 continue
 
-            for room in shuffled_rooms:
+            for room in random.sample(rooms_viable, min(len(rooms_viable), 20)):
 
                 if (room.id, ts.id) in occupied_rooms:
                     continue
 
-                if section is not None and not passes_hard_constraints(
+                if not passes_hard_constraints(
                         section,
                         room,
                         ts,
-                        occupied_instructors=occupied_instructors,
-                        occupied_rooms=occupied_rooms,
+                        occupied_instructors,
+                        occupied_rooms,
                 ):
                     continue
 
                 item.room_id = room.id
                 item.timeslot_id = ts.id
+
+                occupied_rooms.add((room.id, ts.id))
+                if section.instructor_id:
+                    occupied_instructors.add((section.instructor_id, ts.id))
+
                 assigned = True
                 break
 
             if assigned:
                 break
 
-        if assigned:
-            if item.instructor_id is not None:
-                occupied_instructors.add(
-                    (item.instructor_id, item.timeslot_id)
-                )
-            occupied_rooms.add((item.room_id, item.timeslot_id))
-        else:
+        if not assigned:
             item.room_id = None
             item.timeslot_id = None
 
@@ -295,18 +279,59 @@ def tournament_selection(
 # =========================
 # CROSSOVER
 # =========================
-def crossover(parent1, parent2):
+def crossover(parent1, parent2, sections, viability_cache):
     if random.random() > CROSSOVER_RATE:
         return copy.deepcopy(parent1)
 
-    child = []
+    child = [None] * len(parent1)
 
-    for i in range(len(parent1)):
+    order = sorted(
+        range(len(sections)),
+        key=lambda i: len(viability_cache[i]["rooms"]) *
+                      len(viability_cache[i]["timeslots"])
+    )
 
-        if random.random() < 0.5:
-            child.append(copy.deepcopy(parent1[i]))
-        else:
-            child.append(copy.deepcopy(parent2[i]))
+    for i in order:
+
+        p1_gene = parent1[i]
+        p2_gene = parent2[i]
+
+        assigned = False
+
+        # Try parent1 gene
+        if (
+                p1_gene.room_id is not None and
+                p1_gene.timeslot_id is not None
+        ):
+            if passes_hard_constraints(
+                    sections[i],
+                    p1_gene.room_id,
+                    p1_gene.timeslot_id,
+                    set(),
+                    set()
+            ):
+                child[i] = copy.deepcopy(p1_gene)
+                assigned = True
+
+        # Try parent2 gene
+        if (
+                not assigned and
+                p2_gene.room_id is not None and
+                p2_gene.timeslot_id is not None
+        ):
+            if passes_hard_constraints(
+                    sections[i],
+                    p2_gene.room_id,
+                    p2_gene.timeslot_id,
+                    set(),
+                    set()
+            ):
+                child[i] = copy.deepcopy(p2_gene)
+                assigned = True
+
+        # If neither works → fallback
+        if not assigned:
+            child[i] = copy.deepcopy(p1_gene if random.random() < 0.5 else p2_gene)
 
     return child
 
@@ -321,109 +346,56 @@ def mutation(schedule, rooms, timeslots):
     if random.random() > MUTATION_RATE:
         return schedule
 
-    unscheduled = [
-        item for item in schedule
-        if item.room_id is None or item.timeslot_id is None
-    ]
+    selected_item = random.choice(schedule)
 
-    selected_item = (
-        random.choice(unscheduled) if unscheduled else random.choice(schedule)
-    )
-
+    # build conflict map
     occupied_instructors = set()
     occupied_rooms = set()
 
     for item in schedule:
-
         if item != selected_item:
 
             if item.instructor_id and item.timeslot_id:
-                occupied_instructors.add(
-                    (item.instructor_id, item.timeslot_id)
-                )
+                occupied_instructors.add((item.instructor_id, item.timeslot_id))
 
             if item.room_id and item.timeslot_id:
-                occupied_rooms.add(
-                    (item.room_id, item.timeslot_id)
-                )
+                occupied_rooms.add((item.room_id, item.timeslot_id))
 
     if selected_item.room_id is None or selected_item.timeslot_id is None:
 
         viable_rooms = get_viable_rooms_for_schedule_item(selected_item, rooms)
 
-        if viable_rooms and timeslots:
-
-            shuffled_rooms = random.sample(
-                viable_rooms, min(20, len(viable_rooms))
-            )
-            shuffled_timeslots = random.sample(
-                timeslots, min(30, len(timeslots))
-            )
-
-            assigned = False
-
-            for ts in shuffled_timeslots:
+        for room in random.sample(viable_rooms, min(20, len(viable_rooms))):
+            for ts in random.sample(timeslots, min(20, len(timeslots))):
 
                 if (
-                        selected_item.instructor_id is not None
-                        and (selected_item.instructor_id, ts.id) in occupied_instructors
+                        (room.id, ts.id) not in occupied_rooms and
+                        (selected_item.instructor_id, ts.id) not in occupied_instructors
                 ):
-                    continue
-
-                for room in shuffled_rooms:
-
-                    if (room.id, ts.id) in occupied_rooms:
-                        continue
-
                     selected_item.room_id = room.id
                     selected_item.timeslot_id = ts.id
-                    assigned = True
-                    break
-
-                if assigned:
-                    break
+                    return schedule
 
         return schedule
 
     if random.random() < 0.5:
 
-        viable_rooms = get_viable_rooms_for_schedule_item(
-            selected_item,
-            rooms,
-        )
+        viable_rooms = get_viable_rooms_for_schedule_item(selected_item, rooms)
 
-        if viable_rooms and selected_item.timeslot_id:
+        for room in random.sample(viable_rooms, min(20, len(viable_rooms))):
 
-            for room in random.sample(
-                    viable_rooms,
-                    min(20, len(viable_rooms)),
-            ):
-
-                if (
-                        room.id,
-                        selected_item.timeslot_id,
-                ) not in occupied_rooms:
-                    selected_item.room_id = room.id
-                    break
+            if (room.id, selected_item.timeslot_id) not in occupied_rooms:
+                selected_item.room_id = room.id
+                break
 
     else:
 
-        for ts in random.sample(
-                timeslots,
-                min(30, len(timeslots)),
-        ):
+        for ts in random.sample(timeslots, min(30, len(timeslots))):
 
-            instructor_free = (
-                                  selected_item.instructor_id,
-                                  ts.id,
-                              ) not in occupied_instructors
-
-            room_free = (
-                            selected_item.room_id,
-                            ts.id,
-                        ) not in occupied_rooms
-
-            if instructor_free and room_free:
+            if (
+                    (selected_item.instructor_id, ts.id) not in occupied_instructors and
+                    (selected_item.room_id, ts.id) not in occupied_rooms
+            ):
                 selected_item.timeslot_id = ts.id
                 break
 
@@ -553,7 +525,7 @@ def tabu_search(
         if move in tabu_list:
             continue
 
-        repair_schedule(neighbor, sections, rooms, timeslots)
+        repair_schedule(neighbor, sections, rooms, timeslots, cache)
 
         score = calculate_fitness(
             neighbor,
@@ -584,10 +556,9 @@ def tabu_search(
 # =========================
 def genetic_schedule(sections, timeslots, rooms, cache=None):
     if cache is None:
-        cache = build_timeslot_guideline_cache(
-            sections,
-            timeslots,
-        )
+        cache = build_timeslot_guideline_cache(sections, timeslots)
+
+    viability_cache = build_viability_cache(sections, rooms, timeslots)
 
     population = create_population(
         POPULATION_SIZE,
@@ -611,39 +582,22 @@ def genetic_schedule(sections, timeslots, rooms, cache=None):
         )
 
         elites = copy.deepcopy(selected[:ELITE_SIZE])
-
         new_population = elites
 
         while len(new_population) < POPULATION_SIZE:
-            p1 = tournament_selection(
-                selected,
-                rooms,
-                sections,
-                timeslots,
-                cache,
-            )
+            p1 = tournament_selection(selected, rooms, sections, timeslots, cache)
+            p2 = tournament_selection(selected, rooms, sections, timeslots, cache)
 
-            p2 = tournament_selection(
-                selected,
-                rooms,
-                sections,
-                timeslots,
-                cache,
-            )
+            child = crossover(p1, p2, sections, viability_cache)
+            repair_schedule(child, sections, rooms, timeslots, viability_cache)
 
-            child = crossover(p1, p2)
-
-            repair_schedule(child, sections, rooms, timeslots)
-
-            child = mutation(
-                child,
-                rooms,
-                timeslots,
-            )
-
-            repair_schedule(child, sections, rooms, timeslots)
+            child = mutation(child, rooms, timeslots)
+            repair_schedule(child, sections, rooms, timeslots, viability_cache)
 
             new_population.append(child)
+
+        for s in new_population:
+            repair_schedule(s, sections, rooms, timeslots, viability_cache)
 
         new_population.sort(
             key=lambda s: calculate_fitness(
@@ -670,30 +624,9 @@ def genetic_schedule(sections, timeslots, rooms, cache=None):
         else:
             stagnation += 1
 
-        if stagnation >= NO_IMPROVEMENT_LIMIT:
-            top_k = max(
-                1,
-                int(len(new_population) * TS_APPLY_RATE)
-            )
+        if stagnation >= NO_IMPROVEMENT_LIMIT or i == GENERATIONS - 1:
 
-            for j in range(top_k):
-                new_population[j] = tabu_search(
-                    new_population[j],
-                    rooms,
-                    timeslots,
-                    sections,
-                    cache,
-                )
-
-            population = new_population
-            break
-
-        # Apply Tabu Search only during the final generation
-        if i == GENERATIONS - 1:
-            top_k = max(
-                1,
-                int(len(new_population) * TS_APPLY_RATE)
-            )
+            top_k = max(1, int(len(new_population) * TS_APPLY_RATE))
 
             for j in range(top_k):
                 new_population[j] = tabu_search(
@@ -717,7 +650,7 @@ def genetic_schedule(sections, timeslots, rooms, cache=None):
         ),
     )
 
-    repair_schedule(best, sections, rooms, timeslots)
+    repair_schedule(best, sections, rooms, timeslots, viability_cache)
 
     return best
 
