@@ -164,12 +164,7 @@ def repair_schedule(schedule, sections, rooms, timeslots, viability_cache=None):
     occupied_instructors = set()
     occupied_rooms = set()
 
-    order = sorted(
-        range(len(schedule)),
-        key=lambda i: (
-            len(viability_cache[i]["rooms"]) if viability_cache else 0
-        )
-    )
+    order = list(range(len(schedule)))
 
     for idx in order:
 
@@ -189,8 +184,8 @@ def repair_schedule(schedule, sections, rooms, timeslots, viability_cache=None):
                 occupied_rooms.add((item.room_id, item.timeslot_id))
                 continue
 
-        rooms_viable = viability_cache[idx]["rooms"] if viability_cache else get_viable_rooms(section, rooms)
-        times_viable = viability_cache[idx]["timeslots"] if viability_cache else get_valid_timeslots(section, timeslots)
+        rooms_viable = get_viable_rooms(section, rooms)
+        times_viable = get_valid_timeslots(section, timeslots)
 
         assigned = False
 
@@ -280,36 +275,31 @@ def tournament_selection(
 # CROSSOVER
 # =========================
 def crossover(parent1, parent2, sections, viability_cache):
-    if random.random() > CROSSOVER_RATE:
-        return copy.deepcopy(parent1)
+    child = []
 
-    child = [None] * len(parent1)
+    for i in range(len(sections)):
 
-    order = sorted(
-        range(len(sections)),
-        key=lambda i: len(viability_cache[i]["rooms"]) *
-                      len(viability_cache[i]["timeslots"])
-    )
+        section = sections[i]
 
-    for i in order:
-
-        p1_gene = parent1[i]
-        p2_gene = parent2[i]
-
-        if (
-                p1_gene.room_id is not None and
-                p1_gene.timeslot_id is not None
-        ):
-            child[i] = copy.deepcopy(p1_gene)
-
-        elif (
-                p2_gene.room_id is not None and
-                p2_gene.timeslot_id is not None
-        ):
-            child[i] = copy.deepcopy(p2_gene)
-
+        if random.random() < 0.5:
+            source = parent1[i]
         else:
-            child[i] = copy.deepcopy(p1_gene)
+            source = parent2[i]
+
+        # rebuild gene based on section constraints
+        item = ScheduleItem(
+            course_id=section.course.id,
+            course_name=section.course.name,
+            course_type=section.course.type,
+            course_dept=section.course.dept,
+            capacity=section.capacity,
+            instructor_id=section.instructor_id,
+            room_id=source.room_id,
+            timeslot_id=source.timeslot_id,
+            section=str(section.no),
+        )
+
+        child.append(item)
 
     return child
 
