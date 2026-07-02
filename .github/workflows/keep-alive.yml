@@ -1,0 +1,17 @@
+name: Keep Render service alive
+
+on:
+  schedule:
+    # Render's free tier spins a web service down after 15 minutes with no
+    # incoming requests. Pinging every 10 minutes keeps it warm so users
+    # don't hit a 30-60s cold start, and keeps it awake during long
+    # genetic/hybrid optimization jobs that poll infrequently.
+    - cron: "*/10 * * * *"
+  workflow_dispatch: {}
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping health endpoint
+        run: curl -fsS --max-time 20 https://scheduling-optimization-backend.onrender.com/api/health
