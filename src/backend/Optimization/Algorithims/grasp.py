@@ -383,6 +383,39 @@ def grasp_runs(
             best_overall_fitness = score
             best_overall_schedule = copy.deepcopy(best_schedule)
 
-# last part is left
+        scheduled = sum(
+            1
+            for item in best_schedule
+            if item.room_id is not None
+            and item.timeslot_id is not None
+        )
+
+        print(
+            f"Run {run + 1:2d}: "
+            f"Fitness = {score:.4f} | "
+            f"Scheduled = {scheduled}"
+        )
+
+    # ========================================================
+    # Statistics
+    # ========================================================
+
+    best_score = max(fitness_scores)
+    worst_score = min(fitness_scores)
+    avg_score = sum(fitness_scores) / len(fitness_scores)
+
+    std_dev = (
+        statistics.stdev(fitness_scores)
+        if len(fitness_scores) > 1
+        else 0
+    )
+
+    print("\n=== Results ===")
+    print(f"Best fitness: {best_score:.4f}")
+    print(f"Worst fitness: {worst_score:.4f}")
+    print(f"Average fitness: {avg_score:.4f}")
+    print(f"Standard deviation: {std_dev:.4f}")
+
+    return best_overall_schedule
 
     
