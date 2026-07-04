@@ -38,6 +38,12 @@ ELITE_SIZE = 2
 # slower, smaller = faster but more conflicts left over.
 MAX_SEARCH_WIDTH = 20
 
+# how many still-unscheduled items the final "rescue" pass is allowed
+# to brute-force search exhaustively (see force_place_remaining below).
+# this normally only ever needs to touch a handful of items, so it's
+# safe to search all of their options instead of a random sample.
+RESCUE_MAX_ITEMS = 50
+
 
 # =========================
 # CLONE HELPERS
@@ -79,9 +85,23 @@ def count_unscheduled(schedule):
 # single time something touches a section (which happens A LOT - every
 # repair call, every mutation, etc), just compute it once at the start
 # of a run and reuse it everywhere. huge speedup.
+#
+# also stashes id->object lookup maps for rooms/timeslots under a
+# couple of reserved string keys. every section index is an int, so
+# these string keys can never collide with a real section index -
+# this lets every function that already receives option_cache look up
+# a room/timeslot object by id in O(1) without needing a brand new
+# parameter threaded through the whole call chain.
+_ROOMS_BY_ID_KEY = "_rooms_by_id"
+_TIMESLOTS_BY_ID_KEY = "_timeslots_by_id"
+
+
 def build_option_cache(sections, rooms, timeslots):
 
-    cache = {}
+    cache = {
+        _ROOMS_BY_ID_KEY: {r.id: r for r in rooms},
+        _TIMESLOTS_BY_ID_KEY: {t.id: t for t in timeslots},
+    }
 
     for idx, section in enumerate(sections):
         viable_rooms = get_viable_rooms(section, rooms)
@@ -89,6 +109,19 @@ def build_option_cache(sections, rooms, timeslots):
         cache[idx] = (viable_rooms, valid_timeslots)
 
     return cache
+
+
+def _get_id_maps(option_cache, rooms, timeslots):
+    # falls back to building fresh maps if option_cache wasn't built via
+    # build_option_cache for some reason - keeps this defensive without
+    # forcing every caller to guarantee the keys exist
+    if option_cache and _ROOMS_BY_ID_KEY in option_cache:
+        rooms_by_id = option_cache[_ROOMS_BY_ID_KEY]
+        timeslots_by_id = option_cache[_TIMESLOTS_BY_ID_KEY]
+    else:
+        rooms_by_id = {r.id: r for r in rooms}
+        timeslots_by_id = {t.id: t for t in timeslots}
+    return rooms_by_id, timeslots_by_id
 
 
 def _constraint_score(idx, option_cache):
@@ -149,6 +182,8 @@ def repair_schedule(schedule, sections, rooms, timeslots, option_cache=None):
     """
     goes through the schedule and tries to clean up:
       - double bookings (same room/instructor at the same timeslot)
+      - hard-constraint violations (wrong room type, instructor
+        unavailable, etc) that got introduced by mutation/tabu moves
       - anything that's still unassigned
 
     allows conflicts instead of hard blocking them. reasoning: if
@@ -164,11 +199,14 @@ def repair_schedule(schedule, sections, rooms, timeslots, option_cache=None):
 
     only swaps an item to a new slot if the new slot is actually BETTER
     (fewer conflicts) than what it already has, or if it didn't have
-    anything yet. otherwise leaves it where it is.
+    anything yet, or if what it currently has actually breaks a hard
+    constraint. otherwise leaves it where it is.
     """
 
     if option_cache is None:
         option_cache = build_option_cache(sections, rooms, timeslots)
+
+    rooms_by_id, timeslots_by_id = _get_id_maps(option_cache, rooms, timeslots)
 
     occupied_instructors = set()
     occupied_rooms = set()
@@ -187,6 +225,8 @@ def repair_schedule(schedule, sections, rooms, timeslots, option_cache=None):
         is_unset = item.room_id is None or item.timeslot_id is None
 
         current_conflicts = 0
+        hard_ok = True
+
         if not is_unset:
             if (
                 item.instructor_id is not None
@@ -196,7 +236,25 @@ def repair_schedule(schedule, sections, rooms, timeslots, option_cache=None):
             if (item.room_id, item.timeslot_id) in occupied_rooms:
                 current_conflicts += 1
 
-        if not is_unset and current_conflicts == 0:
+            # double-booking checks above don't catch every hard
+            # constraint (room too small, instructor not available at
+            # that time, etc) - mutation/tabu can produce a slot that's
+            # "free" in the double-booking sense but still invalid, so
+            # double check that here before trusting the current slot
+            if section is not None:
+                room_obj = rooms_by_id.get(item.room_id)
+                ts_obj = timeslots_by_id.get(item.timeslot_id)
+                if room_obj is not None and ts_obj is not None:
+                    if not passes_hard_constraints(
+                        section,
+                        room_obj,
+                        ts_obj,
+                        occupied_instructors=occupied_instructors,
+                        occupied_rooms=occupied_rooms,
+                    ):
+                        hard_ok = False
+
+        if not is_unset and current_conflicts == 0 and hard_ok:
             # totally fine where it is, keep it and mark the slot taken
             if item.instructor_id is not None:
                 occupied_instructors.add(
@@ -205,7 +263,8 @@ def repair_schedule(schedule, sections, rooms, timeslots, option_cache=None):
             occupied_rooms.add((item.room_id, item.timeslot_id))
             continue
 
-        # either unset, or sitting in a conflict - see if we can do better
+        # either unset, sitting in a conflict, or breaking a hard
+        # constraint - see if we can do better
         if idx in option_cache:
             viable_rooms, valid_timeslots = option_cache[idx]
         elif section is not None:
@@ -295,7 +354,16 @@ def repair_schedule(schedule, sections, rooms, timeslots, option_cache=None):
                     if best_conflicts is None or conflicts < best_conflicts:
                         best_room, best_ts, best_conflicts = room, ts, conflicts
 
-        if best_room is not None and (is_unset or best_conflicts < current_conflicts):
+        # accept the new slot if: item had nothing yet, current slot
+        # breaks a hard constraint (has to move no matter what), or the
+        # new slot is a strict improvement over the current conflict count
+        should_replace = (
+            is_unset
+            or not hard_ok
+            or (best_conflicts is not None and best_conflicts < current_conflicts)
+        )
+
+        if best_room is not None and should_replace:
             item.room_id = best_room.id
             item.timeslot_id = best_ts.id
 
@@ -304,6 +372,102 @@ def repair_schedule(schedule, sections, rooms, timeslots, option_cache=None):
                 occupied_instructors.add(
                     (item.instructor_id, item.timeslot_id)
                 )
+            occupied_rooms.add((item.room_id, item.timeslot_id))
+
+    return schedule
+
+
+# =========================
+# RESCUE PASS FOR LEFTOVER UNSCHEDULED ITEMS
+# =========================
+def force_place_remaining(schedule, sections, rooms, timeslots, option_cache=None):
+    """
+    repair_schedule only samples MAX_SEARCH_WIDTH rooms/timeslots per
+    attempt, so a handful of hard-to-place sections can still end up
+    unscheduled just from bad luck in the sampling, not because they're
+    truly infeasible. by the time everything else has settled, that
+    leftover set is normally tiny (a handful of items, not thousands),
+    so it's cheap to search their full option lists exhaustively
+    instead of a random sample. only runs if there aren't too many
+    leftovers, so it can't blow up runtime on a genuinely bad schedule.
+    """
+
+    unscheduled = [
+        i for i, item in enumerate(schedule)
+        if item.room_id is None or item.timeslot_id is None
+    ]
+
+    if not unscheduled or len(unscheduled) > RESCUE_MAX_ITEMS:
+        return schedule
+
+    if option_cache is None:
+        option_cache = build_option_cache(sections, rooms, timeslots)
+
+    occupied_instructors = set()
+    occupied_rooms = set()
+
+    for item in schedule:
+        if item.room_id is not None and item.timeslot_id is not None:
+            if item.instructor_id is not None:
+                occupied_instructors.add((item.instructor_id, item.timeslot_id))
+            occupied_rooms.add((item.room_id, item.timeslot_id))
+
+    for idx in unscheduled:
+
+        item = schedule[idx]
+        section = sections[idx] if idx < len(sections) else None
+
+        if idx in option_cache:
+            viable_rooms, valid_timeslots = option_cache[idx]
+        elif section is not None:
+            viable_rooms = get_viable_rooms(section, rooms)
+            valid_timeslots = get_valid_timeslots(section, timeslots)
+        else:
+            viable_rooms = get_viable_rooms_for_schedule_item(item, rooms)
+            valid_timeslots = timeslots
+
+        if not viable_rooms or not valid_timeslots:
+            continue
+
+        best_room, best_ts, best_conflicts = None, None, None
+
+        for ts in valid_timeslots:
+
+            instr_conflict = (
+                item.instructor_id is not None
+                and (item.instructor_id, ts.id) in occupied_instructors
+            )
+
+            for room in viable_rooms:
+
+                if section is not None and not passes_hard_constraints(
+                    section,
+                    room,
+                    ts,
+                    occupied_instructors=occupied_instructors,
+                    occupied_rooms=occupied_rooms,
+                ):
+                    continue
+
+                conflicts = (1 if instr_conflict else 0) + (
+                    1 if (room.id, ts.id) in occupied_rooms else 0
+                )
+
+                if conflicts == 0:
+                    best_room, best_ts, best_conflicts = room, ts, 0
+                    break
+
+                if best_conflicts is None or conflicts < best_conflicts:
+                    best_room, best_ts, best_conflicts = room, ts, conflicts
+
+            if best_conflicts == 0:
+                break
+
+        if best_room is not None:
+            item.room_id = best_room.id
+            item.timeslot_id = best_ts.id
+            if item.instructor_id is not None:
+                occupied_instructors.add((item.instructor_id, item.timeslot_id))
             occupied_rooms.add((item.room_id, item.timeslot_id))
 
     return schedule
@@ -425,7 +589,7 @@ def crossover(parent1, parent2, option_cache=None):
 # =========================
 # MUTATION
 # =========================
-def mutation(schedule, rooms, timeslots, option_cache=None):
+def mutation(schedule, rooms, timeslots, option_cache=None, sections=None):
     # returns (schedule, changed) so the caller knows if it actually
     # needs to re-run repair afterward. mutation only fires ~15% of the
     # time anyway, no point re-scanning the whole schedule when nothing
@@ -447,6 +611,9 @@ def mutation(schedule, rooms, timeslots, option_cache=None):
     idx, selected_item = (
         random.choice(unscheduled) if unscheduled else random.choice(indexed)
     )
+
+    section = sections[idx] if sections and idx < len(sections) else None
+    rooms_by_id, timeslots_by_id = _get_id_maps(option_cache, rooms, timeslots)
 
     occupied_instructors = set()
     occupied_rooms = set()
@@ -494,6 +661,15 @@ def mutation(schedule, rooms, timeslots, option_cache=None):
 
                 for room in search_rooms:
 
+                    if section is not None and not passes_hard_constraints(
+                        section,
+                        room,
+                        ts,
+                        occupied_instructors=occupied_instructors,
+                        occupied_rooms=occupied_rooms,
+                    ):
+                        continue
+
                     conflicts = (1 if instr_conflict else 0) + (
                         1 if (room.id, ts.id) in occupied_rooms else 0
                     )
@@ -522,6 +698,8 @@ def mutation(schedule, rooms, timeslots, option_cache=None):
 
         if cached_rooms and selected_item.timeslot_id:
 
+            ts_obj = timeslots_by_id.get(selected_item.timeslot_id)
+
             for room in random.sample(
                 cached_rooms,
                 min(MAX_SEARCH_WIDTH, len(cached_rooms)),
@@ -530,14 +708,30 @@ def mutation(schedule, rooms, timeslots, option_cache=None):
                 if (
                     room.id,
                     selected_item.timeslot_id,
-                ) not in occupied_rooms:
+                ) in occupied_rooms:
+                    continue
 
-                    if room.id != selected_item.room_id:
-                        changed = True
-                    selected_item.room_id = room.id
-                    break
+                if (
+                    section is not None
+                    and ts_obj is not None
+                    and not passes_hard_constraints(
+                        section,
+                        room,
+                        ts_obj,
+                        occupied_instructors=occupied_instructors,
+                        occupied_rooms=occupied_rooms,
+                    )
+                ):
+                    continue
+
+                if room.id != selected_item.room_id:
+                    changed = True
+                selected_item.room_id = room.id
+                break
 
     else:
+
+        room_obj = rooms_by_id.get(selected_item.room_id)
 
         for ts in random.sample(
             cached_timeslots,
@@ -554,11 +748,26 @@ def mutation(schedule, rooms, timeslots, option_cache=None):
                 ts.id,
             ) not in occupied_rooms
 
-            if instructor_free and room_free:
-                if ts.id != selected_item.timeslot_id:
-                    changed = True
-                selected_item.timeslot_id = ts.id
-                break
+            if not (instructor_free and room_free):
+                continue
+
+            if (
+                section is not None
+                and room_obj is not None
+                and not passes_hard_constraints(
+                    section,
+                    room_obj,
+                    ts,
+                    occupied_instructors=occupied_instructors,
+                    occupied_rooms=occupied_rooms,
+                )
+            ):
+                continue
+
+            if ts.id != selected_item.timeslot_id:
+                changed = True
+            selected_item.timeslot_id = ts.id
+            break
 
     return schedule, changed
 
@@ -579,6 +788,8 @@ def tabu_search(
 
     if option_cache is None:
         option_cache = build_option_cache(sections, rooms, timeslots)
+
+    rooms_by_id, timeslots_by_id = _get_id_maps(option_cache, rooms, timeslots)
 
     current = clone_schedule(schedule)
     best = clone_schedule(schedule)
@@ -604,6 +815,7 @@ def tabu_search(
 
         neighbor = clone_schedule(current)
         selected_item = neighbor[idx]
+        section = sections[idx] if idx < len(sections) else None
 
         occupied_instructors = set()
         occupied_rooms = set()
@@ -631,6 +843,8 @@ def tabu_search(
             else:
                 valid_times = get_valid_timeslots(sections[idx], timeslots)
 
+            room_obj = rooms_by_id.get(selected_item.room_id)
+
             for ts in random.sample(
                 valid_times,
                 min(MAX_SEARCH_WIDTH, len(valid_times)),
@@ -646,10 +860,24 @@ def tabu_search(
                     ts.id,
                 ) not in occupied_rooms
 
-                if instructor_free and room_free:
+                if not (instructor_free and room_free):
+                    continue
 
-                    selected_item.timeslot_id = ts.id
-                    break
+                if (
+                    section is not None
+                    and room_obj is not None
+                    and not passes_hard_constraints(
+                        section,
+                        room_obj,
+                        ts,
+                        occupied_instructors=occupied_instructors,
+                        occupied_rooms=occupied_rooms,
+                    )
+                ):
+                    continue
+
+                selected_item.timeslot_id = ts.id
+                break
 
             move = (
                 "ts",
@@ -667,6 +895,8 @@ def tabu_search(
                     rooms,
                 )
 
+            ts_obj = timeslots_by_id.get(selected_item.timeslot_id)
+
             for room in random.sample(
                 valid_rooms,
                 min(MAX_SEARCH_WIDTH, len(valid_rooms)),
@@ -675,10 +905,24 @@ def tabu_search(
                 if (
                     room.id,
                     selected_item.timeslot_id,
-                ) not in occupied_rooms:
+                ) in occupied_rooms:
+                    continue
 
-                    selected_item.room_id = room.id
-                    break
+                if (
+                    section is not None
+                    and ts_obj is not None
+                    and not passes_hard_constraints(
+                        section,
+                        room,
+                        ts_obj,
+                        occupied_instructors=occupied_instructors,
+                        occupied_rooms=occupied_rooms,
+                    )
+                ):
+                    continue
+
+                selected_item.room_id = room.id
+                break
 
             move = (
                 "room",
@@ -779,6 +1023,7 @@ def genetic_schedule(sections, timeslots, rooms, cache=None, option_cache=None):
                 rooms,
                 timeslots,
                 option_cache=option_cache,
+                sections=sections,
             )
 
             if mutated:
@@ -837,7 +1082,11 @@ def genetic_schedule(sections, timeslots, rooms, cache=None, option_cache=None):
     best, _ = last_scored[0]
 
     # one last repair pass in case anything's still sitting unscheduled
+    # or ended up with a hard-constraint violation, then a targeted
+    # rescue pass for whatever handful of items repair's sampling still
+    # couldn't place (see force_place_remaining docstring)
     repair_schedule(best, sections, rooms, timeslots, option_cache=option_cache)
+    force_place_remaining(best, sections, rooms, timeslots, option_cache=option_cache)
 
     return best
 
