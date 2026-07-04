@@ -100,16 +100,27 @@ def choose_random_assignment(
     occupied_instructors,
     occupied_rooms,
 ):
-    # rooms/timeslots should already be shuffled by the caller so we get
-    # different results each time this runs. we just take the first
-    # combo that actually works and passes the hard constraints.
-    # if nothing works we just return None, None and let repair deal
-    # with it later - no random fallback, that was causing double
-    # bookings before.
+    # two-phase search. phase 1 is the ORIGINAL cheap version - skip
+    # anything occupied with a plain set lookup before even calling
+    # passes_hard_constraints, and grab the first fully free combo. this
+    # covers the common case (most sections DO find a free slot) and
+    # keeps it just as fast as before.
+    #
+    # only if phase 1 comes up empty do we fall back to phase 2, which
+    # is more expensive: it has to call passes_hard_constraints on
+    # occupied combos too, since we now need to know whether a
+    # conflicting slot is even legal before we're willing to fall back
+    # to it. that cost only gets paid for the sections that actually
+    # need it, not the whole population.
+    #
+    # this ONLY returns None, None if literally nothing passes the hard
+    # constraints no matter what - that's a real infeasibility, not
+    # something conflict tolerance can patch around.
 
     if not rooms or not timeslots:
         return None, None
 
+    # ---- phase 1: cheap, free-slot-only ----
     for ts in timeslots:
 
         if (
@@ -132,7 +143,39 @@ def choose_random_assignment(
             ):
                 return room, ts
 
-    return None, None
+    # ---- phase 2: nothing free, allow the least-bad conflict ----
+    best_room, best_ts, best_conflicts = None, None, None
+
+    for ts in timeslots:
+
+        for room in rooms:
+
+            if not passes_hard_constraints(
+                section,
+                room,
+                ts,
+                occupied_instructors=occupied_instructors,
+                occupied_rooms=occupied_rooms,
+            ):
+                continue
+
+            conflicts = 0
+            if (
+                section.instructor_id is not None
+                and (section.instructor_id, ts.id) in occupied_instructors
+            ):
+                conflicts += 1
+            if (room.id, ts.id) in occupied_rooms:
+                conflicts += 1
+
+            if conflicts == 0:
+                # can't do better than this, take it right away
+                return room, ts
+
+            if best_conflicts is None or conflicts < best_conflicts:
+                best_room, best_ts, best_conflicts = room, ts, conflicts
+
+    return best_room, best_ts
 
 
 # =========================
@@ -219,16 +262,26 @@ def create_population(size, sections, rooms, timeslots, option_cache=None):
 # =========================
 def repair_schedule(schedule, sections, rooms, timeslots, option_cache=None):
     """
-    goes through the schedule and fixes:
+    goes through the schedule and tries to clean up:
       - double bookings (same room/instructor at the same timeslot)
       - anything that's still unassigned
 
-    note: this already tries EVERY viable room/timeslot for each item,
-    not just a random handful. so just calling this again and again on
-    the same schedule won't magically schedule more stuff - if a section
-    couldn't find a slot, every free slot was already exhausted, and
-    that won't change unless something else moves out of the way first.
-    that's what rescue_unscheduled() below is for.
+    changed this to allow conflicts now instead of hard blocking them.
+    reasoning: if there's genuinely no free slot left, we used to just
+    drop the section (room_id/timeslot_id = None). but an unscheduled
+    section is basically the same amount of manual work as a conflicting
+    one - someone has to go fix it either way - except a conflicting
+    section at least HAS a room and time, so it's a smaller edit. so now:
+    always prefer a totally free slot if one exists, but if it doesn't,
+    fall back to whatever slot has the fewest conflicts instead of
+    leaving it empty. only actually unassigns something if it truly has
+    zero viable rooms or zero valid timeslots to begin with - that's a
+    real infeasibility case, not a decision we're making.
+
+    also: only swap an item to a new slot if the new slot is actually
+    BETTER (fewer conflicts) than what it already has, or if it didn't
+    have anything yet. otherwise just leave it where it is instead of
+    shuffling it around for no reason.
     """
 
     if option_cache is None:
@@ -248,31 +301,28 @@ def repair_schedule(schedule, sections, rooms, timeslots, option_cache=None):
         item = schedule[idx]
         section = sections[idx] if idx < len(sections) else None
 
-        has_conflict = False
+        is_unset = item.room_id is None or item.timeslot_id is None
 
-        if item.instructor_id is not None and item.timeslot_id is not None:
-            if (item.instructor_id, item.timeslot_id) in occupied_instructors:
-                has_conflict = True
-
-        if item.room_id is not None and item.timeslot_id is not None:
+        current_conflicts = 0
+        if not is_unset:
+            if (
+                item.instructor_id is not None
+                and (item.instructor_id, item.timeslot_id) in occupied_instructors
+            ):
+                current_conflicts += 1
             if (item.room_id, item.timeslot_id) in occupied_rooms:
-                has_conflict = True
+                current_conflicts += 1
 
-        needs_assignment = (
-            item.room_id is None
-            or item.timeslot_id is None
-            or has_conflict
-        )
-
-        if not needs_assignment:
-            if item.instructor_id is not None and item.timeslot_id is not None:
+        if not is_unset and current_conflicts == 0:
+            # totally fine where it is, keep it and mark the slot taken
+            if item.instructor_id is not None:
                 occupied_instructors.add(
                     (item.instructor_id, item.timeslot_id)
                 )
-            if item.room_id is not None and item.timeslot_id is not None:
-                occupied_rooms.add((item.room_id, item.timeslot_id))
+            occupied_rooms.add((item.room_id, item.timeslot_id))
             continue
 
+        # either unset, or sitting in a conflict - see if we can do better
         if idx in option_cache:
             viable_rooms, valid_timeslots = option_cache[idx]
         elif section is not None:
@@ -283,8 +333,16 @@ def repair_schedule(schedule, sections, rooms, timeslots, option_cache=None):
             valid_timeslots = timeslots
 
         if not viable_rooms or not valid_timeslots:
-            item.room_id = None
-            item.timeslot_id = None
+            # section genuinely has nowhere it's allowed to go, no amount
+            # of conflict tolerance fixes that. if it was already
+            # unset, keep it unset. if it somehow had a value already,
+            # leave it be, there's nothing better to move it to anyway.
+            if not is_unset:
+                if item.instructor_id is not None:
+                    occupied_instructors.add(
+                        (item.instructor_id, item.timeslot_id)
+                    )
+                occupied_rooms.add((item.room_id, item.timeslot_id))
             continue
 
         shuffled_rooms = viable_rooms[:]
@@ -292,8 +350,12 @@ def repair_schedule(schedule, sections, rooms, timeslots, option_cache=None):
         random.shuffle(shuffled_rooms)
         random.shuffle(shuffled_timeslots)
 
-        assigned = False
+        best_room, best_ts, best_conflicts = None, None, None
 
+        # phase 1: cheap pass, same as the original code - skip anything
+        # occupied with a plain set lookup, don't even bother calling
+        # passes_hard_constraints on it. this is the common case (item
+        # just needs ANY free slot) and it's fast.
         for ts in shuffled_timeslots:
 
             if (
@@ -316,42 +378,76 @@ def repair_schedule(schedule, sections, rooms, timeslots, option_cache=None):
                 ):
                     continue
 
-                item.room_id = room.id
-                item.timeslot_id = ts.id
-                assigned = True
+                best_room, best_ts, best_conflicts = room, ts, 0
                 break
 
-            if assigned:
+            if best_room is not None:
                 break
 
-        if assigned:
+        # phase 2: only runs if nothing was free. now we have to check
+        # occupied combos too, so this is more expensive - but it only
+        # happens for the sections that actually need it.
+        if best_room is None:
+
+            for ts in shuffled_timeslots:
+
+                for room in shuffled_rooms:
+
+                    if section is not None and not passes_hard_constraints(
+                        section,
+                        room,
+                        ts,
+                        occupied_instructors=occupied_instructors,
+                        occupied_rooms=occupied_rooms,
+                    ):
+                        continue
+
+                    conflicts = 0
+                    if (
+                        item.instructor_id is not None
+                        and (item.instructor_id, ts.id) in occupied_instructors
+                    ):
+                        conflicts += 1
+                    if (room.id, ts.id) in occupied_rooms:
+                        conflicts += 1
+
+                    if best_conflicts is None or conflicts < best_conflicts:
+                        best_room, best_ts, best_conflicts = room, ts, conflicts
+
+        if best_room is not None and (is_unset or best_conflicts < current_conflicts):
+            # only switch if it's actually an improvement (or it had
+            # nothing before) - don't shuffle a section around for a
+            # slot that's just as bad as the one it already has
+            item.room_id = best_room.id
+            item.timeslot_id = best_ts.id
+
+        if item.room_id is not None and item.timeslot_id is not None:
             if item.instructor_id is not None:
                 occupied_instructors.add(
                     (item.instructor_id, item.timeslot_id)
                 )
             occupied_rooms.add((item.room_id, item.timeslot_id))
-        else:
-            # couldn't find anywhere to put it, leave it unscheduled
-            # instead of forcing a bad slot
-            item.room_id = None
-            item.timeslot_id = None
 
     return schedule
 
 
 # =========================
-# RESCUE PASS (this is the actual fix for the unscheduled count)
+# RESCUE PASS (only really matters for the rare "still nothing" case now)
 # =========================
 def rescue_unscheduled(schedule, sections, rooms, timeslots, option_cache=None):
     """
-    ok so the problem with repair_schedule is it only fills empty slots -
-    it never moves something that's already scheduled, even if moving it
-    would free up a slot that some other stuck section desperately needs.
+    now that repair_schedule allows conflicts as a fallback, sections
+    almost never end up with room_id/timeslot_id = None anymore - the
+    only way that happens now is if a section has zero viable rooms or
+    zero valid timeslots to begin with, which conflict tolerance can't
+    fix either. so this function mostly exists as a safety net for that
+    edge case, and for genuinely conflict-free rescues when one exists.
 
-    so this function looks at each unscheduled section, checks its
-    possible room/timeslot combos, and if a combo is only blocked by ONE
-    other item (that item could just move somewhere else), it bumps that
-    item out of the way and puts the stuck section in.
+    it looks at each still-unscheduled section, checks its possible
+    room/timeslot combos, and if a combo is only blocked by ONE other
+    item (that item could just move somewhere else), it bumps that item
+    out of the way and puts the stuck section in - conflict free, no
+    tolerance needed.
 
     only goes one item deep (doesn't chase a whole chain of moves) to
     keep it from getting out of hand. returns how many sections it
@@ -578,6 +674,83 @@ def deep_repair_schedule(
 
 
 # =========================
+# DEBUG / SANITY CHECK
+# =========================
+def diagnose_infeasibility(sections, rooms, timeslots, option_cache=None):
+    """
+    run this if the unscheduled count is still high after everything
+    else. it checks for sections that literally cannot be scheduled no
+    matter what the algorithm does - like a section with zero valid
+    rooms, or a teacher who's assigned way more sections than there are
+    timeslots they're allowed to teach in. if that's the issue, it's not
+    a code bug, it's just not mathematically possible to fit them all in
+    with the current data (need more timeslots/rooms or need to spread
+    sections across different instructors).
+
+    usage:
+        diagnose_infeasibility(sections, rooms, timeslots)
+    """
+
+    from collections import defaultdict
+
+    if option_cache is None:
+        option_cache = build_option_cache(sections, rooms, timeslots)
+
+    zero_rooms = []
+    zero_timeslots = []
+    very_tight = []
+
+    instructor_sections = defaultdict(list)
+
+    for idx, section in enumerate(sections):
+
+        viable_rooms, valid_timeslots = option_cache[idx]
+
+        if not viable_rooms:
+            zero_rooms.append(idx)
+        if not valid_timeslots:
+            zero_timeslots.append(idx)
+        if viable_rooms and valid_timeslots and len(viable_rooms) * len(valid_timeslots) <= 3:
+            very_tight.append((idx, len(viable_rooms), len(valid_timeslots)))
+
+        if section.instructor_id is not None:
+            instructor_sections[section.instructor_id].append(idx)
+
+    overloaded_instructors = []
+
+    for instructor_id, idxs in instructor_sections.items():
+
+        possible_timeslot_ids = set()
+        for i in idxs:
+            _, valid_timeslots = option_cache[i]
+            possible_timeslot_ids.update(ts.id for ts in valid_timeslots)
+
+        if len(idxs) > len(possible_timeslot_ids):
+            overloaded_instructors.append(
+                (instructor_id, len(idxs), len(possible_timeslot_ids))
+            )
+
+    print(f"sections with 0 viable rooms: {len(zero_rooms)}")
+    print(f"sections with 0 valid timeslots: {len(zero_timeslots)}")
+    print(f"sections with <= 3 total room/timeslot combos: {len(very_tight)}")
+    print(f"instructors that need more timeslots than they have: {len(overloaded_instructors)}")
+
+    if overloaded_instructors:
+        print("\noverloaded instructors (id, num sections, num distinct timeslots available):")
+        for instructor_id, n_sections, n_ts in sorted(
+            overloaded_instructors, key=lambda x: x[1] - x[2], reverse=True
+        )[:20]:
+            print(f"  {instructor_id}: {n_sections} sections, only {n_ts} timeslots (short by {n_sections - n_ts})")
+
+    return {
+        "zero_rooms": zero_rooms,
+        "zero_timeslots": zero_timeslots,
+        "very_tight": very_tight,
+        "overloaded_instructors": overloaded_instructors,
+    }
+
+
+# =========================
 # SELECTION
 # =========================
 def selection(population, rooms, sections, timeslots, cache):
@@ -743,7 +916,9 @@ def mutation(schedule, rooms, timeslots, option_cache=None):
 
     # if it's unscheduled, go all out and check every single option
     # instead of a random sample - this is the one we actually care
-    # about fixing, so worth the extra time
+    # about fixing, so worth the extra time. same as repair_schedule,
+    # prefer a free slot but fall back to least-conflict instead of
+    # leaving it unscheduled.
     if selected_item.room_id is None or selected_item.timeslot_id is None:
 
         if cached_rooms and cached_timeslots:
@@ -753,28 +928,35 @@ def mutation(schedule, rooms, timeslots, option_cache=None):
             random.shuffle(shuffled_rooms)
             random.shuffle(shuffled_timeslots)
 
+            best_room, best_ts, best_conflicts = None, None, None
+
             for ts in shuffled_timeslots:
 
-                if (
+                instr_conflict = (
                     selected_item.instructor_id is not None
                     and (selected_item.instructor_id, ts.id) in occupied_instructors
-                ):
-                    continue
-
-                placed = False
+                )
 
                 for room in shuffled_rooms:
 
-                    if (room.id, ts.id) in occupied_rooms:
-                        continue
+                    conflicts = (1 if instr_conflict else 0) + (
+                        1 if (room.id, ts.id) in occupied_rooms else 0
+                    )
 
-                    selected_item.room_id = room.id
-                    selected_item.timeslot_id = ts.id
-                    placed = True
+                    if conflicts == 0:
+                        best_room, best_ts, best_conflicts = room, ts, 0
+                        break
+
+                    if best_conflicts is None or conflicts < best_conflicts:
+                        best_room, best_ts, best_conflicts = room, ts, conflicts
+
+                if best_conflicts == 0:
                     break
 
-                if placed:
-                    return schedule, True
+            if best_room is not None:
+                selected_item.room_id = best_room.id
+                selected_item.timeslot_id = best_ts.id
+                return schedule, True
 
         return schedule, False
 
