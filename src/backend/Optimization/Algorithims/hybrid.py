@@ -86,6 +86,40 @@ def count_unscheduled(schedule):
     )
 
 
+def find_conflicted_indices(schedule):
+    # indices of items that are actually double-booked (room or
+    # instructor shared with at least one other item at the same
+    # timeslot). single O(n) pass with plain dict counting - cheap even
+    # for thousands of sections. used so mutation/tabu can spend their
+    # limited budget on items that are actually causing conflicts
+    # instead of poking already-fine items at random.
+    room_counts = {}
+    instr_counts = {}
+
+    for item in schedule:
+        if item.room_id is not None and item.timeslot_id is not None:
+            key = (item.room_id, item.timeslot_id)
+            room_counts[key] = room_counts.get(key, 0) + 1
+        if item.instructor_id is not None and item.timeslot_id is not None:
+            key = (item.instructor_id, item.timeslot_id)
+            instr_counts[key] = instr_counts.get(key, 0) + 1
+
+    conflicted = []
+    for i, item in enumerate(schedule):
+        if item.room_id is None or item.timeslot_id is None:
+            continue
+        room_key = (item.room_id, item.timeslot_id)
+        if room_counts.get(room_key, 0) > 1:
+            conflicted.append(i)
+            continue
+        if item.instructor_id is not None:
+            instr_key = (item.instructor_id, item.timeslot_id)
+            if instr_counts.get(instr_key, 0) > 1:
+                conflicted.append(i)
+
+    return conflicted
+
+
 # =========================
 # OPTION CACHE
 # =========================
@@ -632,9 +666,18 @@ def mutation(schedule, rooms, timeslots, option_cache=None, sections=None):
         if item.room_id is None or item.timeslot_id is None
     ]
 
-    idx, selected_item = (
-        random.choice(unscheduled) if unscheduled else random.choice(indexed)
-    )
+    if unscheduled:
+        idx, selected_item = random.choice(unscheduled)
+    else:
+        # nothing unscheduled - spend the mutation on an item that's
+        # actually in conflict rather than a random already-fine one,
+        # so the limited mutation budget goes where it matters
+        conflicted_indices = find_conflicted_indices(schedule)
+        if conflicted_indices:
+            idx = random.choice(conflicted_indices)
+            selected_item = schedule[idx]
+        else:
+            idx, selected_item = random.choice(indexed)
 
     section = sections[idx] if sections and idx < len(sections) else None
     rooms_by_id, timeslots_by_id = _get_id_maps(option_cache, rooms, timeslots)
@@ -864,12 +907,23 @@ def tabu_search(
 
     for i in range(TABU_ITERATIONS):
 
-        candidate_indices = random.sample(
-            range(len(current)),
-            min(MAX_SEARCH_WIDTH, len(current)),
-        )
+        # spend tabu's limited iterations on items that are actually
+        # causing conflicts right now, rather than a uniformly random
+        # item that's probably already fine - this is what makes tabu
+        # actually chip away at the conflict count instead of just
+        # wandering. cheap O(n) recompute per iteration (TABU_ITERATIONS
+        # is small), and current only changes when an iteration improves
+        # on it, so this stays in sync with the real conflict picture.
+        conflicted_indices = find_conflicted_indices(current)
 
-        idx = random.choice(candidate_indices)
+        if conflicted_indices:
+            idx = random.choice(conflicted_indices)
+        else:
+            candidate_indices = random.sample(
+                range(len(current)),
+                min(MAX_SEARCH_WIDTH, len(current)),
+            )
+            idx = random.choice(candidate_indices)
 
         neighbor = clone_schedule(current)
         selected_item = neighbor[idx]
