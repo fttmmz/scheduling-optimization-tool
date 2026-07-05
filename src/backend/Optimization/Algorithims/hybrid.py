@@ -38,14 +38,6 @@ ELITE_SIZE = 2
 # slower, smaller = faster but more conflicts left over.
 MAX_SEARCH_WIDTH = 20
 
-# how many candidate timeslots phase 1 scans per section before giving
-# up on finding a totally free slot. this can afford to be a bit wider
-# than MAX_SEARCH_WIDTH because checking "is there a free room at this
-# timeslot" is a cheap O(len(viable_rooms)) filter, not the expensive
-# hard-constraint check - the expensive check is still only ever run on
-# up to MAX_SEARCH_WIDTH rooms per timeslot.
-TIMESLOT_SCAN_WIDTH = MAX_SEARCH_WIDTH * 2
-
 # how many still-unscheduled items the final "rescue" pass is allowed
 # to brute-force search exhaustively (see force_place_remaining below).
 # this normally only ever needs to touch a handful of items, so it's
@@ -84,40 +76,6 @@ def count_unscheduled(schedule):
         1 for item in schedule
         if item.room_id is None or item.timeslot_id is None
     )
-
-
-def find_conflicted_indices(schedule):
-    # indices of items that are actually double-booked (room or
-    # instructor shared with at least one other item at the same
-    # timeslot). single O(n) pass with plain dict counting - cheap even
-    # for thousands of sections. used so mutation/tabu can spend their
-    # limited budget on items that are actually causing conflicts
-    # instead of poking already-fine items at random.
-    room_counts = {}
-    instr_counts = {}
-
-    for item in schedule:
-        if item.room_id is not None and item.timeslot_id is not None:
-            key = (item.room_id, item.timeslot_id)
-            room_counts[key] = room_counts.get(key, 0) + 1
-        if item.instructor_id is not None and item.timeslot_id is not None:
-            key = (item.instructor_id, item.timeslot_id)
-            instr_counts[key] = instr_counts.get(key, 0) + 1
-
-    conflicted = []
-    for i, item in enumerate(schedule):
-        if item.room_id is None or item.timeslot_id is None:
-            continue
-        room_key = (item.room_id, item.timeslot_id)
-        if room_counts.get(room_key, 0) > 1:
-            conflicted.append(i)
-            continue
-        if item.instructor_id is not None:
-            instr_key = (item.instructor_id, item.timeslot_id)
-            if instr_counts.get(instr_key, 0) > 1:
-                conflicted.append(i)
-
-    return conflicted
 
 
 # =========================
@@ -327,10 +285,10 @@ def repair_schedule(schedule, sections, rooms, timeslots, option_cache=None):
                 occupied_rooms.add((item.room_id, item.timeslot_id))
             continue
 
-        # search_timeslots is sampled once and reused below, but rooms
-        # are deliberately NOT pre-sampled the same way - see phase 1's
-        # comment for why.
-        search_timeslots = random.sample(valid_timeslots, min(TIMESLOT_SCAN_WIDTH, len(valid_timeslots)))
+        # random.sample gives us a bounded, shuffled subset in one go -
+        # this is what keeps repair fast even with hundreds of rooms and
+        # timeslots (see MAX_SEARCH_WIDTH comment up top)
+        search_timeslots = random.sample(valid_timeslots, min(MAX_SEARCH_WIDTH, len(valid_timeslots)))
 
         best_room, best_ts, best_conflicts = None, None, None
 
@@ -338,15 +296,15 @@ def repair_schedule(schedule, sections, rooms, timeslots, option_cache=None):
         # lookup, don't even bother calling passes_hard_constraints on
         # it. this is the common case (item just needs ANY free slot).
         #
-        # IMPORTANT: for each candidate timeslot we work out which
-        # viable rooms are actually free right there (one cheap
-        # O(len(viable_rooms)) filter using plain set lookups) instead
-        # of testing the same fixed random subset of rooms against every
-        # timeslot. reusing one fixed room sample across every timeslot
-        # meant that if that particular sample happened to be busy at
-        # every sampled timeslot, a free room sitting elsewhere in the
-        # list was never even considered - forcing a needless fallback
-        # to a conflict even when a clean placement existed.
+        # NOTE: a fresh room sample is drawn for each candidate timeslot
+        # here, instead of reusing one fixed room sample for every
+        # timeslot (as before). reusing one fixed sample meant that if
+        # that particular draw of rooms happened to be busy at every
+        # sampled timeslot, a free room sitting elsewhere in the list
+        # was never even considered, forcing a needless conflict even
+        # when a clean placement existed. same cost as before (still
+        # bounded to MAX_SEARCH_WIDTH rooms checked per timeslot) - just
+        # fixes which rooms get tried.
         for ts in search_timeslots:
 
             if (
@@ -355,15 +313,12 @@ def repair_schedule(schedule, sections, rooms, timeslots, option_cache=None):
             ):
                 continue
 
-            free_rooms = [
-                room for room in viable_rooms
-                if (room.id, ts.id) not in occupied_rooms
-            ]
+            search_rooms = random.sample(viable_rooms, min(MAX_SEARCH_WIDTH, len(viable_rooms)))
 
-            if not free_rooms:
-                continue
+            for room in search_rooms:
 
-            for room in random.sample(free_rooms, min(MAX_SEARCH_WIDTH, len(free_rooms))):
+                if (room.id, ts.id) in occupied_rooms:
+                    continue
 
                 if section is not None and not passes_hard_constraints(
                     section,
@@ -666,18 +621,9 @@ def mutation(schedule, rooms, timeslots, option_cache=None, sections=None):
         if item.room_id is None or item.timeslot_id is None
     ]
 
-    if unscheduled:
-        idx, selected_item = random.choice(unscheduled)
-    else:
-        # nothing unscheduled - spend the mutation on an item that's
-        # actually in conflict rather than a random already-fine one,
-        # so the limited mutation budget goes where it matters
-        conflicted_indices = find_conflicted_indices(schedule)
-        if conflicted_indices:
-            idx = random.choice(conflicted_indices)
-            selected_item = schedule[idx]
-        else:
-            idx, selected_item = random.choice(indexed)
+    idx, selected_item = (
+        random.choice(unscheduled) if unscheduled else random.choice(indexed)
+    )
 
     section = sections[idx] if sections and idx < len(sections) else None
     rooms_by_id, timeslots_by_id = _get_id_maps(option_cache, rooms, timeslots)
@@ -714,30 +660,19 @@ def mutation(schedule, rooms, timeslots, option_cache=None, sections=None):
 
         if cached_rooms and cached_timeslots:
 
-            search_timeslots = random.sample(cached_timeslots, min(TIMESLOT_SCAN_WIDTH, len(cached_timeslots)))
+            search_rooms = random.sample(cached_rooms, min(MAX_SEARCH_WIDTH, len(cached_rooms)))
+            search_timeslots = random.sample(cached_timeslots, min(MAX_SEARCH_WIDTH, len(cached_timeslots)))
 
             best_room, best_ts, best_conflicts = None, None, None
 
-            # phase 1: same fix as repair_schedule - work out which
-            # rooms are actually free at each candidate timeslot instead
-            # of testing one fixed random room sample against all of them
             for ts in search_timeslots:
 
-                if (
+                instr_conflict = (
                     selected_item.instructor_id is not None
                     and (selected_item.instructor_id, ts.id) in occupied_instructors
-                ):
-                    continue
+                )
 
-                free_rooms = [
-                    room for room in cached_rooms
-                    if (room.id, ts.id) not in occupied_rooms
-                ]
-
-                if not free_rooms:
-                    continue
-
-                for room in random.sample(free_rooms, min(MAX_SEARCH_WIDTH, len(free_rooms))):
+                for room in search_rooms:
 
                     if section is not None and not passes_hard_constraints(
                         section,
@@ -748,42 +683,19 @@ def mutation(schedule, rooms, timeslots, option_cache=None, sections=None):
                     ):
                         continue
 
-                    best_room, best_ts, best_conflicts = room, ts, 0
-                    break
-
-                if best_room is not None:
-                    break
-
-            # phase 2: fallback if nothing was totally free - least-bad
-            # option from a bounded sample, same spirit as repair_schedule
-            if best_room is None:
-
-                search_rooms = random.sample(cached_rooms, min(MAX_SEARCH_WIDTH, len(cached_rooms)))
-
-                for ts in search_timeslots:
-
-                    instr_conflict = (
-                        selected_item.instructor_id is not None
-                        and (selected_item.instructor_id, ts.id) in occupied_instructors
+                    conflicts = (1 if instr_conflict else 0) + (
+                        1 if (room.id, ts.id) in occupied_rooms else 0
                     )
 
-                    for room in search_rooms:
+                    if conflicts == 0:
+                        best_room, best_ts, best_conflicts = room, ts, 0
+                        break
 
-                        if section is not None and not passes_hard_constraints(
-                            section,
-                            room,
-                            ts,
-                            occupied_instructors=occupied_instructors,
-                            occupied_rooms=occupied_rooms,
-                        ):
-                            continue
+                    if best_conflicts is None or conflicts < best_conflicts:
+                        best_room, best_ts, best_conflicts = room, ts, conflicts
 
-                        conflicts = (1 if instr_conflict else 0) + (
-                            1 if (room.id, ts.id) in occupied_rooms else 0
-                        )
-
-                        if best_conflicts is None or conflicts < best_conflicts:
-                            best_room, best_ts, best_conflicts = room, ts, conflicts
+                if best_conflicts == 0:
+                    break
 
             if best_room is not None:
                 selected_item.room_id = best_room.id
@@ -907,23 +819,12 @@ def tabu_search(
 
     for i in range(TABU_ITERATIONS):
 
-        # spend tabu's limited iterations on items that are actually
-        # causing conflicts right now, rather than a uniformly random
-        # item that's probably already fine - this is what makes tabu
-        # actually chip away at the conflict count instead of just
-        # wandering. cheap O(n) recompute per iteration (TABU_ITERATIONS
-        # is small), and current only changes when an iteration improves
-        # on it, so this stays in sync with the real conflict picture.
-        conflicted_indices = find_conflicted_indices(current)
+        candidate_indices = random.sample(
+            range(len(current)),
+            min(MAX_SEARCH_WIDTH, len(current)),
+        )
 
-        if conflicted_indices:
-            idx = random.choice(conflicted_indices)
-        else:
-            candidate_indices = random.sample(
-                range(len(current)),
-                min(MAX_SEARCH_WIDTH, len(current)),
-            )
-            idx = random.choice(candidate_indices)
+        idx = random.choice(candidate_indices)
 
         neighbor = clone_schedule(current)
         selected_item = neighbor[idx]
@@ -957,19 +858,23 @@ def tabu_search(
 
             room_obj = rooms_by_id.get(selected_item.room_id)
 
-            # filter to timeslots that are actually free for both this
-            # instructor and this room before sampling, so a sampled
-            # attempt is never wasted on a slot we already know is busy
-            free_times = [
-                ts for ts in valid_times
-                if (selected_item.instructor_id, ts.id) not in occupied_instructors
-                and (selected_item.room_id, ts.id) not in occupied_rooms
-            ]
-
             for ts in random.sample(
-                free_times,
-                min(MAX_SEARCH_WIDTH, len(free_times)),
+                valid_times,
+                min(MAX_SEARCH_WIDTH, len(valid_times)),
             ):
+
+                instructor_free = (
+                    selected_item.instructor_id,
+                    ts.id,
+                ) not in occupied_instructors
+
+                room_free = (
+                    selected_item.room_id,
+                    ts.id,
+                ) not in occupied_rooms
+
+                if not (instructor_free and room_free):
+                    continue
 
                 if (
                     section is not None
@@ -1005,15 +910,16 @@ def tabu_search(
 
             ts_obj = timeslots_by_id.get(selected_item.timeslot_id)
 
-            free_rooms = [
-                room for room in valid_rooms
-                if (room.id, selected_item.timeslot_id) not in occupied_rooms
-            ]
-
             for room in random.sample(
-                free_rooms,
-                min(MAX_SEARCH_WIDTH, len(free_rooms)),
+                valid_rooms,
+                min(MAX_SEARCH_WIDTH, len(valid_rooms)),
             ):
+
+                if (
+                    room.id,
+                    selected_item.timeslot_id,
+                ) in occupied_rooms:
+                    continue
 
                 if (
                     section is not None
