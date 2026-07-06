@@ -1,12 +1,14 @@
 from backend.Optimization.Algorithims.greedy import greedy_schedule
 from backend.Optimization.Algorithims.genetic import genetic_runs
 from backend.Optimization.Algorithims.hybrid import genetic_runs as hybrid_runs
+from backend.Optimization.Algorithims.grasp import grasp_runs
 from backend.Optimization.evaluation import count_scheduled_sections
 
 ALGORITHM_REGISTRY = {
     "greedy": greedy_schedule,
     "genetic": genetic_runs,
     "hybrid": hybrid_runs,
+    "grasp": grasp_runs,
 }
 
 
@@ -39,7 +41,7 @@ class SchedulingEngine:
             f"{len(timeslots)} timeslots, {len(rooms)} rooms"
         )
 
-        if self.algorithm_name in ("genetic", "hybrid"):
+        if self.algorithm_name in ("genetic", "hybrid", "grasp"):
             result = self.algorithm(sections, timeslots, rooms, num_runs=self.num_runs)
         else:
             result = self.algorithm(sections, timeslots, rooms)

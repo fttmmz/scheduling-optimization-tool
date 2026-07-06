@@ -37,7 +37,7 @@ _executor = ThreadPoolExecutor(max_workers=2)
 class TimetableRequest(BaseModel):
     algorithm: str = Field(
         "greedy",
-        description="The scheduling algorithm to run. Available values: greedy, genetic, hybrid.",
+        description="The scheduling algorithm to run. Available values: greedy, genetic, hybrid, grasp.",
     )
     num_runs: int = Field(
         1,
