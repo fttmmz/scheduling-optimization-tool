@@ -27,29 +27,8 @@ _ROOMS_BY_ID_KEY = "_rooms_by_id"
 _TIMESLOTS_BY_ID_KEY = "_timeslots_by_id"
 
 
-# --- DEFENSIVE IDENTIFIER EXTRACTOR ---
-def safe_id(obj):
-    """
-    Safely extracts an attribute ID, protecting the pipeline if
-    an object or its .id property is already a tuple representation.
-    """
-    if obj is None:
-        return None
-    if isinstance(obj, tuple):
-        if len(obj) > 0 and hasattr(obj[0], 'id'):
-            return safe_id(obj[0].id)
-        return obj
-    if hasattr(obj, 'id'):
-        return obj.id
-    return obj
-
-
 # --- SCHEDULE OBJECT CLONING ---
 def clone_item(item):
-    """
-    Manually duplicates individual schedule item fields to bypass
-    the heavy processing lag of copy.deepcopy().
-    """
     return ScheduleItem(
         course_id=item.course_id, course_name=item.course_name,
         course_type=item.course_type, course_dept=item.course_dept,
@@ -59,39 +38,46 @@ def clone_item(item):
 
 
 def clone_schedule(schedule):
-    """Loops and creates a quick duplicate copy of an entire schedule list."""
     return [clone_item(item) for item in schedule]
 
 
-# --- CONSTRAINT OPTION CACHING ---
+# --- OPTION CACHE WITH FIXES ---
 def build_option_cache(sections, rooms, timeslots):
-    """
-    Pre-maps valid rooms and slots once at launch so loops don't
-    have to re-evaluate hard rules continuously.
-    """
+    # Ensure baseline incoming elements are objects, not wrapped tuples
+    rooms = [r[0] if isinstance(r, tuple) and r else r for r in rooms]
+    timeslots = [t[0] if isinstance(t, tuple) and t else t for t in timeslots]
+
     cache = {
-        _ROOMS_BY_ID_KEY: {safe_id(r): r for r in rooms},
-        _TIMESLOTS_BY_ID_KEY: {safe_id(t): t for t in timeslots},
+        _ROOMS_BY_ID_KEY: {r.id: r for r in rooms},
+        _TIMESLOTS_BY_ID_KEY: {t.id: t for t in timeslots},
     }
     for idx, section in enumerate(sections):
-        cache[idx] = (get_viable_rooms(section, rooms), get_valid_timeslots(section, timeslots))
+        viable_rooms = get_viable_rooms(section, rooms)
+        valid_timeslots = get_valid_timeslots(section, timeslots)
+
+        # Strip metadata tuple packing cleanly at cache definition point
+        viable_rooms = [r[0] if isinstance(r, tuple) and r else r for r in viable_rooms]
+        valid_timeslots = [t[0] if isinstance(t, tuple) and t else t for t in valid_timeslots]
+
+        cache[idx] = (viable_rooms, valid_timeslots)
     return cache
 
 
 # --- INITIAL POPULATION GENERATION ---
 def choose_random_assignment(section, rooms, timeslots, occupied_instructors, occupied_rooms):
-    """Helper that checks constraint tracking to find a clear spot during setup."""
     if not rooms or not timeslots:
         return None, None
 
+    # Guarantee fallback safety
+    rooms = [r[0] if isinstance(r, tuple) and r else r for r in rooms]
+    timeslots = [t[0] if isinstance(t, tuple) and t else t for t in timeslots]
+
     for ts in timeslots:
-        ts_id = safe_id(ts)
-        if section.instructor_id is not None and (section.instructor_id, ts_id) in occupied_instructors:
+        if section.instructor_id is not None and (section.instructor_id, ts.id) in occupied_instructors:
             continue
 
         for room in rooms:
-            room_id = safe_id(room)
-            if (room_id, ts_id) in occupied_rooms:
+            if (room.id, ts.id) in occupied_rooms:
                 continue
 
             if passes_hard_constraints(
@@ -108,15 +94,16 @@ def choose_random_assignment(section, rooms, timeslots, occupied_instructors, oc
 
 
 def create_population(size, sections, rooms, timeslots):
-    """
-    Generates initial schedules using smart candidate lists to start
-    the engine with higher baseline fitness.
-    """
     population = []
-    section_candidates = [
-        (section, get_viable_rooms(section, rooms), get_valid_timeslots(section, timeslots))
-        for section in sections
-    ]
+
+    # Extract candidates and clean immediately
+    section_candidates = []
+    for section in sections:
+        v_rooms = get_viable_rooms(section, rooms)
+        v_slots = get_valid_timeslots(section, timeslots)
+        v_rooms = [r[0] if isinstance(r, tuple) and r else r for r in v_rooms]
+        v_slots = [t[0] if isinstance(t, tuple) and t else t for t in v_slots]
+        section_candidates.append((section, v_rooms, v_slots))
 
     for i in range(size):
         schedule = []
@@ -131,15 +118,15 @@ def create_population(size, sections, rooms, timeslots):
                 course_id=section.course.id, course_name=section.course.name,
                 course_type=section.course.type, course_dept=section.course.dept,
                 capacity=section.capacity, instructor_id=section.instructor_id,
-                room_id=safe_id(room) if room else None, timeslot_id=safe_id(timeslot) if timeslot else None,
+                room_id=room.id if room else None, timeslot_id=timeslot.id if timeslot else None,
                 section=str(section.no),
             )
 
             schedule.append(item)
             if room is not None and timeslot is not None:
-                occupied_rooms.add((safe_id(room), safe_id(timeslot)))
+                occupied_rooms.add((room.id, timeslot.id))
             if section.instructor_id is not None and timeslot is not None:
-                occupied_instructors.add((section.instructor_id, safe_id(timeslot)))
+                occupied_instructors.add((section.instructor_id, timeslot.id))
 
         population.append(schedule)
 
@@ -148,7 +135,6 @@ def create_population(size, sections, rooms, timeslots):
 
 # --- GENETIC ALGORITHM SELECTION ---
 def selection(population, rooms, sections, timeslots, valid_timeslot_cache=None):
-    """Evaluates the generation based on fitness and filters out the weaker half."""
     population.sort(
         key=lambda s: calculate_fitness(
             s, rooms, sections=sections, timeslots=timeslots, valid_timeslot_cache=valid_timeslot_cache
@@ -160,7 +146,6 @@ def selection(population, rooms, sections, timeslots, valid_timeslot_cache=None)
 
 # --- GENETIC ALGORITHM CROSSOVER ---
 def crossover(parent1, parent2):
-    """Combines sections from two parents using our fast manual cloning routine."""
     if len(parent1) == 0:
         return []
 
@@ -172,9 +157,8 @@ def crossover(parent1, parent2):
     return clone_schedule(child)
 
 
-# --- GENETIC ALGORITHM MUTATION ---
+# --- GENETIC ALGORITHM MUTATION WITH FIXES ---
 def mutation(schedule, rooms, timeslots, sections=None):
-    """Alters structural properties of an individual chromosome based on mutation probability."""
     if len(schedule) == 0:
         return schedule
 
@@ -194,31 +178,28 @@ def mutation(schedule, rooms, timeslots, sections=None):
 
     if random.random() < 0.5:
         viable_rooms = get_viable_rooms_for_schedule_item(selected_item, rooms)
+        viable_rooms = [r[0] if isinstance(r, tuple) and r else r for r in viable_rooms]
+
         if viable_rooms and selected_item.timeslot_id is not None:
             for room in random.sample(viable_rooms, len(viable_rooms)):
-                room_id = safe_id(room)
-                if (room_id, selected_item.timeslot_id) not in occupied_rooms:
-                    selected_item.room_id = room_id
+                if (room.id, selected_item.timeslot_id) not in occupied_rooms:
+                    selected_item.room_id = room.id
                     break
     else:
+        timeslots = [t[0] if isinstance(t, tuple) and t else t for t in timeslots]
         for ts in random.sample(timeslots, len(timeslots)):
-            ts_id = safe_id(ts)
-            instructor_free = (selected_item.instructor_id, ts_id) not in occupied_instructors
-            room_free = (selected_item.room_id, ts_id) not in occupied_rooms
+            instructor_free = (selected_item.instructor_id, ts.id) not in occupied_instructors
+            room_free = (selected_item.room_id, ts.id) not in occupied_rooms
 
             if instructor_free and room_free:
-                selected_item.timeslot_id = ts_id
+                selected_item.timeslot_id = ts.id
                 break
 
     return schedule
 
 
-# --- MEMETIC TABU REPAIR SEARCH ---
+# --- LOCAL TABU SEARCH ---
 def tabu_local_search(schedule, rooms, timeslots, sections, valid_timeslot_cache, option_cache):
-    """
-    Main local optimization engine. Builds constraint profiles, shifts properties
-    simultaneously, and tests choices against aspiration criteria.
-    """
     best_schedule = clone_schedule(schedule)
     best_fitness = calculate_fitness(best_schedule, rooms, sections, timeslots, valid_timeslot_cache)
 
@@ -232,7 +213,6 @@ def tabu_local_search(schedule, rooms, timeslots, sections, valid_timeslot_cache
         occupied_instructors = set()
         troubled_indices = []
 
-        # Map active room and instructor collisions
         for idx, item in enumerate(current_schedule):
             if item.room_id is None or item.timeslot_id is None:
                 troubled_indices.append(idx)
@@ -255,39 +235,39 @@ def tabu_local_search(schedule, rooms, timeslots, sections, valid_timeslot_cache
         best_move = None
         best_move_fitness = -float('inf')
 
-        # Test localized structural neighborhood moves
         for idx in troubled_indices:
             item = current_schedule[idx]
             viable_rooms, valid_timeslots = option_cache[idx]
+
+            # Explicit normalization safety inside optimization search
+            viable_rooms = [r[0] if isinstance(r, tuple) and r else r for r in viable_rooms]
+            valid_timeslots = [t[0] if isinstance(t, tuple) and t else t for t in valid_timeslots]
+
             if not viable_rooms or not valid_timeslots:
                 continue
 
             for ts in random.sample(valid_timeslots, min(6, len(valid_timeslots))):
-                ts_id = safe_id(ts)
-                if item.instructor_id and (item.instructor_id, ts_id) in occupied_instructors:
+                if item.instructor_id and (item.instructor_id, ts.id) in occupied_instructors:
                     continue
 
                 for rm in random.sample(viable_rooms, min(6, len(viable_rooms))):
-                    rm_id = safe_id(rm)
-                    if (rm_id, ts_id) in occupied_rooms:
+                    if (rm.id, ts.id) in occupied_rooms:
                         continue
 
                     old_rm, old_ts = item.room_id, item.timeslot_id
-                    item.room_id, item.timeslot_id = rm_id, ts_id
+                    item.room_id, item.timeslot_id = rm.id, ts.id
 
                     move_fitness = calculate_fitness(current_schedule, rooms, sections, timeslots, valid_timeslot_cache)
-                    move_key = (idx, rm_id, ts_id)
+                    move_key = (idx, rm.id, ts.id)
                     is_tabu = move_key in tabu_set
 
-                    # Apply aspiration rule
                     if move_fitness > best_move_fitness:
                         if not is_tabu or move_fitness > best_fitness:
                             best_move_fitness = move_fitness
-                            best_move = (idx, rm_id, ts_id)
+                            best_move = (idx, rm.id, ts.id)
 
                     item.room_id, item.timeslot_id = old_rm, old_ts
 
-                    # Update short term tabu memory lists
         if best_move:
             idx, rm_id, ts_id = best_move
             current_schedule[idx].room_id = rm_id
@@ -312,7 +292,6 @@ def tabu_local_search(schedule, rooms, timeslots, sections, valid_timeslot_cache
 
 # --- MAIN EVOLUTION ENGINE ---
 def genetic_schedule(sections, timeslots, rooms, valid_timeslot_cache=None, option_cache=None):
-    """Coordinates seeding, generation sorting, and memetic Tabu search injections."""
     if valid_timeslot_cache is None:
         valid_timeslot_cache = build_timeslot_guideline_cache(sections, timeslots)
     if option_cache is None:
@@ -336,7 +315,6 @@ def genetic_schedule(sections, timeslots, rooms, valid_timeslot_cache=None, opti
 
         population = new_population
 
-        # Injection: Run Tabu optimization pass over top solutions
         population.sort(
             key=lambda s: calculate_fitness(s, rooms, sections, timeslots, valid_timeslot_cache),
             reverse=True
@@ -360,7 +338,6 @@ def genetic_schedule(sections, timeslots, rooms, valid_timeslot_cache=None, opti
 
 # --- BENCHMARK TESTING ROUTINE ---
 def genetic_runs(sections, timeslots, rooms, num_runs=5):
-    """Processes loops over multiple execution runs to verify statistical convergence."""
     fitness_scores = []
     best_overall_schedule = None
     best_overall_fitness = -1
