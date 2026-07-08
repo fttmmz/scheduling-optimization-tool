@@ -241,11 +241,17 @@ def tabu_local_search(schedule, rooms, timeslots, sections, valid_timeslot_cache
             if not viable_rooms or not valid_timeslots:
                 continue
 
-            for ts in random.sample(valid_timeslots, min(6, len(valid_timeslots))):
+            for ts_entry in random.sample(valid_timeslots, min(6, len(valid_timeslots))):
+                # Safe check: if the backend sent a tuple, unpack it to get the object
+                ts = ts_entry[0] if isinstance(ts_entry, tuple) else ts_entry
+
                 if item.instructor_id and (item.instructor_id, ts.id) in occupied_instructors:
                     continue
 
-                for rm in random.sample(viable_rooms, min(6, len(viable_rooms))):
+                for rm_entry in random.sample(viable_rooms, min(6, len(viable_rooms))):
+                    # Safe check: if the backend sent a tuple, unpack it to get the object
+                    rm = rm_entry[0] if isinstance(rm_entry, tuple) else rm_entry
+
                     if (rm.id, ts.id) in occupied_rooms:
                         continue
 
@@ -285,7 +291,6 @@ def tabu_local_search(schedule, rooms, timeslots, sections, valid_timeslot_cache
             break
 
     return best_schedule
-
 
 # --- MAIN EVOLUTION ENGINE ---
 def genetic_schedule(sections, timeslots, rooms, valid_timeslot_cache=None, option_cache=None):
