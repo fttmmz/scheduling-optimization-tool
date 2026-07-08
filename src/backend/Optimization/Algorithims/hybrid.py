@@ -13,7 +13,7 @@ from backend.Optimization.evaluation import (
     build_timeslot_guideline_cache,
 )
 
-# --- SYSTEM CONFIGURATION ---
+# --- PARAMETERS ---
 POPULATION_SIZE = 8
 GENERATIONS = 15
 
