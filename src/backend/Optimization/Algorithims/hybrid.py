@@ -264,7 +264,7 @@ def constraint_repair(schedule, rooms, timeslots, sections):
     return schedule
 
 
-def local_search(schedule, rooms, timeslots, sections, iterations=10):
+def local_search(schedule, rooms, timeslots, sections, iterations=5):
     best = copy.deepcopy(schedule)
 
     best_score = calculate_fitness(
@@ -276,9 +276,13 @@ def local_search(schedule, rooms, timeslots, sections, iterations=10):
 
     for _ in range(iterations):
 
-        candidate = copy.deepcopy(best)
+        candidate = best.copy()
 
-        item = random.choice(candidate)
+        index = random.randrange(len(candidate))
+
+        candidate[index] = copy.deepcopy(candidate[index])
+
+        item = candidate[index]
 
         # Try changing timeslot
         new_ts = random.choice(timeslots)
@@ -311,17 +315,24 @@ def iterated_local_search(schedule, rooms, timeslots, sections):
         rooms,
         timeslots,
         sections,
-        iterations=15
+        iterations=5
     )
 
-    for _ in range(5):
+    best_score = calculate_fitness(
+        best,
+        rooms,
+        sections=sections,
+        timeslots=timeslots
+    )
+
+    for _ in range(2):
 
         candidate = copy.deepcopy(best)
 
         # perturbation:
         # randomly change several classes
 
-        for _ in range(5):
+        for _ in range(2):
             item = random.choice(candidate)
 
             item.timeslot_id = random.choice(timeslots).id
@@ -338,21 +349,19 @@ def iterated_local_search(schedule, rooms, timeslots, sections):
             rooms,
             timeslots,
             sections,
-            iterations=10
+            iterations=5
         )
 
-        if calculate_fitness(
-                candidate,
-                rooms,
-                sections=sections,
-                timeslots=timeslots
-        ) > calculate_fitness(
-            best,
+        candidate_score = calculate_fitness(
+            candidate,
             rooms,
             sections=sections,
             timeslots=timeslots
-        ):
+        )
+
+        if candidate_score > best_score:
             best = candidate
+            best_score = candidate_score
 
     return best
 
@@ -371,7 +380,7 @@ def genetic_schedule(sections, timeslots, rooms, valid_timeslot_cache=None):
         timeslots=timeslots
     )
 
-    generations = 15
+    generations = 10
 
     # step 2: repeat evolution process many times
     for i in range(generations):
@@ -395,7 +404,6 @@ def genetic_schedule(sections, timeslots, rooms, valid_timeslot_cache=None):
             # crossover (mix parents)
             child = crossover(p1, p2)
 
-            # mutation (small random change)
             child = mutation(
                 child,
                 rooms,
@@ -403,16 +411,7 @@ def genetic_schedule(sections, timeslots, rooms, valid_timeslot_cache=None):
                 sections
             )
 
-            # Constraint Repair
             child = constraint_repair(
-                child,
-                rooms,
-                timeslots,
-                sections
-            )
-
-            # ILS improvement
-            child = iterated_local_search(
                 child,
                 rooms,
                 timeslots,
@@ -423,6 +422,25 @@ def genetic_schedule(sections, timeslots, rooms, valid_timeslot_cache=None):
 
         # replace old population with new one
         population = new_population
+
+        # Improve only the best schedule using ILS
+        population.sort(
+            key=lambda s: calculate_fitness(
+                s,
+                rooms,
+                sections=sections,
+                timeslots=timeslots,
+                valid_timeslot_cache=valid_timeslot_cache,
+            ),
+            reverse=True,
+        )
+
+        population[0] = iterated_local_search(
+            population[0],
+            rooms,
+            timeslots,
+            sections,
+        )
 
     # step 3: get best schedule from final population
     best = max(
@@ -464,9 +482,6 @@ def genetic_runs(sections, timeslots, rooms, num_runs=30):
             valid_timeslot_cache=valid_timeslot_cache,
         )
         fitness_scores.append(score)
-
-        # Count how many sections are actually scheduled
-        scheduled = sum(1 for item in best_schedule if item.room_id is not None and item.timeslot_id is not None)
 
         if score > best_overall_fitness:
             best_overall_fitness = score
