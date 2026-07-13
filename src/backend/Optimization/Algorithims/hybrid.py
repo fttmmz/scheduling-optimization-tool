@@ -2,200 +2,158 @@ import random
 import copy
 import statistics
 from backend.Optimization.constraints import (
-    get_valid_timeslots,
-    passes_hard_constraints,
-    get_viable_rooms,
-    get_viable_rooms_for_schedule_item,
+    get_valid_timeslots, passes_hard_constraints,
+    get_viable_rooms, get_viable_rooms_for_schedule_item
 )
 from backend.models.models import ScheduleItem
-from backend.Optimization.evaluation import (
-    calculate_fitness,
-    build_timeslot_guideline_cache,
-)
-
-# --- PERFORMANCE CACHES ---
-VIABLE_ROOMS_CACHE = {}
-VALID_TIMESLOTS_CACHE = {}
+from backend.Optimization.evaluation import calculate_fitness, build_timeslot_guideline_cache
 
 
-def get_viable_rooms_cached(section, rooms):
-    if section.id not in VIABLE_ROOMS_CACHE:
-        VIABLE_ROOMS_CACHE[section.id] = get_viable_rooms(section, rooms)
-    return VIABLE_ROOMS_CACHE[section.id]
+# ==========================================
+# 1. ALNS REPAIR (The "Fixer" Engine)
+# ==========================================
+def alns_repair(schedule, sections, rooms, timeslots):
+    """Destroys 10% of the schedule and repairs it greedily."""
+    num_to_destroy = max(1, len(schedule) // 10)
+    indices_to_clear = random.sample(range(len(schedule)), num_to_destroy)
 
+    for idx in indices_to_clear:
+        schedule[idx].room_id = None
+        schedule[idx].timeslot_id = None
 
-def get_valid_timeslots_cached(section, timeslots):
-    if section.id not in VALID_TIMESLOTS_CACHE:
-        VALID_TIMESLOTS_CACHE[section.id] = get_valid_timeslots(section, timeslots)
-    return VALID_TIMESLOTS_CACHE[section.id]
+    for i in indices_to_clear:
+        sec = sections[i]
+        v_rooms = get_viable_rooms(sec, rooms)
+        v_ts = get_valid_timeslots(sec, timeslots)
+        random.shuffle(v_ts)
 
-
-# --- CORE ALGORITHM FUNCTIONS ---
-
-def choose_random_assignment(section, rooms, timeslots, occupied_instructors, occupied_rooms):
-    if not rooms or not timeslots: return None, None
-    shuffled_timeslots = random.sample(timeslots, len(timeslots))
-    for ts in shuffled_timeslots:
-        if section.instructor_id is not None and (section.instructor_id, ts.id) in occupied_instructors:
-            continue
-        for room in random.sample(rooms, len(rooms)):
-            if (room.id, ts.id) in occupied_rooms: continue
-            if passes_hard_constraints(section, room, ts, occupied_instructors, occupied_rooms):
-                return room, ts
-    return None, None
-
-
-def create_population(size, sections, rooms, timeslots):
-    population = []
-    for _ in range(size):
-        schedule = []
-        occ_instr, occ_rooms = set(), set()
-        for section in sections:
-            viable = get_viable_rooms_cached(section, rooms)
-            valid = get_valid_timeslots_cached(section, timeslots)
-            room, ts = choose_random_assignment(section, viable, valid, occ_instr, occ_rooms)
-            item = ScheduleItem(
-                course_id=section.course.id, course_name=section.course.name,
-                course_type=section.course.type, course_dept=section.course.dept,
-                capacity=section.capacity, instructor_id=section.instructor_id,
-                room_id=room.id if room else None, timeslot_id=ts.id if ts else None,
-                section=str(section.no)
-            )
-            schedule.append(item)
-            if room and ts:
-                occ_rooms.add((room.id, ts.id))
-                occ_instr.add((section.instructor_id, ts.id))
-        population.append(schedule)
-    return population
-
-
-def mutation(schedule, rooms, timeslots, sections=None):
-    if not schedule: return schedule
-    section_map = {str(s.no): s for s in sections} if sections else {}
-    occupied_instructors = set((i.instructor_id, i.timeslot_id) for i in schedule if i.instructor_id and i.timeslot_id)
-    occupied_rooms = set((i.room_id, i.timeslot_id) for i in schedule if i.room_id and i.timeslot_id)
-
-    for item in schedule:
-        is_unscheduled = item.room_id is None or item.timeslot_id is None
-        if not is_unscheduled and random.random() > 0.03: continue
-
-        # Clean occupancy to allow re-assignment
-        if item.room_id and item.timeslot_id: occupied_rooms.discard((item.room_id, item.timeslot_id))
-        if item.instructor_id and item.timeslot_id: occupied_instructors.discard((item.instructor_id, item.timeslot_id))
-
-        section = section_map.get(item.section)
-        v_rooms = get_viable_rooms_cached(section, rooms) if section else get_viable_rooms_for_schedule_item(item,
-                                                                                                             rooms)
-        v_times = get_valid_timeslots_cached(section, timeslots) if section else timeslots
-
-        if is_unscheduled:
-            room, ts = choose_random_assignment(section or item, v_rooms, v_times, occupied_instructors, occupied_rooms)
-            if room and ts: item.room_id, item.timeslot_id = room.id, ts.id
-        else:
-            # Perturbation logic as per your original implementation
-            if random.random() < 0.5 and v_rooms:
-                for r in random.sample(v_rooms, len(v_rooms)):
-                    if (r.id, item.timeslot_id) not in occupied_rooms:
-                        item.room_id = r.id
-                        break
-
-        if item.room_id and item.timeslot_id: occupied_rooms.add((item.room_id, item.timeslot_id))
+        for ts in v_ts:
+            random.shuffle(v_rooms)
+            for room in v_rooms:
+                if passes_hard_constraints(sec, room, ts, schedule=schedule):
+                    schedule[i].room_id = room.id
+                    schedule[i].timeslot_id = ts.id
+                    break
+            if schedule[i].room_id: break
     return schedule
 
 
-def local_search(schedule, rooms, timeslots, sections, iterations=5):
-    best = copy.deepcopy(schedule)
-    best_score = calculate_fitness(best, rooms, sections=sections, timeslots=timeslots)
-    section_map = {str(s.no): s for s in sections}
-    for _ in range(iterations):
-        candidate = best.copy()
-        idx = random.randrange(len(candidate))
-        candidate[idx] = copy.deepcopy(candidate[idx])
-        item = candidate[idx]
-        section = section_map.get(item.section)
-        ts_list = get_valid_timeslots_cached(section, timeslots) if section else timeslots
-        old_ts = item.timeslot_id
-        item.timeslot_id = random.choice(ts_list).id
-
-        score = calculate_fitness(candidate, rooms, sections=sections, timeslots=timeslots)
-        if score > best_score:
-            best, best_score = candidate, score
-        else:
-            item.timeslot_id = old_ts
-    return best
-
-
-def constraint_repair(schedule, rooms, timeslots, sections):
-    section_map = {str(s.no): s for s in sections}
-    occ_rooms, occ_instr = set(), set()
-    for item in schedule:
-        # Full logic implementation: identify conflicts, clear them, re-assign
-        if item.room_id and item.timeslot_id:
-            occ_rooms.add((item.room_id, item.timeslot_id))
-            if item.instructor_id: occ_instr.add((item.instructor_id, item.timeslot_id))
-    return schedule
-
-
+# ==========================================
+# 2. GA OPERATORS (Your existing logic)
+# ==========================================
 def crossover(parent1, parent2):
-    if not parent1: return []
     if random.random() > 0.85: return copy.deepcopy(parent1)
     point = random.randint(1, len(parent1) - 1)
     return copy.deepcopy(parent1[:point] + parent2[point:])
 
 
-def genetic_schedule(sections, timeslots, rooms, population_size=16, generations=15):
-    # Pre-calculate the cache once
-    valid_timeslot_cache = build_timeslot_guideline_cache(sections, timeslots)
+def mutation(schedule, rooms, timeslots, sections):
+    if random.random() > 0.03: return schedule
+    idx = random.randrange(len(schedule))
+    schedule[idx].room_id = None
+    schedule[idx].timeslot_id = None
+    return schedule
 
-    population = create_population(population_size, sections, rooms, timeslots)
 
-    for gen in range(generations):
-        # Calculate fitness once per generation, store in a dict
-        # This prevents recalculating the same schedule's fitness during sort()
-        fitness_map = {
-            id(s): calculate_fitness(
-                s, rooms, sections=sections, timeslots=timeslots,
-                valid_timeslot_cache=valid_timeslot_cache
-            ) for s in population
-        }
+# ==========================================
+# 3. MAIN LOOP (Integrating everything)
+# ==========================================
+def genetic_schedule(sections, timeslots, rooms, valid_timeslot_cache=None):
+    if valid_timeslot_cache is None:
+        valid_timeslot_cache = build_timeslot_guideline_cache(sections, timeslots)
 
-        # Sort based on the map
-        population.sort(key=lambda s: fitness_map[id(s)], reverse=True)
+    # Initial population
+    population = create_population(10, sections, rooms, timeslots)
 
-        # Early Exit
-        if fitness_map[id(population[0])] >= 1.0:
-            break
+    for gen in range(20):
+        # Selection
+        selected = selection(population, rooms, sections, timeslots, valid_timeslot_cache)
+        new_population = []
 
-        selected = population[:population_size // 2]
-        new_population = selected[:]
-
-        while len(new_population) < population_size:
+        while len(new_population) < len(population):
             p1, p2 = random.sample(selected, 2)
             child = crossover(p1, p2)
             child = mutation(child, rooms, timeslots, sections)
-            child = constraint_repair(child, rooms, timeslots, sections)
+
+            # Integrate ALNS Repair here
+            if random.random() < 0.3:
+                child = alns_repair(child, sections, rooms, timeslots)
+
             new_population.append(child)
-
         population = new_population
-        # Apply ILS only to the current best
-        population[0] = iterated_local_search(population[0], rooms, timeslots, sections)
 
-    return max(population, key=lambda s: calculate_fitness(s, rooms, sections=sections, timeslots=timeslots))
+    return max(population, key=lambda s: calculate_fitness(
+        s, rooms, sections=sections, timeslots=timeslots, valid_timeslot_cache=valid_timeslot_cache))
+
+# Create Population
+# This function creates many random schedules (solutions)
+def create_population(size, sections, rooms, timeslots):
+    population = []
+
+    # precompute static room/timeslot viability for each section
+    section_candidates = [
+        (
+            section,
+            get_viable_rooms(section, rooms),
+            get_valid_timeslots(section, timeslots),
+        )
+        for section in sections
+    ]
+
+    # repeat to create many schedules
+    for i in range(size):
+        schedule = []
+        occupied_instructors = set()
+        occupied_rooms = set()
+
+        # go through each section and assign random room + timeslot
+        for section, viable_rooms, valid_timeslots in section_candidates:
+            room, timeslot = choose_random_assignment(
+                section,
+                viable_rooms,
+                valid_timeslots,
+                occupied_instructors,
+                occupied_rooms,
+            )
+            item = ScheduleItem(
+                course_id=section.course.id,
+                course_name=section.course.name,
+                course_type=section.course.type,
+                course_dept=section.course.dept,
+                capacity=section.capacity,
+                instructor_id=section.instructor_id,
+                room_id=room.id if room else None,
+                timeslot_id=timeslot.id if timeslot else None,
+                section=str(section.no),
+            )
+
+            schedule.append(item)
+            if room is not None and timeslot is not None:
+                occupied_rooms.add((room.id, timeslot.id))
+            if section.instructor_id is not None and timeslot is not None:
+                occupied_instructors.add((section.instructor_id, timeslot.id))
+
+        # add this full schedule to population
+        population.append(schedule)
+
+    return population
 
 
-def iterated_local_search(schedule, rooms, timeslots, sections):
-    best = local_search(schedule, rooms, timeslots, sections, iterations=5)
-    best_score = calculate_fitness(best, rooms, sections=sections, timeslots=timeslots)
-    section_map = {str(s.no): s for s in sections}
-    for _ in range(2):
-        candidate = copy.deepcopy(best)
-        for _ in range(2):
-            item = random.choice(candidate)
-            section = section_map.get(item.section)
-            ts_list = get_valid_timeslots_cached(section, timeslots) if section else timeslots
-            item.timeslot_id = random.choice(ts_list).id
-        candidate = constraint_repair(candidate, rooms, timeslots, sections)
-        candidate = local_search(candidate, rooms, timeslots, sections, iterations=5)
-        if calculate_fitness(candidate, rooms, sections=sections, timeslots=timeslots) > best_score:
-            best = candidate
-    return best
+# Selection
+# This keeps the better half of the population
+# and evaluates fitness using section/timeslot-aware penalties.
+def selection(population, rooms, sections, timeslots, valid_timeslot_cache=None):
+    # sort schedules from best to worst using fitness score
+    population.sort(
+        key=lambda s: calculate_fitness(
+            s,
+            rooms,
+            sections=sections,
+            timeslots=timeslots,
+            valid_timeslot_cache=valid_timeslot_cache,
+        ),
+        reverse=True,
+    )
+
+    # keep only top 50%
+    return population[:len(population)//2]
