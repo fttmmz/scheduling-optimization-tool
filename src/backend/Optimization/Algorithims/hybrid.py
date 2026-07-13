@@ -143,22 +143,43 @@ def crossover(parent1, parent2):
     return copy.deepcopy(parent1[:point] + parent2[point:])
 
 
-def genetic_schedule(sections, timeslots, rooms, valid_timeslot_cache=None, population_size=16, generations=15):
+def genetic_schedule(sections, timeslots, rooms, population_size=16, generations=15):
+    # Pre-calculate the cache once
+    valid_timeslot_cache = build_timeslot_guideline_cache(sections, timeslots)
+
     population = create_population(population_size, sections, rooms, timeslots)
-    for _ in range(generations):
-        fitness_map = {id(s): calculate_fitness(s, rooms, sections=sections, timeslots=timeslots) for s in population}
+
+    for gen in range(generations):
+        # Calculate fitness once per generation, store in a dict
+        # This prevents recalculating the same schedule's fitness during sort()
+        fitness_map = {
+            id(s): calculate_fitness(
+                s, rooms, sections=sections, timeslots=timeslots,
+                valid_timeslot_cache=valid_timeslot_cache
+            ) for s in population
+        }
+
+        # Sort based on the map
         population.sort(key=lambda s: fitness_map[id(s)], reverse=True)
-        if fitness_map[id(population[0])] >= 1.0: break
+
+        # Early Exit
+        if fitness_map[id(population[0])] >= 1.0:
+            break
 
         selected = population[:population_size // 2]
         new_population = selected[:]
+
         while len(new_population) < population_size:
             p1, p2 = random.sample(selected, 2)
-            child = constraint_repair(mutation(crossover(p1, p2), rooms, timeslots, sections), rooms, timeslots,
-                                      sections)
+            child = crossover(p1, p2)
+            child = mutation(child, rooms, timeslots, sections)
+            child = constraint_repair(child, rooms, timeslots, sections)
             new_population.append(child)
+
         population = new_population
+        # Apply ILS only to the current best
         population[0] = iterated_local_search(population[0], rooms, timeslots, sections)
+
     return max(population, key=lambda s: calculate_fitness(s, rooms, sections=sections, timeslots=timeslots))
 
 
