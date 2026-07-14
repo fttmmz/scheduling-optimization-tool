@@ -6,6 +6,7 @@ from backend.Optimization.constraints import (
     passes_hard_constraints,
     get_viable_rooms,
     get_viable_rooms_for_schedule_item,
+    classify_section,
 )
 
 from backend.models.models import ScheduleItem
@@ -185,7 +186,7 @@ def _new_empty_schedule(sections):
             instructor_id=section.instructor_id,
             room_id=None,
             timeslot_id=None,
-            section=str(section.no),
+            section=section.no,
         )
         for section in sections
     ]
@@ -357,7 +358,28 @@ def csp_construct_schedule(
 
     sys.setrecursionlimit(max(10_000, len(sections) + 1_000))
     schedule = _new_empty_schedule(sections)
-    unassigned = set(range(len(schedule)))
+
+    # Only sections that truly need both a room and a timeslot belong in
+    # the CSP search. Sections classified as NEEDS_NOTHING are already
+    # complete with both values left as None. NEEDS_ROOM_ONLY sections
+    # receive a viable room here and are also excluded from the timeslot
+    # search. This keeps hybrid.py compatible with evaluation.py without
+    # changing evaluation.py.
+    unassigned = set()
+    for idx, section in enumerate(sections):
+        requirement = classify_section(section)
+
+        if requirement == "NEEDS_NOTHING":
+            continue
+
+        if requirement == "NEEDS_ROOM_ONLY":
+            viable_rooms, _ = option_cache[idx]
+            if viable_rooms:
+                schedule[idx].room_id = viable_rooms[0].id
+            continue
+
+        unassigned.add(idx)
+
     occupied_instructors = set()
     occupied_rooms = set()
     nodes = 0
