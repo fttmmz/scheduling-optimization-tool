@@ -1,4 +1,5 @@
 import random
+import sys
 
 from backend.Optimization.constraints import (
     get_valid_timeslots,
@@ -46,6 +47,17 @@ MAX_SEARCH_WIDTH = 30
 # generations you ran. Raised substantially, and the skip (if it ever
 # happens) now prints a warning instead of failing silently.
 RESCUE_MAX_ITEMS = 1000
+
+# CSP construction controls
+CSP_NODE_BUDGET = 180_000
+CSP_BACKTRACK_LIMIT = 250
+CSP_MRV_SAMPLE_SIZE = 80
+CSP_VALUE_SAMPLE_SIZE = 120
+CSP_RESTARTS = 3
+
+# Final soft-constraint polish
+HILL_CLIMB_ITERATIONS = 250
+HILL_CLIMB_NEIGHBORS = 12
 
 
 # =========================
@@ -160,6 +172,363 @@ def _exhaustive_best_slot(item, section, viable_rooms, valid_timeslots, occupied
 
 
 # =========================
+# CSP CONSTRUCTION: MRV + FORWARD CHECKING
+# =========================
+def _new_empty_schedule(sections):
+    return [
+        ScheduleItem(
+            course_id=section.course.id,
+            course_name=section.course.name,
+            course_type=section.course.type,
+            course_dept=section.course.dept,
+            capacity=section.capacity,
+            instructor_id=section.instructor_id,
+            room_id=None,
+            timeslot_id=None,
+            section=str(section.no),
+        )
+        for section in sections
+    ]
+
+
+def _iter_feasible_values(
+    idx,
+    schedule,
+    sections,
+    option_cache,
+    occupied_instructors,
+    occupied_rooms,
+    randomized=True,
+    limit=None,
+):
+    """Yield valid (room, timeslot) values lazily to avoid huge domains."""
+    item = schedule[idx]
+    section = sections[idx]
+    viable_rooms, valid_timeslots = option_cache[idx]
+
+    timeslot_order = list(valid_timeslots)
+    room_order = list(viable_rooms)
+    if randomized:
+        random.shuffle(timeslot_order)
+        random.shuffle(room_order)
+
+    yielded = 0
+    for ts in timeslot_order:
+        if (
+            item.instructor_id is not None
+            and (item.instructor_id, ts.id) in occupied_instructors
+        ):
+            continue
+
+        for room in room_order:
+            if (room.id, ts.id) in occupied_rooms:
+                continue
+            if not passes_hard_constraints(
+                section,
+                room,
+                ts,
+                occupied_instructors=occupied_instructors,
+                occupied_rooms=occupied_rooms,
+            ):
+                continue
+
+            yield room, ts
+            yielded += 1
+            if limit is not None and yielded >= limit:
+                return
+
+
+def _remaining_value_count(
+    idx,
+    schedule,
+    sections,
+    option_cache,
+    occupied_instructors,
+    occupied_rooms,
+    stop_after=None,
+):
+    count = 0
+    for _ in _iter_feasible_values(
+        idx,
+        schedule,
+        sections,
+        option_cache,
+        occupied_instructors,
+        occupied_rooms,
+        randomized=False,
+        limit=stop_after,
+    ):
+        count += 1
+    return count
+
+
+def _choose_mrv_index(
+    unassigned,
+    schedule,
+    sections,
+    option_cache,
+    occupied_instructors,
+    occupied_rooms,
+):
+    """Choose the section with the smallest current feasible domain."""
+    if len(unassigned) <= CSP_MRV_SAMPLE_SIZE:
+        candidates = list(unassigned)
+    else:
+        base = sorted(unassigned, key=lambda i: _constraint_score(i, option_cache))
+        scarce = base[: CSP_MRV_SAMPLE_SIZE // 2]
+        rest = base[CSP_MRV_SAMPLE_SIZE // 2 :]
+        sampled = random.sample(
+            rest,
+            min(CSP_MRV_SAMPLE_SIZE - len(scarce), len(rest)),
+        )
+        candidates = scarce + sampled
+
+    best_idx = None
+    best_count = None
+    for idx in candidates:
+        cutoff = best_count if best_count is not None else None
+        count = _remaining_value_count(
+            idx,
+            schedule,
+            sections,
+            option_cache,
+            occupied_instructors,
+            occupied_rooms,
+            stop_after=cutoff,
+        )
+        if count == 0:
+            return idx, 0
+        if best_count is None or count < best_count:
+            best_idx, best_count = idx, count
+
+    return best_idx, best_count
+
+
+def _forward_check(
+    placed_idx,
+    unassigned,
+    schedule,
+    sections,
+    option_cache,
+    occupied_instructors,
+    occupied_rooms,
+):
+    """
+    Check sections most affected by the latest assignment. Same-instructor
+    sections are always checked; the currently scarcest sections are checked
+    too. A zero-size domain causes immediate backtracking.
+    """
+    placed_instructor = schedule[placed_idx].instructor_id
+    affected = []
+
+    for idx in unassigned:
+        if placed_instructor is not None and schedule[idx].instructor_id == placed_instructor:
+            affected.append(idx)
+
+    scarce = sorted(unassigned, key=lambda i: _constraint_score(i, option_cache))
+    for idx in scarce[:CSP_MRV_SAMPLE_SIZE]:
+        if idx not in affected:
+            affected.append(idx)
+
+    for idx in affected:
+        if _remaining_value_count(
+            idx,
+            schedule,
+            sections,
+            option_cache,
+            occupied_instructors,
+            occupied_rooms,
+            stop_after=1,
+        ) == 0:
+            return False
+    return True
+
+
+def csp_construct_schedule(
+    sections,
+    rooms,
+    timeslots,
+    option_cache=None,
+    node_budget=CSP_NODE_BUDGET,
+):
+    """Build a conflict-free partial schedule using MRV and forward checking."""
+    if option_cache is None:
+        option_cache = build_option_cache(sections, rooms, timeslots)
+
+    sys.setrecursionlimit(max(10_000, len(sections) + 1_000))
+    schedule = _new_empty_schedule(sections)
+    unassigned = set(range(len(schedule)))
+    occupied_instructors = set()
+    occupied_rooms = set()
+    nodes = 0
+    backtracks = 0
+    best_snapshot = clone_schedule(schedule)
+    best_assigned = 0
+
+    def search():
+        nonlocal nodes, backtracks, best_snapshot, best_assigned
+
+        assigned = len(schedule) - len(unassigned)
+        if assigned > best_assigned:
+            best_assigned = assigned
+            best_snapshot = clone_schedule(schedule)
+
+        if not unassigned:
+            return True
+        if nodes >= node_budget or backtracks >= CSP_BACKTRACK_LIMIT:
+            return False
+
+        idx, domain_count = _choose_mrv_index(
+            unassigned,
+            schedule,
+            sections,
+            option_cache,
+            occupied_instructors,
+            occupied_rooms,
+        )
+        if idx is None or domain_count == 0:
+            backtracks += 1
+            return False
+
+        values = list(_iter_feasible_values(
+            idx,
+            schedule,
+            sections,
+            option_cache,
+            occupied_instructors,
+            occupied_rooms,
+            randomized=True,
+            limit=CSP_VALUE_SAMPLE_SIZE,
+        ))
+
+        # Least-constraining-value approximation: prefer less-used timeslots.
+        timeslot_load = {}
+        for _, ts_id in occupied_rooms:
+            timeslot_load[ts_id] = timeslot_load.get(ts_id, 0) + 1
+        values.sort(key=lambda pair: timeslot_load.get(pair[1].id, 0))
+
+        item = schedule[idx]
+        unassigned.remove(idx)
+
+        for room, ts in values:
+            nodes += 1
+            item.room_id = room.id
+            item.timeslot_id = ts.id
+
+            instr_key = None
+            if item.instructor_id is not None:
+                instr_key = (item.instructor_id, ts.id)
+                occupied_instructors.add(instr_key)
+            room_key = (room.id, ts.id)
+            occupied_rooms.add(room_key)
+
+            forward_ok = _forward_check(
+                idx,
+                unassigned,
+                schedule,
+                sections,
+                option_cache,
+                occupied_instructors,
+                occupied_rooms,
+            )
+
+            if forward_ok and search():
+                return True
+
+            occupied_rooms.remove(room_key)
+            if instr_key is not None:
+                occupied_instructors.remove(instr_key)
+            item.room_id = None
+            item.timeslot_id = None
+
+            if nodes >= node_budget or backtracks >= CSP_BACKTRACK_LIMIT:
+                break
+
+        unassigned.add(idx)
+        backtracks += 1
+        return False
+
+    search()
+    return best_snapshot
+
+
+def hill_climb_polish(
+    schedule,
+    sections,
+    rooms,
+    timeslots,
+    cache,
+    option_cache=None,
+):
+    """Improve soft fitness while accepting only strictly better valid moves."""
+    if option_cache is None:
+        option_cache = build_option_cache(sections, rooms, timeslots)
+
+    current = clone_schedule(schedule)
+    current_score = calculate_fitness(
+        current,
+        rooms,
+        sections=sections,
+        timeslots=timeslots,
+        valid_timeslot_cache=cache,
+    )
+
+    for _ in range(HILL_CLIMB_ITERATIONS):
+        idx = random.randrange(len(current))
+        item = current[idx]
+        section = sections[idx]
+
+        occupied_instructors = set()
+        occupied_rooms = set()
+        for j, other in enumerate(current):
+            if j == idx or other.timeslot_id is None:
+                continue
+            if other.instructor_id is not None:
+                occupied_instructors.add((other.instructor_id, other.timeslot_id))
+            if other.room_id is not None:
+                occupied_rooms.add((other.room_id, other.timeslot_id))
+
+        viable_rooms, valid_timeslots = option_cache[idx]
+        candidates = list(_iter_feasible_values(
+            idx,
+            current,
+            sections,
+            option_cache,
+            occupied_instructors,
+            occupied_rooms,
+            randomized=True,
+            limit=HILL_CLIMB_NEIGHBORS,
+        ))
+
+        old_room, old_ts = item.room_id, item.timeslot_id
+        best_move = None
+        best_score = current_score
+
+        for room, ts in candidates:
+            if room.id == old_room and ts.id == old_ts:
+                continue
+            item.room_id, item.timeslot_id = room.id, ts.id
+            score = calculate_fitness(
+                current,
+                rooms,
+                sections=sections,
+                timeslots=timeslots,
+                valid_timeslot_cache=cache,
+            )
+            if score > best_score:
+                best_score = score
+                best_move = (room.id, ts.id)
+
+        if best_move is None:
+            item.room_id, item.timeslot_id = old_room, old_ts
+        else:
+            item.room_id, item.timeslot_id = best_move
+            current_score = best_score
+
+    return current
+
+
+# =========================
 # CREATE POPULATION
 # =========================
 def create_population(size, sections, rooms, timeslots, option_cache=None):
@@ -167,27 +536,14 @@ def create_population(size, sections, rooms, timeslots, option_cache=None):
         option_cache = build_option_cache(sections, rooms, timeslots)
 
     population = []
-
     for _ in range(size):
-        schedule = [
-            ScheduleItem(
-                course_id=section.course.id,
-                course_name=section.course.name,
-                course_type=section.course.type,
-                course_dept=section.course.dept,
-                capacity=section.capacity,
-                instructor_id=section.instructor_id,
-                room_id=None,
-                timeslot_id=None,
-                section=str(section.no),
-            )
-            for section in sections
-        ]
-
-        repair_schedule(schedule, sections, rooms, timeslots, option_cache=option_cache)
-
+        schedule = csp_construct_schedule(
+            sections,
+            rooms,
+            timeslots,
+            option_cache=option_cache,
+        )
         population.append(schedule)
-
     return population
 
 
@@ -1138,153 +1494,79 @@ def tabu_search(
 # MAIN GA + TABU LOOP
 # =========================
 def genetic_schedule(sections, timeslots, rooms, cache=None, option_cache=None):
-    if cache is None:
-        cache = build_timeslot_guideline_cache(
-            sections,
-            timeslots,
-        )
+    """
+    Pure-Python CSP pipeline:
+      1. MRV backtracking construction with forward checking.
+      2. Existing exhaustive cleanup and ejection-chain repair.
+      3. Soft-constraint hill-climbing polish.
 
+    The public function name is unchanged, so the rest of the application
+    can continue calling genetic_schedule().
+    """
+    if cache is None:
+        cache = build_timeslot_guideline_cache(sections, timeslots)
     if option_cache is None:
         option_cache = build_option_cache(sections, rooms, timeslots)
 
-    population = create_population(
-        POPULATION_SIZE,
-        sections,
-        rooms,
-        timeslots,
-        option_cache=option_cache,
-    )
+    best = None
+    best_score = None
+    best_problem_count = None
 
-    best_generation_score = 0
-    stagnation = 0
-    NO_IMPROVEMENT_LIMIT = 8
+    for _ in range(CSP_RESTARTS):
+        candidate = csp_construct_schedule(
+            sections,
+            rooms,
+            timeslots,
+            option_cache=option_cache,
+        )
 
-    last_scored = None
-
-    for i in range(GENERATIONS):
-
-        scored_population = score_population(population, rooms, sections, timeslots, cache)
-        scored_population.sort(key=lambda x: x[1], reverse=True)
-
-        half = len(scored_population) // 2
-        selected_scored = scored_population[:half]
-        selected = [s for s, _ in selected_scored]
-        fitness_lookup = {id(s): f for s, f in scored_population}
-
-        elites = [clone_schedule(s) for s, _ in selected_scored[:ELITE_SIZE]]
-
-        new_population = elites
-
-        while len(new_population) < POPULATION_SIZE:
-
-            p1 = tournament_selection(selected, fitness_lookup)
-            p2 = tournament_selection(selected, fitness_lookup)
-
-            child = crossover(p1, p2, option_cache=option_cache)
-
-            if count_unscheduled(child) > 0:
-                repair_schedule(child, sections, rooms, timeslots, option_cache=option_cache)
-
-            child, mutated = mutation(
-                child,
-                rooms,
-                timeslots,
+        for _ in range(5):
+            before = len(_find_problem_indices(candidate))
+            force_place_remaining(
+                candidate, sections, rooms, timeslots,
                 option_cache=option_cache,
-                sections=sections,
             )
-
-            if mutated:
-                repair_schedule(child, sections, rooms, timeslots, option_cache=option_cache)
-
-            new_population.append(child)
-
-        scored_new = score_population(new_population, rooms, sections, timeslots, cache)
-        scored_new.sort(key=lambda x: x[1], reverse=True)
-        new_population = [s for s, _ in scored_new]
-
-        current_best = scored_new[0][1]
-
-        if current_best > best_generation_score:
-            best_generation_score = current_best
-            stagnation = 0
-        else:
-            stagnation += 1
-
-        apply_tabu = stagnation >= NO_IMPROVEMENT_LIMIT or i == GENERATIONS - 1
-
-        if apply_tabu:
-
-            top_k = max(
-                1,
-                int(len(new_population) * TS_APPLY_RATE)
+            resolve_conflicts(
+                candidate, sections, rooms, timeslots,
+                option_cache=option_cache,
             )
+            candidate, resolved = resolve_hard_cases(
+                candidate, sections, rooms, timeslots,
+                option_cache=option_cache,
+            )
+            after = len(_find_problem_indices(candidate))
+            if after >= before and resolved == 0:
+                break
 
-            for j in range(top_k):
-                improved_schedule, improved_score = tabu_search(
-                    new_population[j],
-                    rooms,
-                    timeslots,
-                    sections,
-                    cache,
-                    option_cache=option_cache,
-                )
+        candidate = hill_climb_polish(
+            candidate,
+            sections,
+            rooms,
+            timeslots,
+            cache,
+            option_cache=option_cache,
+        )
 
-                # CHANGED: also run the exhaustive rescue pass on each
-                # tabu-polished individual, not just at the very end of
-                # the whole run. This means leftover unscheduled items in
-                # your best individuals get mopped up every time tabu
-                # search runs (on stagnation, and on the final
-                # generation), rather than only once at the very end --
-                # so later generations get to build on fuller schedules.
-                if count_unscheduled(improved_schedule) > 0:
-                    force_place_remaining(
-                        improved_schedule, sections, rooms, timeslots,
-                        option_cache=option_cache,
-                    )
+        problems = len(_find_problem_indices(candidate))
+        score = calculate_fitness(
+            candidate,
+            rooms,
+            sections=sections,
+            timeslots=timeslots,
+            valid_timeslot_cache=cache,
+        )
 
-                resolve_conflicts(
-                    improved_schedule, sections, rooms, timeslots,
-                    option_cache=option_cache,
-                )
-                improved_schedule, _ = resolve_hard_cases(
-                    improved_schedule, sections, rooms, timeslots,
-                    option_cache=option_cache,
-                )
+        if (
+            best is None
+            or problems < best_problem_count
+            or (problems == best_problem_count and score > best_score)
+        ):
+            best = clone_schedule(candidate)
+            best_problem_count = problems
+            best_score = score
 
-                improved_score = calculate_fitness(
-                    improved_schedule, rooms, sections=sections,
-                    timeslots=timeslots, valid_timeslot_cache=cache,
-                )
-
-                new_population[j] = improved_schedule
-                scored_new[j] = (improved_schedule, improved_score)
-
-            scored_new.sort(key=lambda x: x[1], reverse=True)
-            new_population = [s for s, _ in scored_new]
-
-        population = new_population
-        last_scored = scored_new
-
-        if stagnation >= NO_IMPROVEMENT_LIMIT:
-            break
-
-    best, _ = last_scored[0]
-
-    repair_schedule(best, sections, rooms, timeslots, option_cache=option_cache)
-
-    # Loop the cleanup passes: resolving one item can free up capacity
-    # that helps the next, so keep going until nothing more improves or
-    # we hit a safety cap on iterations.
-    for _ in range(5):
-        before = len(_find_problem_indices(best))
-        force_place_remaining(best, sections, rooms, timeslots, option_cache=option_cache)
-        resolve_conflicts(best, sections, rooms, timeslots, option_cache=option_cache)
-        best, resolved = resolve_hard_cases(best, sections, rooms, timeslots, option_cache=option_cache)
-        after = len(_find_problem_indices(best))
-        if after >= before and resolved == 0:
+        if problems == 0:
             break
 
     diagnose_remaining_problems(best, sections, option_cache)
-
     return best
-
