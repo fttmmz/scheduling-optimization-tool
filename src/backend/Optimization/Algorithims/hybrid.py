@@ -16,10 +16,10 @@ from backend.Optimization.evaluation import (
     calculate_fitness,
 )
 
-# ============================================================
+# ===========================================================
 # PURE-PYTHON HYBRID
 # Classification-aware MRV construction + LNS + min-conflicts
-# ============================================================
+# ===========================================================
 
 CONSTRUCTION_RESTARTS = 4
 CONSTRUCTION_PAIR_SAMPLES = 220
