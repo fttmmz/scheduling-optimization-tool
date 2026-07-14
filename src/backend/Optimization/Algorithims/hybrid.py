@@ -17,21 +17,27 @@ from backend.Optimization.evaluation import (
 # =========================
 # PARAMETERS
 # =========================
-POPULATION_SIZE = 15
-GENERATIONS = 15
+POPULATION_SIZE = 20
+GENERATIONS = 25
 
 CROSSOVER_RATE = 0.90
 MUTATION_RATE = 0.15  # gate for "nudge an already-scheduled item"; unscheduled
                        # items now bypass this gate entirely (see mutation()).
 
-TABU_ITERATIONS = 5
+TABU_ITERATIONS = 12
 TABU_TENURE = 7
 
-TS_APPLY_RATE = 0.2  # top 20% of population gets tabu search
+TS_APPLY_RATE = 0.3  # top 30% of population gets tabu search
 
 ELITE_SIZE = 2
 
-MAX_SEARCH_WIDTH = 20
+# Quick-pass sample width. Kept moderate (not exhaustive) because this
+# runs for EVERY item, EVERY child, EVERY generation -- it's the hot
+# path. Items that fail this quick pass fall through to an exhaustive
+# search (see _exhaustive_best_slot) rather than another sampled pass,
+# so thoroughness for hard-to-place items no longer depends on this
+# number being huge.
+MAX_SEARCH_WIDTH = 30
 
 # CHANGED: this used to hard-cap the final rescue pass at 50 leftover
 # items -- meaning if more than 50 sections were unscheduled, the ONE
@@ -108,6 +114,49 @@ def _constraint_score(idx, option_cache):
             return len(viable_rooms) * len(valid_timeslots)
         return 0
     return 1_000_000
+
+
+# =========================
+# EXHAUSTIVE FALLBACK SEARCH
+# =========================
+def _exhaustive_best_slot(item, section, viable_rooms, valid_timeslots, occupied_instructors, occupied_rooms):
+    """
+    Full scan over every (room, timeslot) combo for `item`, looking for a
+    genuinely conflict-free placement and falling back to the least-bad
+    conflict count if none exists. Early-exits the instant a zero-conflict
+    combo is found, so the full cost is only ever paid for items that are
+    truly hard to place -- easy items get resolved by a cheap sampled pass
+    before this ever runs. This is what the sampled fallbacks used to do
+    with a bounded random sample (and could therefore miss a real free
+    slot that existed outside the sample); this always finds one if it
+    exists.
+    """
+    best_room, best_ts, best_conflicts = None, None, None
+
+    for ts in valid_timeslots:
+        instr_conflict = (
+            item.instructor_id is not None
+            and (item.instructor_id, ts.id) in occupied_instructors
+        )
+        for room in viable_rooms:
+            if section is not None and not passes_hard_constraints(
+                section, room, ts,
+                occupied_instructors=occupied_instructors,
+                occupied_rooms=occupied_rooms,
+            ):
+                continue
+
+            conflicts = (1 if instr_conflict else 0) + (
+                1 if (room.id, ts.id) in occupied_rooms else 0
+            )
+
+            if conflicts == 0:
+                return room, ts, 0
+
+            if best_conflicts is None or conflicts < best_conflicts:
+                best_room, best_ts, best_conflicts = room, ts, conflicts
+
+    return best_room, best_ts, best_conflicts
 
 
 # =========================
@@ -252,33 +301,17 @@ def repair_schedule(schedule, sections, rooms, timeslots, option_cache=None):
                 break
 
         if best_room is None:
-
-            search_rooms = random.sample(viable_rooms, min(MAX_SEARCH_WIDTH, len(viable_rooms)))
-
-            for ts in search_timeslots:
-
-                for room in search_rooms:
-
-                    if section is not None and not passes_hard_constraints(
-                            section,
-                            room,
-                            ts,
-                            occupied_instructors=occupied_instructors,
-                            occupied_rooms=occupied_rooms,
-                    ):
-                        continue
-
-                    conflicts = 0
-                    if (
-                            item.instructor_id is not None
-                            and (item.instructor_id, ts.id) in occupied_instructors
-                    ):
-                        conflicts += 1
-                    if (room.id, ts.id) in occupied_rooms:
-                        conflicts += 1
-
-                    if best_conflicts is None or conflicts < best_conflicts:
-                        best_room, best_ts, best_conflicts = room, ts, conflicts
+            # CHANGED: this used to be another *sampled* pass looking for
+            # the least-bad conflict, which could still miss a genuinely
+            # free slot sitting outside the random sample. Now it's a
+            # full exhaustive scan -- only paid for items that already
+            # failed the cheap sampled pass above, which should be the
+            # minority, so the extra cost is proportional to how many
+            # sections are actually hard to place.
+            best_room, best_ts, best_conflicts = _exhaustive_best_slot(
+                item, section, viable_rooms, valid_timeslots,
+                occupied_instructors, occupied_rooms,
+            )
 
         should_replace = (
                 is_unset
@@ -358,39 +391,10 @@ def force_place_remaining(schedule, sections, rooms, timeslots, option_cache=Non
         if not viable_rooms or not valid_timeslots:
             continue
 
-        best_room, best_ts, best_conflicts = None, None, None
-
-        for ts in valid_timeslots:
-
-            instr_conflict = (
-                    item.instructor_id is not None
-                    and (item.instructor_id, ts.id) in occupied_instructors
-            )
-
-            for room in viable_rooms:
-
-                if section is not None and not passes_hard_constraints(
-                        section,
-                        room,
-                        ts,
-                        occupied_instructors=occupied_instructors,
-                        occupied_rooms=occupied_rooms,
-                ):
-                    continue
-
-                conflicts = (1 if instr_conflict else 0) + (
-                    1 if (room.id, ts.id) in occupied_rooms else 0
-                )
-
-                if conflicts == 0:
-                    best_room, best_ts, best_conflicts = room, ts, 0
-                    break
-
-                if best_conflicts is None or conflicts < best_conflicts:
-                    best_room, best_ts, best_conflicts = room, ts, conflicts
-
-            if best_conflicts == 0:
-                break
+        best_room, best_ts, best_conflicts = _exhaustive_best_slot(
+            item, section, viable_rooms, valid_timeslots,
+            occupied_instructors, occupied_rooms,
+        )
 
         if best_room is not None:
             item.room_id = best_room.id
@@ -398,6 +402,99 @@ def force_place_remaining(schedule, sections, rooms, timeslots, option_cache=Non
             if item.instructor_id is not None:
                 occupied_instructors.add((item.instructor_id, item.timeslot_id))
             occupied_rooms.add((item.room_id, item.timeslot_id))
+
+    return schedule
+
+
+# =========================
+# CONFLICT RESOLUTION PASS
+# =========================
+def resolve_conflicts(schedule, sections, rooms, timeslots, option_cache=None):
+    """
+    force_place_remaining fixes items with NO room/timeslot at all. This
+    fixes the other kind of leftover problem: items that DO have a room
+    and timeslot, but it's a double-booked one (the "room conflicts" you
+    were seeing). For each conflicted item, it rebuilds the occupancy
+    picture excluding that item, then does an exhaustive search for a
+    genuinely free slot -- only moving the item if it actually finds a
+    strictly better (lower-conflict) placement.
+    """
+    if option_cache is None:
+        option_cache = build_option_cache(sections, rooms, timeslots)
+
+    rooms_by_id, timeslots_by_id = _get_id_maps(option_cache, rooms, timeslots)
+
+    room_counts = {}
+    instr_counts = {}
+    for item in schedule:
+        if item.room_id is not None and item.timeslot_id is not None:
+            key = (item.room_id, item.timeslot_id)
+            room_counts[key] = room_counts.get(key, 0) + 1
+        if item.instructor_id is not None and item.timeslot_id is not None:
+            key = (item.instructor_id, item.timeslot_id)
+            instr_counts[key] = instr_counts.get(key, 0) + 1
+
+    conflicted_indices = []
+    for idx, item in enumerate(schedule):
+        if item.room_id is None or item.timeslot_id is None:
+            continue
+        room_conflict = room_counts.get((item.room_id, item.timeslot_id), 0) > 1
+        instr_conflict = (
+            item.instructor_id is not None
+            and instr_counts.get((item.instructor_id, item.timeslot_id), 0) > 1
+        )
+        if room_conflict or instr_conflict:
+            conflicted_indices.append(idx)
+
+    if not conflicted_indices:
+        return schedule
+
+    # most-constrained-first, same reasoning as everywhere else: give
+    # scarce sections first crack at whatever opens up
+    conflicted_indices.sort(key=lambda i: _constraint_score(i, option_cache))
+
+    for idx in conflicted_indices:
+        item = schedule[idx]
+        section = sections[idx] if idx < len(sections) else None
+
+        # rebuild occupancy excluding this item specifically, so it
+        # doesn't block itself while we search for somewhere better
+        occupied_instructors = set()
+        occupied_rooms = set()
+        for j, other in enumerate(schedule):
+            if j == idx:
+                continue
+            if other.instructor_id is not None and other.timeslot_id is not None:
+                occupied_instructors.add((other.instructor_id, other.timeslot_id))
+            if other.room_id is not None and other.timeslot_id is not None:
+                occupied_rooms.add((other.room_id, other.timeslot_id))
+
+        if idx in option_cache:
+            viable_rooms, valid_timeslots = option_cache[idx]
+        elif section is not None:
+            viable_rooms = get_viable_rooms(section, rooms)
+            valid_timeslots = get_valid_timeslots(section, timeslots)
+        else:
+            viable_rooms = get_viable_rooms_for_schedule_item(item, rooms)
+            valid_timeslots = timeslots
+
+        if not viable_rooms or not valid_timeslots:
+            continue
+
+        current_conflicts = 0
+        if item.instructor_id is not None and (item.instructor_id, item.timeslot_id) in occupied_instructors:
+            current_conflicts += 1
+        if (item.room_id, item.timeslot_id) in occupied_rooms:
+            current_conflicts += 1
+
+        best_room, best_ts, best_conflicts = _exhaustive_best_slot(
+            item, section, viable_rooms, valid_timeslots,
+            occupied_instructors, occupied_rooms,
+        )
+
+        if best_room is not None and (best_conflicts is None or best_conflicts < current_conflicts):
+            item.room_id = best_room.id
+            item.timeslot_id = best_ts.id
 
     return schedule
 
@@ -597,6 +694,16 @@ def mutation(schedule, rooms, timeslots, option_cache=None, sections=None):
 
                 if best_conflicts == 0:
                     break
+
+            if best_room is None:
+                # same reasoning as repair_schedule -- fall through to an
+                # exhaustive search rather than giving up after one
+                # sampled pass, since this branch specifically targets
+                # unscheduled items.
+                best_room, best_ts, best_conflicts = _exhaustive_best_slot(
+                    selected_item, section, cached_rooms, cached_timeslots,
+                    occupied_instructors, occupied_rooms,
+                )
 
             if best_room is not None:
                 selected_item.room_id = best_room.id
@@ -867,7 +974,7 @@ def genetic_schedule(sections, timeslots, rooms, cache=None, option_cache=None):
 
     best_generation_score = 0
     stagnation = 0
-    NO_IMPROVEMENT_LIMIT = 5
+    NO_IMPROVEMENT_LIMIT = 8
 
     last_scored = None
 
@@ -951,10 +1058,16 @@ def genetic_schedule(sections, timeslots, rooms, cache=None, option_cache=None):
                         improved_schedule, sections, rooms, timeslots,
                         option_cache=option_cache,
                     )
-                    improved_score = calculate_fitness(
-                        improved_schedule, rooms, sections=sections,
-                        timeslots=timeslots, valid_timeslot_cache=cache,
-                    )
+
+                resolve_conflicts(
+                    improved_schedule, sections, rooms, timeslots,
+                    option_cache=option_cache,
+                )
+
+                improved_score = calculate_fitness(
+                    improved_schedule, rooms, sections=sections,
+                    timeslots=timeslots, valid_timeslot_cache=cache,
+                )
 
                 new_population[j] = improved_schedule
                 scored_new[j] = (improved_schedule, improved_score)
@@ -972,6 +1085,7 @@ def genetic_schedule(sections, timeslots, rooms, cache=None, option_cache=None):
 
     repair_schedule(best, sections, rooms, timeslots, option_cache=option_cache)
     force_place_remaining(best, sections, rooms, timeslots, option_cache=option_cache)
+    resolve_conflicts(best, sections, rooms, timeslots, option_cache=option_cache)
 
     return best
 
