@@ -21,22 +21,22 @@ from backend.Optimization.evaluation import (
 # Classification-aware MRV construction + LNS + min-conflicts
 # ============================================================
 
-CONSTRUCTION_RESTARTS = 4
+CONSTRUCTION_RESTARTS = 6
 CONSTRUCTION_PAIR_SAMPLES = 220
 
-LNS_ITERATIONS = 180
-LNS_MIN_SIZE = 30
-LNS_MAX_SIZE = 100
+LNS_ITERATIONS = 320
+LNS_MIN_SIZE = 40
+LNS_MAX_SIZE = 150
 LNS_PAIR_SAMPLES = 280
 
-MIN_CONFLICT_STEPS = 12000
+MIN_CONFLICT_STEPS = 24000
 MIN_CONFLICT_PAIR_SAMPLES = 320
 RANDOM_WALK_RATE = 0.06
 
 SOFT_POLISH_STEPS = 100
 SOFT_POLISH_PAIR_SAMPLES = 60
 
-UNSCHEDULED_WEIGHT = 10000
+UNSCHEDULED_WEIGHT = 100000
 ROOM_CONFLICT_WEIGHT = 1000
 INSTRUCTOR_CONFLICT_WEIGHT = 1000
 
@@ -704,6 +704,258 @@ def _min_conflicts(schedule, sections, option_cache, static_memo):
     return best
 
 
+
+# ============================================================
+# EXACT FINAL RESCUE AND EJECTION REPAIR
+# ============================================================
+def _exhaustive_best_candidate(
+    idx,
+    schedule,
+    sections,
+    option_cache,
+    room_counts,
+    instructor_counts,
+    static_memo,
+    require_zero=False,
+):
+    requirement = _requirement(idx, option_cache)
+    schedule_item = schedule[idx]
+
+    if requirement == "NEEDS_NOTHING":
+        return (0, None, None)
+
+    viable_rooms = option_cache[idx]["rooms"]
+    if not viable_rooms:
+        return None
+
+    if requirement == "NEEDS_ROOM_ONLY":
+        return (0, viable_rooms[0], None)
+
+    valid_timeslots = option_cache[idx]["timeslots"]
+    if not valid_timeslots:
+        return None
+
+    ordered_timeslots = sorted(
+        valid_timeslots,
+        key=lambda timeslot: instructor_counts.get(
+            (schedule_item.instructor_id, timeslot.id), 0
+        ) if schedule_item.instructor_id is not None else 0,
+    )
+
+    best = None
+    best_cost = math.inf
+
+    for timeslot in ordered_timeslots:
+        instructor_cost = 0
+        if schedule_item.instructor_id is not None:
+            instructor_cost = instructor_counts.get(
+                (schedule_item.instructor_id, timeslot.id), 0
+            ) * INSTRUCTOR_CONFLICT_WEIGHT
+
+        # If even the instructor part is already worse than the best,
+        # no room in this timeslot can improve it.
+        if instructor_cost > best_cost:
+            continue
+
+        ordered_rooms = sorted(
+            viable_rooms,
+            key=lambda room: room_counts.get((room.id, timeslot.id), 0),
+        )
+
+        for room in ordered_rooms:
+            if not _static_ok(idx, room, timeslot, sections, static_memo):
+                continue
+
+            cost = instructor_cost + (
+                room_counts.get((room.id, timeslot.id), 0)
+                * ROOM_CONFLICT_WEIGHT
+            )
+
+            if cost == 0:
+                return (0, room, timeslot)
+
+            if not require_zero and cost < best_cost:
+                best_cost = cost
+                best = (cost, room, timeslot)
+
+    return best
+
+
+def _force_schedule_all(schedule, sections, option_cache, static_memo):
+    """Exhaustively place every section that has at least one feasible domain value."""
+    room_counts, instructor_counts = _build_occupancy(schedule)
+    unscheduled = [
+        idx for idx, schedule_item in enumerate(schedule)
+        if not _is_scheduled(schedule_item)
+        and _requirement(idx, option_cache) != "NEEDS_NOTHING"
+    ]
+    unscheduled.sort(key=lambda idx: _domain_size(idx, option_cache))
+
+    for idx in unscheduled:
+        candidate = _exhaustive_best_candidate(
+            idx, schedule, sections, option_cache, room_counts,
+            instructor_counts, static_memo, require_zero=False,
+        )
+        if candidate is None:
+            continue
+        _, room, timeslot = candidate
+        if room is None:
+            continue
+        _add_assignment(
+            schedule[idx], room.id,
+            timeslot.id if timeslot is not None else None,
+            room_counts, instructor_counts,
+        )
+
+    return schedule
+
+
+def _exact_conflict_descent(schedule, sections, option_cache, static_memo, rounds=8):
+    """Move conflicted items using exhaustive best-placement searches."""
+    best = clone_schedule(schedule)
+    best_cost = _objective(best)
+
+    for _ in range(rounds):
+        room_counts, instructor_counts = _build_occupancy(best)
+        problems = _problem_indices(best, room_counts, instructor_counts)
+        problems.sort(key=lambda idx: _domain_size(idx, option_cache))
+        improved = False
+
+        for idx in problems:
+            if _requirement(idx, option_cache) == "NEEDS_NOTHING":
+                continue
+
+            candidate_schedule = clone_schedule(best)
+            candidate_room_counts, candidate_instructor_counts = _build_occupancy(
+                candidate_schedule
+            )
+            _remove_assignment(
+                candidate_schedule[idx],
+                candidate_room_counts,
+                candidate_instructor_counts,
+            )
+
+            placement = _exhaustive_best_candidate(
+                idx, candidate_schedule, sections, option_cache,
+                candidate_room_counts, candidate_instructor_counts,
+                static_memo, require_zero=False,
+            )
+            if placement is None:
+                continue
+
+            _, room, timeslot = placement
+            if room is None:
+                continue
+            _add_assignment(
+                candidate_schedule[idx], room.id,
+                timeslot.id if timeslot is not None else None,
+                candidate_room_counts, candidate_instructor_counts,
+            )
+            candidate_cost = _objective_from_counts(
+                candidate_schedule, candidate_room_counts,
+                candidate_instructor_counts,
+            )
+            if candidate_cost < best_cost:
+                best = candidate_schedule
+                best_cost = candidate_cost
+                improved = True
+
+        if not improved:
+            break
+
+    return best
+
+
+def _depth_two_ejection_repair(
+    schedule, sections, option_cache, static_memo, max_problem_items=350
+):
+    """Place a problem item into an occupied slot and relocate its blocker."""
+    best = clone_schedule(schedule)
+    best_cost = _objective(best)
+    room_counts, instructor_counts = _build_occupancy(best)
+    problems = _problem_indices(best, room_counts, instructor_counts)
+    problems.sort(key=lambda idx: _domain_size(idx, option_cache))
+
+    for p_idx in problems[:max_problem_items]:
+        if _requirement(p_idx, option_cache) != "NEEDS_ROOM_AND_TIME":
+            continue
+
+        p_rooms = option_cache[p_idx]["rooms"]
+        p_timeslots = option_cache[p_idx]["timeslots"]
+        if not p_rooms or not p_timeslots:
+            continue
+
+        # Prefer candidate slots with only one room blocker and no
+        # instructor blocker. This keeps the chain at depth two.
+        candidates = []
+        for timeslot in p_timeslots:
+            p_item = best[p_idx]
+            instr_count = (
+                instructor_counts.get((p_item.instructor_id, timeslot.id), 0)
+                if p_item.instructor_id is not None else 0
+            )
+            if instr_count > 0:
+                continue
+            for room in p_rooms:
+                if room_counts.get((room.id, timeslot.id), 0) != 1:
+                    continue
+                if not _static_ok(p_idx, room, timeslot, sections, static_memo):
+                    continue
+                candidates.append((room, timeslot))
+                if len(candidates) >= 80:
+                    break
+            if len(candidates) >= 80:
+                break
+
+        random.shuffle(candidates)
+        for room, timeslot in candidates:
+            blocker_idx = None
+            for idx, item in enumerate(best):
+                if idx != p_idx and item.room_id == room.id and item.timeslot_id == timeslot.id:
+                    blocker_idx = idx
+                    break
+            if blocker_idx is None:
+                continue
+
+            trial = clone_schedule(best)
+            trial_room_counts, trial_instructor_counts = _build_occupancy(trial)
+            _remove_assignment(trial[p_idx], trial_room_counts, trial_instructor_counts)
+            _remove_assignment(trial[blocker_idx], trial_room_counts, trial_instructor_counts)
+
+            # Put the problem item into the target slot first.
+            _add_assignment(
+                trial[p_idx], room.id, timeslot.id,
+                trial_room_counts, trial_instructor_counts,
+            )
+
+            blocker_placement = _exhaustive_best_candidate(
+                blocker_idx, trial, sections, option_cache,
+                trial_room_counts, trial_instructor_counts,
+                static_memo, require_zero=True,
+            )
+            if blocker_placement is None:
+                continue
+
+            _, blocker_room, blocker_timeslot = blocker_placement
+            if blocker_room is None:
+                continue
+            _add_assignment(
+                trial[blocker_idx], blocker_room.id,
+                blocker_timeslot.id if blocker_timeslot is not None else None,
+                trial_room_counts, trial_instructor_counts,
+            )
+
+            trial_cost = _objective_from_counts(
+                trial, trial_room_counts, trial_instructor_counts
+            )
+            if trial_cost < best_cost:
+                best = trial
+                best_cost = trial_cost
+                room_counts, instructor_counts = _build_occupancy(best)
+                break
+
+    return best
+
 # ============================================================
 # SOFT-CONSTRAINT POLISH
 # ============================================================
@@ -798,16 +1050,35 @@ def genetic_schedule(sections, timeslots, rooms, cache=None, option_cache=None):
     static_memo = {}
 
     best = _initial_construction(sections, option_cache, static_memo)
+
+    # First guarantee that every section with a non-empty feasible domain
+    # receives an assignment. The earlier sampled construction could miss
+    # valid pairs for difficult sections.
+    best = _force_schedule_all(best, sections, option_cache, static_memo)
+
     best = _large_neighborhood_search(
         best, sections, option_cache, static_memo
     )
     best = _min_conflicts(
         best, sections, option_cache, static_memo
     )
+    best = _exact_conflict_descent(
+        best, sections, option_cache, static_memo, rounds=6
+    )
+    best = _depth_two_ejection_repair(
+        best, sections, option_cache, static_memo
+    )
     best = _large_neighborhood_search(
         best, sections, option_cache, static_memo
     )
     best = _min_conflicts(
+        best, sections, option_cache, static_memo
+    )
+    best = _force_schedule_all(best, sections, option_cache, static_memo)
+    best = _exact_conflict_descent(
+        best, sections, option_cache, static_memo, rounds=10
+    )
+    best = _depth_two_ejection_repair(
         best, sections, option_cache, static_memo
     )
     best = _soft_polish(
