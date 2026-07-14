@@ -3,56 +3,48 @@ import random
 from collections import defaultdict
 
 from backend.Optimization.constraints import (
+    NEEDS_NOTHING,
+    NEEDS_ROOM_ONLY,
+    classify_section,
     get_valid_timeslots,
-    passes_hard_constraints,
     get_viable_rooms,
+    passes_hard_constraints,
 )
 from backend.models.models import ScheduleItem
 from backend.Optimization.evaluation import (
-    calculate_fitness,
     build_timeslot_guideline_cache,
+    calculate_fitness,
 )
 
 # ============================================================
-# PURE-PYTHON HYBRID: MRV GREEDY + LNS + MIN-CONFLICTS
+# PURE-PYTHON HYBRID
+# Classification-aware MRV construction + LNS + min-conflicts
 # ============================================================
-# The public function remains genetic_schedule(...) so the website does
-# not need to change its import or call.
 
-# Initial construction
-GREEDY_VALUE_SAMPLES = 160
-GREEDY_RANDOM_TOP = 5
-CONSTRUCTION_RESTARTS = 3
+CONSTRUCTION_RESTARTS = 4
+CONSTRUCTION_PAIR_SAMPLES = 220
 
-# Large Neighborhood Search
-LNS_ITERATIONS = 350
-LNS_MIN_SIZE = 35
-LNS_MAX_SIZE = 110
-LNS_REBUILD_SAMPLES = 220
-LNS_STAGNATION_EXPAND = 35
+LNS_ITERATIONS = 180
+LNS_MIN_SIZE = 30
+LNS_MAX_SIZE = 100
+LNS_PAIR_SAMPLES = 280
 
-# Min-conflicts
 MIN_CONFLICT_STEPS = 12000
-MIN_CONFLICT_SAMPLES = 240
+MIN_CONFLICT_PAIR_SAMPLES = 320
 RANDOM_WALK_RATE = 0.06
 
-# Ejection chains
-EJECTION_ROUNDS = 4
-EJECTION_DEPTH = 3
-EJECTION_BRANCHES = 14
+SOFT_POLISH_STEPS = 100
+SOFT_POLISH_PAIR_SAMPLES = 60
 
-# Final soft polish
-SOFT_POLISH_STEPS = 120
-SOFT_POLISH_SAMPLES = 40
-
-# Objective priorities. One unscheduled section must be more expensive than
-# several ordinary clashes, so the search first completes the timetable.
 UNSCHEDULED_WEIGHT = 10000
 ROOM_CONFLICT_WEIGHT = 1000
 INSTRUCTOR_CONFLICT_WEIGHT = 1000
 
-# Static feasibility memo. It only stores combinations actually tested.
-_STATIC_OK_CACHE_LIMIT = 600000
+STATIC_CACHE_LIMIT = 700000
+
+_ROOMS_BY_ID_KEY = "_rooms_by_id"
+_TIMESLOTS_BY_ID_KEY = "_timeslots_by_id"
+_REQUIREMENT_KEY = "_requirement"
 
 
 # ============================================================
@@ -73,12 +65,12 @@ def clone_item(item):
 
 
 def clone_schedule(schedule):
-    return [clone_item(item) for item in schedule]
+    return [clone_item(schedule_item) for schedule_item in schedule]
 
 
 def _new_schedule(sections):
-    # Keep section.no in its original type. This helps evaluation.py match
-    # ScheduleItem objects back to their original Section objects.
+    # Preserve section.no exactly because evaluation.py uses it to match
+    # ScheduleItem objects back to Section objects.
     return [
         ScheduleItem(
             course_id=section.course.id,
@@ -95,66 +87,69 @@ def _new_schedule(sections):
     ]
 
 
+def _item_requirement(item):
+    if item.course_type in NEEDS_NOTHING:
+        return "NEEDS_NOTHING"
+    if item.course_type in NEEDS_ROOM_ONLY:
+        return "NEEDS_ROOM_ONLY"
+    return "NEEDS_ROOM_AND_TIME"
+
+
+def _is_scheduled(item):
+    requirement = _item_requirement(item)
+    if requirement == "NEEDS_NOTHING":
+        return True
+    if requirement == "NEEDS_ROOM_ONLY":
+        return item.room_id is not None
+    return item.room_id is not None and item.timeslot_id is not None
+
+
 def count_unscheduled(schedule):
-    return sum(
-        1
-        for item in schedule
-        if item.room_id is None or item.timeslot_id is None
-    )
+    return sum(1 for schedule_item in schedule if not _is_scheduled(schedule_item))
 
 
 # ============================================================
-# OPTIONS AND STATIC FEASIBILITY
+# OPTION CACHE
 # ============================================================
-_ROOMS_BY_ID_KEY = "_rooms_by_id"
-_TIMESLOTS_BY_ID_KEY = "_timeslots_by_id"
-
-
 def build_option_cache(sections, rooms, timeslots):
     cache = {
         _ROOMS_BY_ID_KEY: {room.id: room for room in rooms},
-        _TIMESLOTS_BY_ID_KEY: {ts.id: ts for ts in timeslots},
+        _TIMESLOTS_BY_ID_KEY: {timeslot.id: timeslot for timeslot in timeslots},
     }
 
     for idx, section in enumerate(sections):
-        cache[idx] = (
-            list(get_viable_rooms(section, rooms)),
-            list(get_valid_timeslots(section, timeslots)),
-        )
+        requirement = classify_section(section)
+
+        if requirement == "NEEDS_NOTHING":
+            viable_rooms = []
+            valid_timeslots = []
+        elif requirement == "NEEDS_ROOM_ONLY":
+            viable_rooms = list(get_viable_rooms(section, rooms))
+            valid_timeslots = []
+        else:
+            viable_rooms = list(get_viable_rooms(section, rooms))
+            valid_timeslots = list(get_valid_timeslots(section, timeslots))
+
+        cache[idx] = {
+            _REQUIREMENT_KEY: requirement,
+            "rooms": viable_rooms,
+            "timeslots": valid_timeslots,
+        }
 
     return cache
 
 
+def _requirement(idx, option_cache):
+    return option_cache[idx][_REQUIREMENT_KEY]
+
+
 def _domain_size(idx, option_cache):
-    viable_rooms, valid_timeslots = option_cache[idx]
-    return len(viable_rooms) * len(valid_timeslots)
-
-
-def _static_ok(idx, room, ts, sections, memo):
-    """
-    Test room/type/capacity/campus/timeslot constraints without treating
-    current room or instructor occupancy as a hard rejection.
-
-    Occupancy conflicts are handled by the LNS objective, which is necessary
-    because escaping mutual blocking sometimes requires a temporary clash.
-    """
-    key = (idx, room.id, ts.id)
-    cached = memo.get(key)
-    if cached is not None:
-        return cached
-
-    ok = passes_hard_constraints(
-        sections[idx],
-        room,
-        ts,
-        occupied_instructors=set(),
-        occupied_rooms=set(),
-    )
-
-    if len(memo) < _STATIC_OK_CACHE_LIMIT:
-        memo[key] = bool(ok)
-
-    return bool(ok)
+    requirement = _requirement(idx, option_cache)
+    if requirement == "NEEDS_NOTHING":
+        return 0
+    if requirement == "NEEDS_ROOM_ONLY":
+        return len(option_cache[idx]["rooms"])
+    return len(option_cache[idx]["rooms"]) * len(option_cache[idx]["timeslots"])
 
 
 # ============================================================
@@ -164,55 +159,62 @@ def _build_occupancy(schedule):
     room_counts = defaultdict(int)
     instructor_counts = defaultdict(int)
 
-    for item in schedule:
-        if item.room_id is None or item.timeslot_id is None:
+    for schedule_item in schedule:
+        # Room-only activities have no timeslot and therefore do not create
+        # a room-time or instructor-time collision.
+        if schedule_item.room_id is None or schedule_item.timeslot_id is None:
             continue
 
-        room_counts[(item.room_id, item.timeslot_id)] += 1
-        if item.instructor_id is not None:
-            instructor_counts[(item.instructor_id, item.timeslot_id)] += 1
+        room_counts[(schedule_item.room_id, schedule_item.timeslot_id)] += 1
+        if schedule_item.instructor_id is not None:
+            instructor_counts[(schedule_item.instructor_id, schedule_item.timeslot_id)] += 1
 
     return room_counts, instructor_counts
 
 
-def _add_assignment(item, room_id, timeslot_id, room_counts, instructor_counts):
-    item.room_id = room_id
-    item.timeslot_id = timeslot_id
-    room_counts[(room_id, timeslot_id)] += 1
-    if item.instructor_id is not None:
-        instructor_counts[(item.instructor_id, timeslot_id)] += 1
+def _remove_assignment(schedule_item, room_counts, instructor_counts):
+    if schedule_item.room_id is not None and schedule_item.timeslot_id is not None:
+        room_key = (schedule_item.room_id, schedule_item.timeslot_id)
+        room_counts[room_key] -= 1
+        if room_counts[room_key] <= 0:
+            del room_counts[room_key]
+
+        if schedule_item.instructor_id is not None:
+            instructor_key = (schedule_item.instructor_id, schedule_item.timeslot_id)
+            instructor_counts[instructor_key] -= 1
+            if instructor_counts[instructor_key] <= 0:
+                del instructor_counts[instructor_key]
+
+    schedule_item.room_id = None
+    schedule_item.timeslot_id = None
 
 
-def _remove_assignment(item, room_counts, instructor_counts):
-    if item.room_id is None or item.timeslot_id is None:
-        item.room_id = None
-        item.timeslot_id = None
+def _add_assignment(schedule_item, room_id, timeslot_id, room_counts, instructor_counts):
+    schedule_item.room_id = room_id
+    schedule_item.timeslot_id = timeslot_id
+
+    if room_id is None or timeslot_id is None:
         return
 
-    room_key = (item.room_id, item.timeslot_id)
-    room_counts[room_key] -= 1
-    if room_counts[room_key] <= 0:
-        del room_counts[room_key]
-
-    if item.instructor_id is not None:
-        instructor_key = (item.instructor_id, item.timeslot_id)
-        instructor_counts[instructor_key] -= 1
-        if instructor_counts[instructor_key] <= 0:
-            del instructor_counts[instructor_key]
-
-    item.room_id = None
-    item.timeslot_id = None
+    room_counts[(room_id, timeslot_id)] += 1
+    if schedule_item.instructor_id is not None:
+        instructor_counts[(schedule_item.instructor_id, timeslot_id)] += 1
 
 
-def _objective_from_counts(schedule, room_counts, instructor_counts):
-    unscheduled = count_unscheduled(schedule)
+def _conflict_totals(room_counts, instructor_counts):
     room_conflicts = sum(max(0, count - 1) for count in room_counts.values())
     instructor_conflicts = sum(
         max(0, count - 1) for count in instructor_counts.values()
     )
+    return room_conflicts, instructor_conflicts
 
+
+def _objective_from_counts(schedule, room_counts, instructor_counts):
+    room_conflicts, instructor_conflicts = _conflict_totals(
+        room_counts, instructor_counts
+    )
     return (
-        unscheduled * UNSCHEDULED_WEIGHT
+        count_unscheduled(schedule) * UNSCHEDULED_WEIGHT
         + room_conflicts * ROOM_CONFLICT_WEIGHT
         + instructor_conflicts * INSTRUCTOR_CONFLICT_WEIGHT
     )
@@ -223,30 +225,37 @@ def _objective(schedule):
     return _objective_from_counts(schedule, room_counts, instructor_counts)
 
 
-def _placement_cost(item, room_id, timeslot_id, room_counts, instructor_counts):
-    room_conflicts = room_counts.get((room_id, timeslot_id), 0)
-    instructor_conflicts = 0
-    if item.instructor_id is not None:
-        instructor_conflicts = instructor_counts.get(
-            (item.instructor_id, timeslot_id), 0
+def _placement_cost(schedule_item, room_id, timeslot_id, room_counts, instructor_counts):
+    if timeslot_id is None:
+        return 0
+
+    cost = room_counts.get((room_id, timeslot_id), 0) * ROOM_CONFLICT_WEIGHT
+    if schedule_item.instructor_id is not None:
+        cost += (
+            instructor_counts.get(
+                (schedule_item.instructor_id, timeslot_id), 0
+            )
+            * INSTRUCTOR_CONFLICT_WEIGHT
         )
-
-    return (
-        room_conflicts * ROOM_CONFLICT_WEIGHT
-        + instructor_conflicts * INSTRUCTOR_CONFLICT_WEIGHT
-    )
+    return cost
 
 
-def _item_is_problem(item, room_counts, instructor_counts):
-    if item.room_id is None or item.timeslot_id is None:
+def _is_problem(schedule_item, room_counts, instructor_counts):
+    if not _is_scheduled(schedule_item):
         return True
 
-    if room_counts.get((item.room_id, item.timeslot_id), 0) > 1:
+    if schedule_item.timeslot_id is None:
+        return False
+
+    if room_counts.get((schedule_item.room_id, schedule_item.timeslot_id), 0) > 1:
         return True
 
     return (
-        item.instructor_id is not None
-        and instructor_counts.get((item.instructor_id, item.timeslot_id), 0) > 1
+        schedule_item.instructor_id is not None
+        and instructor_counts.get(
+            (schedule_item.instructor_id, schedule_item.timeslot_id), 0
+        )
+        > 1
     )
 
 
@@ -256,8 +265,8 @@ def _problem_indices(schedule, room_counts=None, instructor_counts=None):
 
     return [
         idx
-        for idx, item in enumerate(schedule)
-        if _item_is_problem(item, room_counts, instructor_counts)
+        for idx, schedule_item in enumerate(schedule)
+        if _is_problem(schedule_item, room_counts, instructor_counts)
     ]
 
 
@@ -271,8 +280,8 @@ def _sample_pairs(viable_rooms, valid_timeslots, limit):
 
     if total <= limit:
         pairs = [
-            (room, ts)
-            for ts in valid_timeslots
+            (room, timeslot)
+            for timeslot in valid_timeslots
             for room in viable_rooms
         ]
         random.shuffle(pairs)
@@ -281,19 +290,38 @@ def _sample_pairs(viable_rooms, valid_timeslots, limit):
     pairs = []
     seen = set()
     attempts = 0
-    max_attempts = limit * 5
+    max_attempts = limit * 6
 
     while len(pairs) < limit and attempts < max_attempts:
         attempts += 1
         room = random.choice(viable_rooms)
-        ts = random.choice(valid_timeslots)
-        key = (room.id, ts.id)
+        timeslot = random.choice(valid_timeslots)
+        key = (room.id, timeslot.id)
         if key in seen:
             continue
         seen.add(key)
-        pairs.append((room, ts))
+        pairs.append((room, timeslot))
 
     return pairs
+
+
+def _static_ok(idx, room, timeslot, sections, static_memo):
+    key = (idx, room.id, timeslot.id)
+    if key in static_memo:
+        return static_memo[key]
+
+    ok = passes_hard_constraints(
+        sections[idx],
+        room,
+        timeslot,
+        occupied_instructors=set(),
+        occupied_rooms=set(),
+    )
+
+    if len(static_memo) < STATIC_CACHE_LIMIT:
+        static_memo[key] = bool(ok)
+
+    return bool(ok)
 
 
 def _best_candidates(
@@ -305,32 +333,48 @@ def _best_candidates(
     instructor_counts,
     static_memo,
     sample_limit,
-    top_k=1,
+    top_k=8,
 ):
-    item = schedule[idx]
-    viable_rooms, valid_timeslots = option_cache[idx]
+    requirement = _requirement(idx, option_cache)
+    schedule_item = schedule[idx]
 
-    if not viable_rooms or not valid_timeslots:
+    if requirement == "NEEDS_NOTHING":
+        return [(0, None, None)]
+
+    viable_rooms = option_cache[idx]["rooms"]
+    if not viable_rooms:
+        return []
+
+    if requirement == "NEEDS_ROOM_ONLY":
+        rooms_to_try = list(viable_rooms)
+        random.shuffle(rooms_to_try)
+        return [(0, room, None) for room in rooms_to_try[:top_k]]
+
+    valid_timeslots = option_cache[idx]["timeslots"]
+    if not valid_timeslots:
         return []
 
     ranked = []
-    for room, ts in _sample_pairs(viable_rooms, valid_timeslots, sample_limit):
-        if not _static_ok(idx, room, ts, sections, static_memo):
+    for room, timeslot in _sample_pairs(
+        viable_rooms, valid_timeslots, sample_limit
+    ):
+        if not _static_ok(idx, room, timeslot, sections, static_memo):
             continue
 
         cost = _placement_cost(
-            item,
+            schedule_item,
             room.id,
-            ts.id,
+            timeslot.id,
             room_counts,
             instructor_counts,
         )
-
-        # A small random tie-breaker gives restarts and LNS rebuilds variety.
-        ranked.append((cost, random.random(), room, ts))
+        ranked.append((cost, random.random(), room, timeslot))
 
     ranked.sort(key=lambda value: (value[0], value[1]))
-    return [(cost, room, ts) for cost, _, room, ts in ranked[:top_k]]
+    return [
+        (cost, room, timeslot)
+        for cost, _, room, timeslot in ranked[:top_k]
+    ]
 
 
 # ============================================================
@@ -342,8 +386,13 @@ def _construction_order(sections, option_cache):
         if section.instructor_id is not None:
             instructor_load[section.instructor_id] += 1
 
-    order = list(range(len(sections)))
-    order.sort(
+    indices = [
+        idx
+        for idx in range(len(sections))
+        if _requirement(idx, option_cache) != "NEEDS_NOTHING"
+    ]
+
+    indices.sort(
         key=lambda idx: (
             _domain_size(idx, option_cache),
             -instructor_load.get(sections[idx].instructor_id, 0),
@@ -351,7 +400,7 @@ def _construction_order(sections, option_cache):
             random.random(),
         )
     )
-    return order
+    return indices
 
 
 def _construct_once(sections, option_cache, static_memo):
@@ -368,22 +417,25 @@ def _construct_once(sections, option_cache, static_memo):
             room_counts,
             instructor_counts,
             static_memo,
-            sample_limit=GREEDY_VALUE_SAMPLES,
-            top_k=GREEDY_RANDOM_TOP,
+            CONSTRUCTION_PAIR_SAMPLES,
+            top_k=10,
         )
-
         if not candidates:
             continue
 
-        # Prefer a zero-conflict assignment. If none exists, leave the section
-        # unscheduled; the LNS stage will consider coordinated moves later.
         zero_cost = [candidate for candidate in candidates if candidate[0] == 0]
-        if not zero_cost:
+        chosen = random.choice(zero_cost if zero_cost else candidates[:3])
+        _, room, timeslot = chosen
+
+        if room is None:
             continue
 
-        _, room, ts = random.choice(zero_cost)
         _add_assignment(
-            schedule[idx], room.id, ts.id, room_counts, instructor_counts
+            schedule[idx],
+            room.id,
+            timeslot.id if timeslot is not None else None,
+            room_counts,
+            instructor_counts,
         )
 
     return schedule
@@ -406,82 +458,59 @@ def _initial_construction(sections, option_cache, static_memo):
 # ============================================================
 # LARGE NEIGHBORHOOD SEARCH
 # ============================================================
-def _indices_using_room_time(schedule, room_id, timeslot_id):
-    return [
-        idx
-        for idx, item in enumerate(schedule)
-        if item.room_id == room_id and item.timeslot_id == timeslot_id
-    ]
-
-
-def _indices_using_instructor_time(schedule, instructor_id, timeslot_id):
-    if instructor_id is None:
-        return []
-    return [
-        idx
-        for idx, item in enumerate(schedule)
-        if item.instructor_id == instructor_id
-        and item.timeslot_id == timeslot_id
-    ]
-
-
 def _select_neighborhood(schedule, option_cache, target_size):
     room_counts, instructor_counts = _build_occupancy(schedule)
     problems = _problem_indices(schedule, room_counts, instructor_counts)
-
     if not problems:
         return []
 
     seed = random.choice(problems)
     chosen = {seed}
-    frontier = [seed]
+    seed_item = schedule[seed]
 
-    while frontier and len(chosen) < target_size:
-        idx = frontier.pop()
-        item = schedule[idx]
+    related = []
+    for idx, schedule_item in enumerate(schedule):
+        if idx == seed:
+            continue
 
-        related = []
-        if item.room_id is not None and item.timeslot_id is not None:
-            related.extend(
-                _indices_using_room_time(
-                    schedule, item.room_id, item.timeslot_id
-                )
-            )
-            related.extend(
-                _indices_using_instructor_time(
-                    schedule, item.instructor_id, item.timeslot_id
-                )
-            )
+        same_room_time = (
+            seed_item.room_id is not None
+            and seed_item.timeslot_id is not None
+            and schedule_item.room_id == seed_item.room_id
+            and schedule_item.timeslot_id == seed_item.timeslot_id
+        )
+        same_instructor = (
+            seed_item.instructor_id is not None
+            and schedule_item.instructor_id == seed_item.instructor_id
+        )
+        same_timeslot = (
+            seed_item.timeslot_id is not None
+            and schedule_item.timeslot_id == seed_item.timeslot_id
+        )
 
-        # Include sections of the same instructor because moving one of them
-        # often frees the exact timeslot needed by another.
-        if item.instructor_id is not None:
-            related.extend(
-                idx2
-                for idx2, other in enumerate(schedule)
-                if other.instructor_id == item.instructor_id
-            )
+        if same_room_time or same_instructor or same_timeslot:
+            related.append(idx)
 
-        random.shuffle(related)
-        for idx2 in related:
-            if len(chosen) >= target_size:
-                break
-            if idx2 not in chosen:
-                chosen.add(idx2)
-                frontier.append(idx2)
+    random.shuffle(related)
+    for idx in related:
+        if len(chosen) >= target_size:
+            break
+        chosen.add(idx)
 
-    # Fill the rest with difficult/problem sections first, then random nearby
-    # sections. This makes the neighborhood large enough to break blocking.
     remaining_problems = [idx for idx in problems if idx not in chosen]
     remaining_problems.sort(key=lambda idx: _domain_size(idx, option_cache))
-
     for idx in remaining_problems:
         if len(chosen) >= target_size:
             break
         chosen.add(idx)
 
     if len(chosen) < target_size:
-        pool = [idx for idx in range(len(schedule)) if idx not in chosen]
+        pool = [
+            idx
+            for idx in range(len(schedule))
+            if idx not in chosen
+            and _requirement(idx, option_cache) != "NEEDS_NOTHING"
+        ]
         random.shuffle(pool)
         chosen.update(pool[: target_size - len(chosen)])
 
@@ -509,6 +538,10 @@ def _rebuild_neighborhood(
     )
 
     for idx in neighborhood:
+        requirement = _requirement(idx, option_cache)
+        if requirement == "NEEDS_NOTHING":
+            continue
+
         candidates = _best_candidates(
             idx,
             schedule,
@@ -517,8 +550,8 @@ def _rebuild_neighborhood(
             room_counts,
             instructor_counts,
             static_memo,
-            sample_limit=LNS_REBUILD_SAMPLES,
-            top_k=GREEDY_RANDOM_TOP,
+            LNS_PAIR_SAMPLES,
+            top_k=12,
         )
         if not candidates:
             continue
@@ -529,9 +562,17 @@ def _rebuild_neighborhood(
             for candidate in candidates
             if candidate[0] <= best_cost + ROOM_CONFLICT_WEIGHT
         ]
-        _, room, ts = random.choice(near_best)
+        _, room, timeslot = random.choice(near_best)
+
+        if room is None:
+            continue
+
         _add_assignment(
-            schedule[idx], room.id, ts.id, room_counts, instructor_counts
+            schedule[idx],
+            room.id,
+            timeslot.id if timeslot is not None else None,
+            room_counts,
+            instructor_counts,
         )
 
     return schedule
@@ -542,21 +583,10 @@ def _large_neighborhood_search(schedule, sections, option_cache, static_memo):
     best_cost = _objective(best)
     current = clone_schedule(best)
     current_cost = best_cost
-    stagnation = 0
 
     for iteration in range(LNS_ITERATIONS):
-        expansion = min(
-            LNS_MAX_SIZE - LNS_MIN_SIZE,
-            (stagnation // LNS_STAGNATION_EXPAND) * 15,
-        )
-        target_size = random.randint(
-            LNS_MIN_SIZE,
-            min(LNS_MAX_SIZE, LNS_MIN_SIZE + 25 + expansion),
-        )
-
-        neighborhood = _select_neighborhood(
-            current, option_cache, target_size
-        )
+        target_size = random.randint(LNS_MIN_SIZE, LNS_MAX_SIZE)
+        neighborhood = _select_neighborhood(current, option_cache, target_size)
         if not neighborhood:
             break
 
@@ -570,7 +600,10 @@ def _large_neighborhood_search(schedule, sections, option_cache, static_memo):
         )
         candidate_cost = _objective(candidate)
 
-        temperature = max(1.0, 5000.0 * (1.0 - iteration / LNS_ITERATIONS))
+        temperature = max(
+            1.0,
+            4000.0 * (1.0 - iteration / max(1, LNS_ITERATIONS)),
+        )
         accept_worse = (
             candidate_cost > current_cost
             and random.random()
@@ -584,9 +617,6 @@ def _large_neighborhood_search(schedule, sections, option_cache, static_memo):
         if candidate_cost < best_cost:
             best = clone_schedule(candidate)
             best_cost = candidate_cost
-            stagnation = 0
-        else:
-            stagnation += 1
 
         if best_cost == 0:
             break
@@ -600,7 +630,6 @@ def _large_neighborhood_search(schedule, sections, option_cache, static_memo):
 def _min_conflicts(schedule, sections, option_cache, static_memo):
     best = clone_schedule(schedule)
     best_cost = _objective(best)
-
     current = clone_schedule(schedule)
     room_counts, instructor_counts = _build_occupancy(current)
 
@@ -610,11 +639,14 @@ def _min_conflicts(schedule, sections, option_cache, static_memo):
             return current
 
         idx = random.choice(problems)
-        item = current[idx]
+        requirement = _requirement(idx, option_cache)
+        if requirement == "NEEDS_NOTHING":
+            continue
 
-        old_room_id = item.room_id
-        old_timeslot_id = item.timeslot_id
-        _remove_assignment(item, room_counts, instructor_counts)
+        schedule_item = current[idx]
+        old_room_id = schedule_item.room_id
+        old_timeslot_id = schedule_item.timeslot_id
+        _remove_assignment(schedule_item, room_counts, instructor_counts)
 
         candidates = _best_candidates(
             idx,
@@ -624,15 +656,14 @@ def _min_conflicts(schedule, sections, option_cache, static_memo):
             room_counts,
             instructor_counts,
             static_memo,
-            sample_limit=MIN_CONFLICT_SAMPLES,
-            top_k=12,
+            MIN_CONFLICT_PAIR_SAMPLES,
+            top_k=18,
         )
 
         if not candidates:
-            # Restore its old assignment if it had one.
-            if old_room_id is not None and old_timeslot_id is not None:
+            if old_room_id is not None:
                 _add_assignment(
-                    item,
+                    schedule_item,
                     old_room_id,
                     old_timeslot_id,
                     room_counts,
@@ -641,7 +672,7 @@ def _min_conflicts(schedule, sections, option_cache, static_memo):
             continue
 
         if random.random() < RANDOM_WALK_RATE:
-            _, room, ts = random.choice(candidates)
+            _, room, timeslot = random.choice(candidates)
         else:
             best_local_cost = candidates[0][0]
             best_local = [
@@ -649,11 +680,16 @@ def _min_conflicts(schedule, sections, option_cache, static_memo):
                 for candidate in candidates
                 if candidate[0] == best_local_cost
             ]
-            _, room, ts = random.choice(best_local)
+            _, room, timeslot = random.choice(best_local)
 
-        _add_assignment(
-            item, room.id, ts.id, room_counts, instructor_counts
-        )
+        if room is not None:
+            _add_assignment(
+                schedule_item,
+                room.id,
+                timeslot.id if timeslot is not None else None,
+                room_counts,
+                instructor_counts,
+            )
 
         current_cost = _objective_from_counts(
             current, room_counts, instructor_counts
@@ -661,180 +697,27 @@ def _min_conflicts(schedule, sections, option_cache, static_memo):
         if current_cost < best_cost:
             best = clone_schedule(current)
             best_cost = current_cost
-            if best_cost == 0:
-                break
 
-    return best
-
-
-# ============================================================
-# DEPTH-LIMITED EJECTION CHAINS
-# ============================================================
-def _blocking_indices(schedule, idx, room_id, timeslot_id):
-    item = schedule[idx]
-    blockers = []
-
-    for other_idx, other in enumerate(schedule):
-        if other_idx == idx:
-            continue
-        if other.room_id == room_id and other.timeslot_id == timeslot_id:
-            blockers.append(other_idx)
-            continue
-        if (
-            item.instructor_id is not None
-            and other.instructor_id == item.instructor_id
-            and other.timeslot_id == timeslot_id
-        ):
-            blockers.append(other_idx)
-
-    return blockers
-
-
-def _try_ejection(
-    schedule,
-    idx,
-    sections,
-    option_cache,
-    static_memo,
-    depth,
-    visited,
-):
-    if depth < 0 or idx in visited:
-        return False
-
-    visited = set(visited)
-    visited.add(idx)
-
-    room_counts, instructor_counts = _build_occupancy(schedule)
-    item = schedule[idx]
-    old_room_id = item.room_id
-    old_timeslot_id = item.timeslot_id
-    _remove_assignment(item, room_counts, instructor_counts)
-
-    candidates = _best_candidates(
-        idx,
-        schedule,
-        sections,
-        option_cache,
-        room_counts,
-        instructor_counts,
-        static_memo,
-        sample_limit=MIN_CONFLICT_SAMPLES,
-        top_k=EJECTION_BRANCHES,
-    )
-
-    # Restore before testing tentative recursive moves.
-    if old_room_id is not None and old_timeslot_id is not None:
-        _add_assignment(
-            item,
-            old_room_id,
-            old_timeslot_id,
-            room_counts,
-            instructor_counts,
-        )
-
-    for cost, room, ts in candidates:
-        if cost == 0:
-            room_counts, instructor_counts = _build_occupancy(schedule)
-            _remove_assignment(item, room_counts, instructor_counts)
-            _add_assignment(
-                item, room.id, ts.id, room_counts, instructor_counts
-            )
-            return True
-
-        if depth == 0:
-            continue
-
-        blockers = _blocking_indices(
-            schedule, idx, room.id, ts.id
-        )
-        if not blockers or len(blockers) > 2:
-            continue
-
-        snapshot = clone_schedule(schedule)
-        moved_all = True
-
-        # Temporarily remove the target so blockers can be relocated without
-        # the target's old assignment occupying space.
-        schedule[idx].room_id = None
-        schedule[idx].timeslot_id = None
-
-        for blocker_idx in blockers:
-            if not _try_ejection(
-                schedule,
-                blocker_idx,
-                sections,
-                option_cache,
-                static_memo,
-                depth - 1,
-                visited,
-            ):
-                moved_all = False
-                break
-
-        if moved_all:
-            room_counts, instructor_counts = _build_occupancy(schedule)
-            if _placement_cost(
-                schedule[idx],
-                room.id,
-                ts.id,
-                room_counts,
-                instructor_counts,
-            ) == 0:
-                _add_assignment(
-                    schedule[idx],
-                    room.id,
-                    ts.id,
-                    room_counts,
-                    instructor_counts,
-                )
-                return True
-
-        schedule[:] = clone_schedule(snapshot)
-
-    return False
-
-
-def _ejection_chain_repair(schedule, sections, option_cache, static_memo):
-    best = clone_schedule(schedule)
-    best_cost = _objective(best)
-
-    for _ in range(EJECTION_ROUNDS):
-        room_counts, instructor_counts = _build_occupancy(best)
-        problems = _problem_indices(best, room_counts, instructor_counts)
-        problems.sort(key=lambda idx: _domain_size(idx, option_cache))
-
-        improved = False
-        for idx in problems:
-            candidate = clone_schedule(best)
-            if _try_ejection(
-                candidate,
-                idx,
-                sections,
-                option_cache,
-                static_memo,
-                EJECTION_DEPTH,
-                visited=set(),
-            ):
-                candidate_cost = _objective(candidate)
-                if candidate_cost < best_cost:
-                    best = candidate
-                    best_cost = candidate_cost
-                    improved = True
-
-        if not improved or best_cost == 0:
+        if best_cost == 0:
             break
 
     return best
 
 
 # ============================================================
-# FINAL SOFT-CONSTRAINT POLISH
+# SOFT-CONSTRAINT POLISH
 # ============================================================
-def _soft_polish(schedule, sections, rooms, timeslots, cache, option_cache, static_memo):
+def _soft_polish(
+    schedule,
+    sections,
+    rooms,
+    timeslots,
+    cache,
+    option_cache,
+    static_memo,
+):
     best = clone_schedule(schedule)
     hard_cost = _objective(best)
-
     best_fitness = calculate_fitness(
         best,
         rooms,
@@ -843,8 +726,16 @@ def _soft_polish(schedule, sections, rooms, timeslots, cache, option_cache, stat
         valid_timeslot_cache=cache,
     )
 
+    movable_indices = [
+        idx
+        for idx in range(len(best))
+        if _requirement(idx, option_cache) == "NEEDS_ROOM_AND_TIME"
+    ]
+    if not movable_indices:
+        return best
+
     for _ in range(SOFT_POLISH_STEPS):
-        idx = random.randrange(len(best))
+        idx = random.choice(movable_indices)
         candidate = clone_schedule(best)
         room_counts, instructor_counts = _build_occupancy(candidate)
         _remove_assignment(candidate[idx], room_counts, instructor_counts)
@@ -857,16 +748,20 @@ def _soft_polish(schedule, sections, rooms, timeslots, cache, option_cache, stat
             room_counts,
             instructor_counts,
             static_memo,
-            sample_limit=SOFT_POLISH_SAMPLES,
-            top_k=8,
+            SOFT_POLISH_PAIR_SAMPLES,
+            top_k=10,
         )
-        zero_conflict_choices = [choice for choice in choices if choice[0] == 0]
-        if not zero_conflict_choices:
+        choices = [choice for choice in choices if choice[0] == 0]
+        if not choices:
             continue
 
-        _, room, ts = random.choice(zero_conflict_choices)
+        _, room, timeslot = random.choice(choices)
         _add_assignment(
-            candidate[idx], room.id, ts.id, room_counts, instructor_counts
+            candidate[idx],
+            room.id,
+            timeslot.id,
+            room_counts,
+            instructor_counts,
         )
 
         if _objective_from_counts(candidate, room_counts, instructor_counts) != hard_cost:
@@ -879,7 +774,6 @@ def _soft_polish(schedule, sections, rooms, timeslots, cache, option_cache, stat
             timeslots=timeslots,
             valid_timeslot_cache=cache,
         )
-
         if candidate_fitness > best_fitness:
             best = candidate
             best_fitness = candidate_fitness
@@ -888,24 +782,13 @@ def _soft_polish(schedule, sections, rooms, timeslots, cache, option_cache, stat
 
 
 # ============================================================
-# PUBLIC ENTRY POINT -- NAME KEPT FOR WEBSITE COMPATIBILITY
+# PUBLIC FUNCTIONS EXPECTED BY THE WEBSITE
 # ============================================================
 def genetic_schedule(sections, timeslots, rooms, cache=None, option_cache=None):
     """
-    Website-compatible entry point.
-
-    Despite the retained historical name, this function now runs:
-        1. MRV greedy construction with randomized restarts
-        2. Large Neighborhood Search
-        3. Min-conflicts repair
-        4. Depth-limited ejection chains
-        5. Soft-constraint hill climbing
-
-    It uses only the Python standard library and the project's existing
-    constraint/evaluation functions.
+    Retains the historical function name used by the project, but runs a
+    classification-aware MRV + LNS + min-conflicts hybrid.
     """
-    print("\n*** RUNNING MRV + LNS + MIN-CONFLICTS HYBRID ***")
-
     if cache is None:
         cache = build_timeslot_guideline_cache(sections, timeslots)
 
@@ -921,18 +804,12 @@ def genetic_schedule(sections, timeslots, rooms, cache=None, option_cache=None):
     best = _min_conflicts(
         best, sections, option_cache, static_memo
     )
-    best = _ejection_chain_repair(
-        best, sections, option_cache, static_memo
-    )
-
-    # A second LNS/min-conflicts pass benefits from slots opened by ejections.
     best = _large_neighborhood_search(
         best, sections, option_cache, static_memo
     )
     best = _min_conflicts(
         best, sections, option_cache, static_memo
     )
-
     best = _soft_polish(
         best,
         sections,
@@ -943,5 +820,43 @@ def genetic_schedule(sections, timeslots, rooms, cache=None, option_cache=None):
         static_memo,
     )
 
-    _print_diagnostics(best, option_cache)
     return best
+
+
+def genetic_runs(sections, timeslots, rooms, num_runs=1):
+    """
+    Wrapper required by engine.py. Runs the hybrid one or more times and
+    returns the best schedule. No other project file needs to change.
+    """
+    run_count = max(1, int(num_runs or 1))
+    cache = build_timeslot_guideline_cache(sections, timeslots)
+    option_cache = build_option_cache(sections, rooms, timeslots)
+
+    best_schedule = None
+    best_key = None
+
+    for _ in range(run_count):
+        candidate = genetic_schedule(
+            sections,
+            timeslots,
+            rooms,
+            cache=cache,
+            option_cache=option_cache,
+        )
+
+        candidate_objective = _objective(candidate)
+        candidate_fitness = calculate_fitness(
+            candidate,
+            rooms,
+            sections=sections,
+            timeslots=timeslots,
+            valid_timeslot_cache=cache,
+        )
+
+        # Hard feasibility first; fitness breaks ties.
+        candidate_key = (candidate_objective, -candidate_fitness)
+        if best_key is None or candidate_key < best_key:
+            best_key = candidate_key
+            best_schedule = clone_schedule(candidate)
+
+    return best_schedule
