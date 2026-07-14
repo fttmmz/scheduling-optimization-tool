@@ -50,10 +50,10 @@ RESCUE_MAX_ITEMS = 1000
 
 # CSP construction controls
 CSP_NODE_BUDGET = 180_000
-CSP_BACKTRACK_LIMIT = 250
+CSP_BACKTRACK_LIMIT = 2_000
 CSP_MRV_SAMPLE_SIZE = 80
 CSP_VALUE_SAMPLE_SIZE = 120
-CSP_RESTARTS = 3
+CSP_RESTARTS = 1
 
 # Final soft-constraint polish
 HILL_CLIMB_ITERATIONS = 250
@@ -1490,6 +1490,183 @@ def tabu_search(
     return best, best_score
 
 
+
+# =========================
+# LARGE-SCALE MIN-CONFLICTS REPAIR
+# =========================
+def min_conflicts_repair(
+    schedule,
+    sections,
+    rooms,
+    timeslots,
+    option_cache=None,
+    max_steps=20_000,
+    candidate_limit=120,
+    random_walk_rate=0.08,
+):
+    """
+    Repair a large timetable using the classic min-conflicts strategy.
+
+    Unlike the earlier cleanup functions, this method is allowed to move an
+    item to a slot that is not immediately perfect when that move reduces the
+    total number of collisions. This is important because many timetable
+    conflicts are mutually blocking and cannot be solved by perfect-slot-only
+    moves. Static hard constraints such as room type, capacity, campus, and
+    valid timeslots are still enforced.
+    """
+    if option_cache is None:
+        option_cache = build_option_cache(sections, rooms, timeslots)
+
+    room_counts = {}
+    instructor_counts = {}
+
+    def add_item(item):
+        if item.room_id is not None and item.timeslot_id is not None:
+            rk = (item.room_id, item.timeslot_id)
+            room_counts[rk] = room_counts.get(rk, 0) + 1
+            if item.instructor_id is not None:
+                ik = (item.instructor_id, item.timeslot_id)
+                instructor_counts[ik] = instructor_counts.get(ik, 0) + 1
+
+    def remove_item(item):
+        if item.room_id is not None and item.timeslot_id is not None:
+            rk = (item.room_id, item.timeslot_id)
+            room_counts[rk] -= 1
+            if room_counts[rk] <= 0:
+                del room_counts[rk]
+            if item.instructor_id is not None:
+                ik = (item.instructor_id, item.timeslot_id)
+                instructor_counts[ik] -= 1
+                if instructor_counts[ik] <= 0:
+                    del instructor_counts[ik]
+
+    def item_conflicts(item):
+        if item.room_id is None or item.timeslot_id is None:
+            return 3
+        conflicts = max(0, room_counts.get((item.room_id, item.timeslot_id), 0) - 1)
+        if item.instructor_id is not None:
+            conflicts += max(
+                0,
+                instructor_counts.get((item.instructor_id, item.timeslot_id), 0) - 1,
+            )
+        return conflicts
+
+    for item in schedule:
+        add_item(item)
+
+    best = clone_schedule(schedule)
+    best_problem_count = len(_find_problem_indices(schedule))
+    stagnant_steps = 0
+
+    for step in range(max_steps):
+        problem_indices = [
+            idx for idx, item in enumerate(schedule)
+            if item_conflicts(item) > 0
+        ]
+
+        if not problem_indices:
+            return schedule
+
+        # Prefer scarce sections, but retain randomness to escape cycles.
+        sample = random.sample(
+            problem_indices,
+            min(50, len(problem_indices)),
+        )
+        idx = min(sample, key=lambda i: _constraint_score(i, option_cache))
+        item = schedule[idx]
+        section = sections[idx]
+
+        viable_rooms, valid_timeslots = option_cache[idx]
+        if not viable_rooms or not valid_timeslots:
+            continue
+
+        remove_item(item)
+        old_room_id, old_timeslot_id = item.room_id, item.timeslot_id
+
+        # Sample across the full Cartesian domain rather than taking only
+        # the first rooms/timeslots. This keeps runtime bounded while giving
+        # every valid area of the domain a chance to be explored.
+        total_pairs = len(viable_rooms) * len(valid_timeslots)
+        attempts = min(candidate_limit, total_pairs)
+        candidates = []
+        seen = set()
+
+        if old_room_id is not None and old_timeslot_id is not None:
+            seen.add((old_room_id, old_timeslot_id))
+
+        while len(candidates) < attempts and len(seen) < total_pairs:
+            room = random.choice(viable_rooms)
+            ts = random.choice(valid_timeslots)
+            key = (room.id, ts.id)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            # Empty occupancy sets intentionally check only intrinsic hard
+            # constraints. Occupancy collisions are measured by the
+            # min-conflicts objective below instead of being rejected.
+            if not passes_hard_constraints(
+                section,
+                room,
+                ts,
+                occupied_instructors=set(),
+                occupied_rooms=set(),
+            ):
+                continue
+
+            conflict_cost = room_counts.get((room.id, ts.id), 0)
+            if item.instructor_id is not None:
+                conflict_cost += instructor_counts.get(
+                    (item.instructor_id, ts.id), 0
+                )
+            candidates.append((conflict_cost, room.id, ts.id))
+
+        if not candidates:
+            item.room_id, item.timeslot_id = old_room_id, old_timeslot_id
+            add_item(item)
+            continue
+
+        candidates.sort(key=lambda x: x[0])
+        minimum_cost = candidates[0][0]
+        best_candidates = [c for c in candidates if c[0] == minimum_cost]
+
+        if random.random() < random_walk_rate:
+            _, new_room_id, new_timeslot_id = random.choice(candidates)
+        else:
+            _, new_room_id, new_timeslot_id = random.choice(best_candidates)
+
+        item.room_id = new_room_id
+        item.timeslot_id = new_timeslot_id
+        add_item(item)
+
+        if step % 100 == 0:
+            current_problem_count = len(_find_problem_indices(schedule))
+            if current_problem_count < best_problem_count:
+                best_problem_count = current_problem_count
+                best = clone_schedule(schedule)
+                stagnant_steps = 0
+            else:
+                stagnant_steps += 100
+
+            # Diversify after a long plateau by unsetting a few conflicted
+            # items. The following iterations will place them again based on
+            # the current global occupancy picture.
+            if stagnant_steps >= 3_000 and problem_indices:
+                for kick_idx in random.sample(
+                    problem_indices, min(8, len(problem_indices))
+                ):
+                    kick_item = schedule[kick_idx]
+                    remove_item(kick_item)
+                    kick_item.room_id = None
+                    kick_item.timeslot_id = None
+                    add_item(kick_item)
+                stagnant_steps = 0
+
+    # Never return a result worse than the best state visited.
+    if len(_find_problem_indices(schedule)) < best_problem_count:
+        return schedule
+    return best
+
 # =========================
 # MAIN GA + TABU LOOP
 # =========================
@@ -1537,6 +1714,32 @@ def genetic_schedule(sections, timeslots, rooms, cache=None, option_cache=None):
             after = len(_find_problem_indices(candidate))
             if after >= before and resolved == 0:
                 break
+
+        # Escape the local minimum left by perfect-slot-only cleanup.
+        candidate = min_conflicts_repair(
+            candidate,
+            sections,
+            rooms,
+            timeslots,
+            option_cache=option_cache,
+        )
+
+        # Run the deterministic cleanup again after min-conflicts has
+        # rearranged the blocked areas of the timetable.
+        for _ in range(3):
+            force_place_remaining(
+                candidate, sections, rooms, timeslots,
+                option_cache=option_cache,
+            )
+            resolve_conflicts(
+                candidate, sections, rooms, timeslots,
+                option_cache=option_cache,
+            )
+            candidate, _ = resolve_hard_cases(
+                candidate, sections, rooms, timeslots,
+                option_cache=option_cache,
+                max_candidates_per_item=20,
+            )
 
         candidate = hill_climb_polish(
             candidate,
