@@ -500,6 +500,189 @@ def resolve_conflicts(schedule, sections, rooms, timeslots, option_cache=None):
 
 
 # =========================
+# EJECTION-CHAIN RESOLUTION (for mutual blocking)
+# =========================
+def _find_problem_indices(schedule):
+    room_counts = {}
+    instr_counts = {}
+    for item in schedule:
+        if item.room_id is not None and item.timeslot_id is not None:
+            key = (item.room_id, item.timeslot_id)
+            room_counts[key] = room_counts.get(key, 0) + 1
+        if item.instructor_id is not None and item.timeslot_id is not None:
+            key = (item.instructor_id, item.timeslot_id)
+            instr_counts[key] = instr_counts.get(key, 0) + 1
+
+    probs = []
+    for idx, item in enumerate(schedule):
+        if item.room_id is None or item.timeslot_id is None:
+            probs.append(idx)
+            continue
+        room_conflict = room_counts.get((item.room_id, item.timeslot_id), 0) > 1
+        instr_conflict = (
+            item.instructor_id is not None
+            and instr_counts.get((item.instructor_id, item.timeslot_id), 0) > 1
+        )
+        if room_conflict or instr_conflict:
+            probs.append(idx)
+    return probs
+
+
+def resolve_hard_cases(schedule, sections, rooms, timeslots, option_cache=None, max_candidates_per_item=8):
+    """
+    resolve_conflicts and force_place_remaining only ever move ONE item at
+    a time. That can't fix mutual blocking: section A's best slot is held
+    by section B, but B can't be evicted by a single-item search because
+    nowhere else looks better to B in isolation -- even though B actually
+    has plenty of other fine options and moving it would free up exactly
+    what A needs.
+
+    This does a depth-1 ejection chain: for each still-broken item, look
+    at who's occupying a slot it wants, tentatively evict them, and check
+    whether THEY can be placed somewhere else with zero conflicts. If so,
+    commit both moves. If not, undo and try the next candidate. Only ever
+    commits a chain if the evicted item lands somewhere completely clean
+    -- it never trades one problem for another.
+    """
+    if option_cache is None:
+        option_cache = build_option_cache(sections, rooms, timeslots)
+
+    problem_indices = _find_problem_indices(schedule)
+    if not problem_indices:
+        return schedule, 0
+
+    problem_indices.sort(key=lambda i: _constraint_score(i, option_cache))
+    resolved_count = 0
+
+    for p_idx in problem_indices:
+        p_item = schedule[p_idx]
+        p_section = sections[p_idx] if p_idx < len(sections) else None
+
+        if p_idx in option_cache:
+            p_rooms, p_timeslots = option_cache[p_idx]
+        elif p_section is not None:
+            p_rooms = get_viable_rooms(p_section, rooms)
+            p_timeslots = get_valid_timeslots(p_section, timeslots)
+        else:
+            p_rooms = get_viable_rooms_for_schedule_item(p_item, rooms)
+            p_timeslots = timeslots
+
+        if not p_rooms or not p_timeslots:
+            continue
+
+        occupant_of = {}
+        for k, item in enumerate(schedule):
+            if k == p_idx:
+                continue
+            if item.room_id is not None and item.timeslot_id is not None:
+                occupant_of[(item.room_id, item.timeslot_id)] = k
+
+        candidates = []
+        for room in p_rooms:
+            for ts in p_timeslots:
+                q_idx = occupant_of.get((room.id, ts.id))
+                if q_idx is not None:
+                    candidates.append((room, ts, q_idx))
+
+        if not candidates:
+            continue
+
+        random.shuffle(candidates)
+        candidates = candidates[: max_candidates_per_item * 3]
+
+        tried = 0
+        for room, ts, q_idx in candidates:
+            if tried >= max_candidates_per_item:
+                break
+            tried += 1
+
+            q_item = schedule[q_idx]
+            q_section = sections[q_idx] if q_idx < len(sections) else None
+
+            occ_instr = set()
+            occ_room = set()
+            for k, item in enumerate(schedule):
+                if k in (p_idx, q_idx):
+                    continue
+                if item.instructor_id is not None and item.timeslot_id is not None:
+                    occ_instr.add((item.instructor_id, item.timeslot_id))
+                if item.room_id is not None and item.timeslot_id is not None:
+                    occ_room.add((item.room_id, item.timeslot_id))
+
+            p_instr_conflict = (
+                p_item.instructor_id is not None
+                and (p_item.instructor_id, ts.id) in occ_instr
+            )
+            if p_instr_conflict:
+                continue
+            if p_section is not None and not passes_hard_constraints(
+                p_section, room, ts, occupied_instructors=occ_instr, occupied_rooms=occ_room
+            ):
+                continue
+
+            occ_instr_for_q = set(occ_instr)
+            occ_room_for_q = set(occ_room)
+            if p_item.instructor_id is not None:
+                occ_instr_for_q.add((p_item.instructor_id, ts.id))
+            occ_room_for_q.add((room.id, ts.id))
+
+            if q_idx in option_cache:
+                q_rooms, q_timeslots = option_cache[q_idx]
+            elif q_section is not None:
+                q_rooms = get_viable_rooms(q_section, rooms)
+                q_timeslots = get_valid_timeslots(q_section, timeslots)
+            else:
+                q_rooms = get_viable_rooms_for_schedule_item(q_item, rooms)
+                q_timeslots = timeslots
+
+            if not q_rooms or not q_timeslots:
+                continue
+
+            new_q_room, new_q_ts, new_q_conflicts = _exhaustive_best_slot(
+                q_item, q_section, q_rooms, q_timeslots, occ_instr_for_q, occ_room_for_q
+            )
+
+            if new_q_room is not None and new_q_conflicts == 0:
+                p_item.room_id, p_item.timeslot_id = room.id, ts.id
+                q_item.room_id, q_item.timeslot_id = new_q_room.id, new_q_ts.id
+                resolved_count += 1
+                break
+
+    return schedule, resolved_count
+
+
+def diagnose_remaining_problems(schedule, sections, option_cache, top_n=15):
+    """
+    After all the repair passes, whatever's still broken is worth a
+    quick look at WHY. If a stuck section has very few viable rooms
+    and/or valid timeslots to begin with, no algorithm change can fix
+    it -- that's a genuine supply/constraint problem (not enough of the
+    right room type, or the instructor/section combination is simply
+    over-constrained) and needs a data-level fix, not a code one.
+    """
+    problem_indices = _find_problem_indices(schedule)
+    if not problem_indices:
+        print("[diagnose] no remaining unscheduled/conflicted items.")
+        return
+
+    problem_indices.sort(key=lambda i: _constraint_score(i, option_cache))
+
+    print(f"\n[diagnose] {len(problem_indices)} items still unscheduled/conflicted.")
+    print("[diagnose] most constrained offenders (fewest room x timeslot options):")
+    for idx in problem_indices[:top_n]:
+        item = schedule[idx]
+        section = sections[idx] if idx < len(sections) else None
+        if idx in option_cache:
+            viable_rooms, valid_timeslots = option_cache[idx]
+            n_rooms, n_ts = len(viable_rooms), len(valid_timeslots)
+        else:
+            n_rooms, n_ts = "?", "?"
+        status = "UNSCHEDULED" if (item.room_id is None or item.timeslot_id is None) else "CONFLICT"
+        sec_label = getattr(section, "no", item.section) if section else item.section
+        print(f"    section {sec_label}: {status}, viable_rooms={n_rooms}, valid_timeslots={n_ts}")
+
+
+# =========================
 # FITNESS SCORING
 # =========================
 def score_population(population, rooms, sections, timeslots, cache):
@@ -1063,6 +1246,10 @@ def genetic_schedule(sections, timeslots, rooms, cache=None, option_cache=None):
                     improved_schedule, sections, rooms, timeslots,
                     option_cache=option_cache,
                 )
+                improved_schedule, _ = resolve_hard_cases(
+                    improved_schedule, sections, rooms, timeslots,
+                    option_cache=option_cache,
+                )
 
                 improved_score = calculate_fitness(
                     improved_schedule, rooms, sections=sections,
@@ -1084,67 +1271,20 @@ def genetic_schedule(sections, timeslots, rooms, cache=None, option_cache=None):
     best, _ = last_scored[0]
 
     repair_schedule(best, sections, rooms, timeslots, option_cache=option_cache)
-    force_place_remaining(best, sections, rooms, timeslots, option_cache=option_cache)
-    resolve_conflicts(best, sections, rooms, timeslots, option_cache=option_cache)
+
+    # Loop the cleanup passes: resolving one item can free up capacity
+    # that helps the next, so keep going until nothing more improves or
+    # we hit a safety cap on iterations.
+    for _ in range(5):
+        before = len(_find_problem_indices(best))
+        force_place_remaining(best, sections, rooms, timeslots, option_cache=option_cache)
+        resolve_conflicts(best, sections, rooms, timeslots, option_cache=option_cache)
+        best, resolved = resolve_hard_cases(best, sections, rooms, timeslots, option_cache=option_cache)
+        after = len(_find_problem_indices(best))
+        if after >= before and resolved == 0:
+            break
+
+    diagnose_remaining_problems(best, sections, option_cache)
 
     return best
 
-
-# =========================
-# RUN IT A BUNCH OF TIMES
-# =========================
-def genetic_runs(
-        sections,
-        timeslots,
-        rooms,
-        num_runs,
-):
-    fitness_scores = []
-    unscheduled_counts = []
-
-    best_overall_schedule = None
-    best_overall_fitness = -1
-
-    print(
-        f"\n=== Hybrid GA + Tabu Search: {num_runs} runs ==="
-    )
-
-    cache = build_timeslot_guideline_cache(
-        sections,
-        timeslots,
-    )
-
-    option_cache = build_option_cache(sections, rooms, timeslots)
-
-    for i in range(num_runs):
-
-        best_schedule = genetic_schedule(
-            sections,
-            timeslots,
-            rooms,
-            cache,
-            option_cache=option_cache,
-        )
-
-        score = calculate_fitness(
-            best_schedule,
-            rooms,
-            sections=sections,
-            timeslots=timeslots,
-            valid_timeslot_cache=cache,
-        )
-
-        fitness_scores.append(score)
-        unscheduled_counts.append(count_unscheduled(best_schedule))
-
-        if score > best_overall_fitness:
-            best_overall_fitness = score
-            best_overall_schedule = best_schedule
-
-    print("\n=== Results ===")
-    print(f"Best fitness: {max(fitness_scores):.4f}")
-    print(f"Worst fitness: {min(fitness_scores):.4f}")
-    print(f"Average fitness: {sum(fitness_scores) / len(fitness_scores):.4f}")
-    print(f"Average unscheduled sections: {sum(unscheduled_counts) / len(unscheduled_counts):.1f}")
-
-    return best_overall_schedule
