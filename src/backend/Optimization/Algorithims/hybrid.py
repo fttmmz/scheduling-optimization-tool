@@ -24,24 +24,31 @@ from backend.Optimization.evaluation import (
 CONSTRUCTION_RESTARTS = 4
 CONSTRUCTION_PAIR_SAMPLES = 220
 
-LNS_ITERATIONS = 180
+LNS_ITERATIONS = 100
 LNS_MIN_SIZE = 30
 LNS_MAX_SIZE = 100
 LNS_PAIR_SAMPLES = 280
 
-MIN_CONFLICT_STEPS = 12000
+MIN_CONFLICT_STEPS = 7000
 MIN_CONFLICT_PAIR_SAMPLES = 320
 RANDOM_WALK_RATE = 0.06
 
 # Ejection-chain repair: move blocking sections to make space for
 # unscheduled sections instead of leaving them unassigned.
-EJECTION_REPAIR_ROUNDS = 3
-EJECTION_MAX_DEPTH = 3
-EJECTION_MAX_BLOCKERS = 2
-EJECTION_PAIR_SAMPLES = 500
-EJECTION_TOP_K = 40
+EJECTION_REPAIR_ROUNDS = 1
+EJECTION_MAX_DEPTH = 1
+EJECTION_MAX_BLOCKERS = 1
+EJECTION_PAIR_SAMPLES = 250
+EJECTION_TOP_K = 20
 
-SOFT_POLISH_STEPS = 100
+
+# Direct unscheduled rescue: first use conflict-free openings, then try a
+# single-blocker relocation. This is cheaper than deep recursive ejection.
+DIRECT_RESCUE_ROUNDS = 3
+DIRECT_RESCUE_PAIR_SAMPLES = 900
+DIRECT_RESCUE_BLOCKER_SAMPLES = 360
+
+SOFT_POLISH_STEPS = 60
 SOFT_POLISH_PAIR_SAMPLES = 60
 
 UNSCHEDULED_WEIGHT = 10000
@@ -713,6 +720,191 @@ def _min_conflicts(schedule, sections, option_cache, static_memo):
 
 
 # ============================================================
+# DIRECT UNSCHEDULED RESCUE
+# ============================================================
+def _zero_cost_candidates(
+    idx,
+    schedule,
+    sections,
+    option_cache,
+    room_counts,
+    instructor_counts,
+    static_memo,
+    sample_limit,
+    top_k=30,
+):
+    return [
+        candidate
+        for candidate in _best_candidates(
+            idx,
+            schedule,
+            sections,
+            option_cache,
+            room_counts,
+            instructor_counts,
+            static_memo,
+            sample_limit,
+            top_k=top_k,
+        )
+        if candidate[0] == 0
+    ]
+
+
+def _try_single_blocker_rescue(
+    schedule,
+    idx,
+    sections,
+    option_cache,
+    static_memo,
+):
+    """Place idx by moving at most one blocking section to a free position."""
+    base = clone_schedule(schedule)
+    room_counts, instructor_counts = _build_occupancy(base)
+    _remove_assignment(base[idx], room_counts, instructor_counts)
+
+    candidates = _best_candidates(
+        idx,
+        base,
+        sections,
+        option_cache,
+        room_counts,
+        instructor_counts,
+        static_memo,
+        DIRECT_RESCUE_PAIR_SAMPLES,
+        top_k=40,
+    )
+
+    ranked = []
+    for cost, room, timeslot in candidates:
+        if room is None:
+            continue
+        if timeslot is None:
+            ranked.append((0, cost, random.random(), room, timeslot, []))
+            continue
+        blockers = _blocking_indices(base, idx, room.id, timeslot.id)
+        if len(blockers) <= 1:
+            ranked.append(
+                (len(blockers), cost, random.random(), room, timeslot, blockers)
+            )
+
+    ranked.sort(key=lambda value: (value[0], value[1], value[2]))
+
+    for blocker_count, _, _, room, timeslot, blockers in ranked:
+        trial = clone_schedule(base)
+        trial_room_counts, trial_instructor_counts = _build_occupancy(trial)
+
+        if blocker_count == 0:
+            _add_assignment(
+                trial[idx],
+                room.id,
+                timeslot.id if timeslot is not None else None,
+                trial_room_counts,
+                trial_instructor_counts,
+            )
+            return trial
+
+        blocker_idx = blockers[0]
+        _remove_assignment(
+            trial[blocker_idx], trial_room_counts, trial_instructor_counts
+        )
+        _add_assignment(
+            trial[idx],
+            room.id,
+            timeslot.id,
+            trial_room_counts,
+            trial_instructor_counts,
+        )
+
+        blocker_choices = _zero_cost_candidates(
+            blocker_idx,
+            trial,
+            sections,
+            option_cache,
+            trial_room_counts,
+            trial_instructor_counts,
+            static_memo,
+            DIRECT_RESCUE_BLOCKER_SAMPLES,
+            top_k=20,
+        )
+        if not blocker_choices:
+            continue
+
+        _, blocker_room, blocker_timeslot = random.choice(blocker_choices[:5])
+        _add_assignment(
+            trial[blocker_idx],
+            blocker_room.id,
+            blocker_timeslot.id if blocker_timeslot is not None else None,
+            trial_room_counts,
+            trial_instructor_counts,
+        )
+        return trial
+
+    return None
+
+
+def _direct_rescue_unscheduled(
+    schedule,
+    sections,
+    option_cache,
+    static_memo,
+):
+    """Prioritize reducing unscheduled sections without adding conflicts."""
+    best = clone_schedule(schedule)
+
+    for _ in range(DIRECT_RESCUE_ROUNDS):
+        unscheduled = [
+            idx
+            for idx, item in enumerate(best)
+            if not _is_scheduled(item)
+            and _requirement(idx, option_cache) != "NEEDS_NOTHING"
+        ]
+        if not unscheduled:
+            break
+
+        unscheduled.sort(
+            key=lambda idx: (
+                _domain_size(idx, option_cache),
+                -getattr(sections[idx], "capacity", 0),
+            )
+        )
+
+        improved = False
+        for idx in unscheduled:
+            candidate = _try_single_blocker_rescue(
+                best,
+                idx,
+                sections,
+                option_cache,
+                static_memo,
+            )
+            if candidate is None:
+                continue
+
+            # Accept only when the unscheduled count decreases and the total
+            # number of hard conflicts does not increase.
+            old_room_counts, old_instructor_counts = _build_occupancy(best)
+            new_room_counts, new_instructor_counts = _build_occupancy(candidate)
+            old_conflicts = sum(_conflict_totals(
+                old_room_counts, old_instructor_counts
+            ))
+            new_conflicts = sum(_conflict_totals(
+                new_room_counts, new_instructor_counts
+            ))
+
+            if (
+                count_unscheduled(candidate) < count_unscheduled(best)
+                and new_conflicts <= old_conflicts
+            ):
+                best = candidate
+                improved = True
+
+        if not improved:
+            break
+
+    return best
+
+
+# ============================================================
 # EJECTION-CHAIN REPAIR
 # ============================================================
 def _blocking_indices(schedule, moving_idx, room_id, timeslot_id):
@@ -1021,6 +1213,18 @@ def genetic_schedule(sections, timeslots, rooms, cache=None, option_cache=None):
     static_memo = {}
 
     best = _initial_construction(sections, option_cache, static_memo)
+    best = _direct_rescue_unscheduled(
+        best, sections, option_cache, static_memo
+    )
+    best = _large_neighborhood_search(
+        best, sections, option_cache, static_memo
+    )
+    best = _min_conflicts(
+        best, sections, option_cache, static_memo
+    )
+    best = _direct_rescue_unscheduled(
+        best, sections, option_cache, static_memo
+    )
     best = _large_neighborhood_search(
         best, sections, option_cache, static_memo
     )
@@ -1030,13 +1234,7 @@ def genetic_schedule(sections, timeslots, rooms, cache=None, option_cache=None):
     best = _ejection_chain_repair(
         best, sections, option_cache, static_memo
     )
-    best = _large_neighborhood_search(
-        best, sections, option_cache, static_memo
-    )
-    best = _min_conflicts(
-        best, sections, option_cache, static_memo
-    )
-    best = _ejection_chain_repair(
+    best = _direct_rescue_unscheduled(
         best, sections, option_cache, static_memo
     )
     best = _soft_polish(
