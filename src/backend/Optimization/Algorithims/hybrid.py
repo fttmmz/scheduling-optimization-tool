@@ -44,9 +44,16 @@ EJECTION_TOP_K = 20
 
 # Direct unscheduled rescue: first use conflict-free openings, then try a
 # single-blocker relocation. This is cheaper than deep recursive ejection.
-DIRECT_RESCUE_ROUNDS = 3
-DIRECT_RESCUE_PAIR_SAMPLES = 900
-DIRECT_RESCUE_BLOCKER_SAMPLES = 360
+DIRECT_RESCUE_ROUNDS = 2
+DIRECT_RESCUE_PAIR_SAMPLES = 700
+DIRECT_RESCUE_BLOCKER_SAMPLES = 260
+
+# Allow a small temporary conflict to schedule difficult sections.
+# Min-conflicts runs immediately afterward to clean those conflicts.
+FORCE_SCHEDULE_ROUNDS = 2
+FORCE_SCHEDULE_PAIR_SAMPLES = 1200
+FORCE_SCHEDULE_TOP_K = 60
+MAX_TEMPORARY_PLACEMENT_COST = 2000
 
 SOFT_POLISH_STEPS = 60
 SOFT_POLISH_PAIR_SAMPLES = 60
@@ -904,6 +911,97 @@ def _direct_rescue_unscheduled(
     return best
 
 
+
+# ============================================================
+# FORCE-SCHEDULE THEN REPAIR
+# ============================================================
+def _force_schedule_unscheduled(
+    schedule,
+    sections,
+    option_cache,
+    static_memo,
+):
+    """
+    Schedule difficult remaining sections even when the best placement creates
+    one or two temporary room/instructor conflicts. The later min-conflicts
+    phase repairs those collisions.
+    """
+    best = clone_schedule(schedule)
+
+    for _ in range(FORCE_SCHEDULE_ROUNDS):
+        room_counts, instructor_counts = _build_occupancy(best)
+        unscheduled = [
+            idx
+            for idx, item in enumerate(best)
+            if not _is_scheduled(item)
+            and _requirement(idx, option_cache) != "NEEDS_NOTHING"
+        ]
+        if not unscheduled:
+            break
+
+        # Hardest sections first so flexible sections remain available later.
+        unscheduled.sort(
+            key=lambda idx: (
+                _domain_size(idx, option_cache),
+                -getattr(sections[idx], "capacity", 0),
+            )
+        )
+
+        placed_any = False
+        for idx in unscheduled:
+            requirement = _requirement(idx, option_cache)
+
+            if requirement == "NEEDS_ROOM_ONLY":
+                rooms = option_cache[idx]["rooms"]
+                if rooms:
+                    best[idx].room_id = random.choice(rooms).id
+                    best[idx].timeslot_id = None
+                    placed_any = True
+                continue
+
+            candidates = _best_candidates(
+                idx,
+                best,
+                sections,
+                option_cache,
+                room_counts,
+                instructor_counts,
+                static_memo,
+                FORCE_SCHEDULE_PAIR_SAMPLES,
+                top_k=FORCE_SCHEDULE_TOP_K,
+            )
+            if not candidates:
+                continue
+
+            # Prefer the lowest-conflict placement. Permit at most two
+            # temporary collisions (cost 2000 with the current weights).
+            minimum_cost = candidates[0][0]
+            if minimum_cost > MAX_TEMPORARY_PLACEMENT_COST:
+                continue
+
+            near_best = [
+                candidate for candidate in candidates
+                if candidate[0] == minimum_cost
+            ]
+            _, room, timeslot = random.choice(near_best)
+            if room is None:
+                continue
+
+            _add_assignment(
+                best[idx],
+                room.id,
+                timeslot.id if timeslot is not None else None,
+                room_counts,
+                instructor_counts,
+            )
+            placed_any = True
+
+        if not placed_any:
+            break
+
+    return best
+
+
 # ============================================================
 # EJECTION-CHAIN REPAIR
 # ============================================================
@@ -1216,16 +1314,19 @@ def genetic_schedule(sections, timeslots, rooms, cache=None, option_cache=None):
     best = _direct_rescue_unscheduled(
         best, sections, option_cache, static_memo
     )
-    best = _large_neighborhood_search(
+    best = _force_schedule_unscheduled(
         best, sections, option_cache, static_memo
     )
     best = _min_conflicts(
         best, sections, option_cache, static_memo
     )
+    best = _large_neighborhood_search(
+        best, sections, option_cache, static_memo
+    )
     best = _direct_rescue_unscheduled(
         best, sections, option_cache, static_memo
     )
-    best = _large_neighborhood_search(
+    best = _force_schedule_unscheduled(
         best, sections, option_cache, static_memo
     )
     best = _min_conflicts(
@@ -1234,7 +1335,7 @@ def genetic_schedule(sections, timeslots, rooms, cache=None, option_cache=None):
     best = _ejection_chain_repair(
         best, sections, option_cache, static_memo
     )
-    best = _direct_rescue_unscheduled(
+    best = _min_conflicts(
         best, sections, option_cache, static_memo
     )
     best = _soft_polish(
