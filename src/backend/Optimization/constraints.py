@@ -575,24 +575,29 @@ def is_department_match(section, room) -> bool:
     """
     Department matching rules:
 
-    - Rooms without a department can be used by everyone.
-    - Department-specific labs remain restricted to the same department.
-    - Classrooms can be shared between departments.
-    - Campus restrictions are still enforced separately by is_campus_match().
+    For LABS (room.type == 'lab'):
+      HARD — room.dept_id must equal section.course.dept OR room.dept_id is None/''
+      (a lab with no dept assignment is open to everyone; a dept-assigned
+       lab is exclusive to that department)
+
+    For CLASSROOMS (room.type == 'classroom'):
+      SOFT treated as HARD here — prefer dept match, but allow undept-rooms.
+      Rooms assigned to a dept are RESERVED for that dept (hard).
+      Rooms with no dept can be used by anyone .
+
+    Returns True  → assignment is allowed
+    Returns False → hard violation (dept-locked room, wrong dept)
     """
-    room_dept = room.dept_id
+    room_dept = room.dept_id  # may be None / ''
     course_dept = section.course.dept
 
-    # Room has no department restriction
+    # Room has no department restriction → always allowed
     if not room_dept:
         return True
 
-    # Keep department restriction for labs
-    if str(room.type).strip().lower() == "lab":
-        return room_dept == course_dept
+    # Room IS dept-restricted → must match course dept
+    return room_dept == course_dept
 
-    # Allow classrooms to be shared across departments
-    return True
 
 def is_capacity_ok(section, room) -> bool:
     """Room capacity must be >= section enrolment capacity."""
