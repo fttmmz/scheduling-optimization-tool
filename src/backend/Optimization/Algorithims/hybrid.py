@@ -16,10 +16,10 @@ from backend.Optimization.evaluation import (
     calculate_fitness,
 )
 
-# ===========================================================
+# ============================================================
 # PURE-PYTHON HYBRID
 # Classification-aware MRV construction + LNS + min-conflicts
-# ===========================================================
+# ============================================================
 
 CONSTRUCTION_RESTARTS = 4
 CONSTRUCTION_PAIR_SAMPLES = 220
@@ -32,6 +32,14 @@ LNS_PAIR_SAMPLES = 280
 MIN_CONFLICT_STEPS = 12000
 MIN_CONFLICT_PAIR_SAMPLES = 320
 RANDOM_WALK_RATE = 0.06
+
+# Ejection-chain repair: move blocking sections to make space for
+# unscheduled sections instead of leaving them unassigned.
+EJECTION_REPAIR_ROUNDS = 3
+EJECTION_MAX_DEPTH = 3
+EJECTION_MAX_BLOCKERS = 2
+EJECTION_PAIR_SAMPLES = 500
+EJECTION_TOP_K = 40
 
 SOFT_POLISH_STEPS = 100
 SOFT_POLISH_PAIR_SAMPLES = 60
@@ -704,247 +712,217 @@ def _min_conflicts(schedule, sections, option_cache, static_memo):
     return best
 
 
-
-
 # ============================================================
-# TARGETED FINAL REPAIR
-# Strictly improving, bounded passes added on top of the stable version.
+# EJECTION-CHAIN REPAIR
 # ============================================================
-TARGETED_RESCUE_PAIR_LIMIT = 1200
-TARGETED_RESCUE_ROUNDS = 2
-TARGETED_SWAP_STEPS = 2200
-TARGETED_SWAP_PAIR_SAMPLES = 260
+def _blocking_indices(schedule, moving_idx, room_id, timeslot_id):
+    """Return sections that prevent moving_idx from using this placement."""
+    moving_item = schedule[moving_idx]
+    blockers = []
+
+    for idx, item in enumerate(schedule):
+        if idx == moving_idx or item.timeslot_id is None:
+            continue
+
+        room_block = (
+            item.room_id == room_id
+            and item.timeslot_id == timeslot_id
+        )
+        instructor_block = (
+            moving_item.instructor_id is not None
+            and item.instructor_id == moving_item.instructor_id
+            and item.timeslot_id == timeslot_id
+        )
+
+        if room_block or instructor_block:
+            blockers.append(idx)
+
+    return blockers
 
 
-def _bounded_ranked_candidates(
-    idx,
+def _try_ejection_chain(
     schedule,
+    idx,
     sections,
     option_cache,
-    room_counts,
-    instructor_counts,
     static_memo,
-    pair_limit,
-    top_k=12,
+    depth,
+    visited,
 ):
-    """Broader deterministic/random candidate scan used only for problem items."""
-    requirement = _requirement(idx, option_cache)
-    item = schedule[idx]
+    """
+    Try to place one section. If its desired placement is occupied, move the
+    blocking section(s) recursively. Returns a repaired schedule or None.
+    """
+    if idx in visited:
+        return None
 
+    requirement = _requirement(idx, option_cache)
     if requirement == "NEEDS_NOTHING":
-        return [(0, None, None)]
+        return clone_schedule(schedule)
+
+    base = clone_schedule(schedule)
+    room_counts, instructor_counts = _build_occupancy(base)
+    _remove_assignment(base[idx], room_counts, instructor_counts)
 
     viable_rooms = option_cache[idx]["rooms"]
     if not viable_rooms:
-        return []
+        return None
 
+    # Room-only activities do not use a timeslot, so any viable room works.
     if requirement == "NEEDS_ROOM_ONLY":
-        return [(0, room, None) for room in viable_rooms[:top_k]]
+        chosen_room = random.choice(viable_rooms)
+        _add_assignment(
+            base[idx], chosen_room.id, None, room_counts, instructor_counts
+        )
+        return base
 
-    valid_timeslots = option_cache[idx]["timeslots"]
-    if not valid_timeslots:
-        return []
+    candidates = _best_candidates(
+        idx,
+        base,
+        sections,
+        option_cache,
+        room_counts,
+        instructor_counts,
+        static_memo,
+        EJECTION_PAIR_SAMPLES,
+        top_k=EJECTION_TOP_K,
+    )
+    if not candidates:
+        return None
 
     ranked = []
-    seen = set()
-
-    # First cover timeslots systematically, trying a rotating subset of rooms.
-    ts_order = list(valid_timeslots)
-    room_order = list(viable_rooms)
-    random.shuffle(ts_order)
-    random.shuffle(room_order)
-
-    room_width = max(1, min(len(room_order), pair_limit // max(1, len(ts_order))))
-    checked = 0
-    for ts_pos, timeslot in enumerate(ts_order):
-        start = (ts_pos * room_width) % len(room_order)
-        for offset in range(room_width):
-            room = room_order[(start + offset) % len(room_order)]
-            key = (room.id, timeslot.id)
-            if key in seen:
-                continue
-            seen.add(key)
-            checked += 1
-
-            if not _static_ok(idx, room, timeslot, sections, static_memo):
-                continue
-
-            cost = _placement_cost(
-                item, room.id, timeslot.id, room_counts, instructor_counts
-            )
-            ranked.append((cost, random.random(), room, timeslot))
-            if cost == 0 and len(ranked) >= top_k:
-                break
-        if checked >= pair_limit or (ranked and ranked[0][0] == 0 and len(ranked) >= top_k):
-            break
-
-    # Fill any unused budget randomly to improve coverage without an exhaustive scan.
-    attempts = 0
-    while checked < pair_limit and attempts < pair_limit * 4:
-        attempts += 1
-        room = random.choice(viable_rooms)
-        timeslot = random.choice(valid_timeslots)
-        key = (room.id, timeslot.id)
-        if key in seen:
-            continue
-        seen.add(key)
-        checked += 1
-        if not _static_ok(idx, room, timeslot, sections, static_memo):
-            continue
-        cost = _placement_cost(
-            item, room.id, timeslot.id, room_counts, instructor_counts
+    for cost, room, timeslot in candidates:
+        blockers = _blocking_indices(
+            base, idx, room.id, timeslot.id
         )
-        ranked.append((cost, random.random(), room, timeslot))
+        ranked.append(
+            (len(blockers), cost, random.random(), room, timeslot, blockers)
+        )
 
-    ranked.sort(key=lambda value: (value[0], value[1]))
-    return [(cost, room, timeslot) for cost, _, room, timeslot in ranked[:top_k]]
+    ranked.sort(key=lambda value: (value[0], value[1], value[2]))
+
+    for blocker_count, _, _, room, timeslot, blockers in ranked:
+        # Best case: the placement is already conflict-free.
+        if blocker_count == 0:
+            result = clone_schedule(base)
+            result_room_counts, result_instructor_counts = _build_occupancy(result)
+            _add_assignment(
+                result[idx],
+                room.id,
+                timeslot.id,
+                result_room_counts,
+                result_instructor_counts,
+            )
+            return result
+
+        if depth <= 0 or blocker_count > EJECTION_MAX_BLOCKERS:
+            continue
+
+        # Never eject a section that is already part of this repair chain.
+        if any(blocker in visited for blocker in blockers):
+            continue
+
+        trial = clone_schedule(base)
+        trial_room_counts, trial_instructor_counts = _build_occupancy(trial)
+
+        # Temporarily remove the blockers and reserve the desired placement.
+        for blocker in blockers:
+            _remove_assignment(
+                trial[blocker], trial_room_counts, trial_instructor_counts
+            )
+
+        _add_assignment(
+            trial[idx],
+            room.id,
+            timeslot.id,
+            trial_room_counts,
+            trial_instructor_counts,
+        )
+
+        repaired = trial
+        chain_ok = True
+        next_visited = set(visited)
+        next_visited.add(idx)
+
+        # Move the most constrained blocker first.
+        blockers = sorted(
+            blockers,
+            key=lambda blocker_idx: _domain_size(blocker_idx, option_cache),
+        )
+
+        for blocker in blockers:
+            repaired = _try_ejection_chain(
+                repaired,
+                blocker,
+                sections,
+                option_cache,
+                static_memo,
+                depth - 1,
+                next_visited,
+            )
+            if repaired is None:
+                chain_ok = False
+                break
+            next_visited.add(blocker)
+
+        if chain_ok:
+            return repaired
+
+    return None
 
 
-def _targeted_rescue_unscheduled(schedule, sections, option_cache, static_memo):
-    """Try harder on only unscheduled sections; never worsen the objective."""
+def _ejection_chain_repair(
+    schedule,
+    sections,
+    option_cache,
+    static_memo,
+):
+    """Repair unscheduled sections using short recursive relocation chains."""
     best = clone_schedule(schedule)
     best_cost = _objective(best)
 
-    for _ in range(TARGETED_RESCUE_ROUNDS):
-        current = clone_schedule(best)
-        room_counts, instructor_counts = _build_occupancy(current)
+    for _ in range(EJECTION_REPAIR_ROUNDS):
         unscheduled = [
-            idx for idx, item in enumerate(current)
+            idx
+            for idx, item in enumerate(best)
             if not _is_scheduled(item)
             and _requirement(idx, option_cache) != "NEEDS_NOTHING"
         ]
-        unscheduled.sort(key=lambda idx: _domain_size(idx, option_cache))
-        improved = False
-
-        for idx in unscheduled:
-            item = current[idx]
-            candidates = _bounded_ranked_candidates(
-                idx, current, sections, option_cache,
-                room_counts, instructor_counts, static_memo,
-                TARGETED_RESCUE_PAIR_LIMIT, top_k=10,
-            )
-            if not candidates:
-                continue
-
-            old_cost = _objective_from_counts(current, room_counts, instructor_counts)
-            for _, room, timeslot in candidates:
-                if room is None:
-                    continue
-                _add_assignment(
-                    item,
-                    room.id,
-                    timeslot.id if timeslot is not None else None,
-                    room_counts,
-                    instructor_counts,
-                )
-                new_cost = _objective_from_counts(current, room_counts, instructor_counts)
-                if new_cost < old_cost:
-                    improved = True
-                    break
-                _remove_assignment(item, room_counts, instructor_counts)
-
-        current_cost = _objective_from_counts(current, room_counts, instructor_counts)
-        if current_cost < best_cost:
-            best = clone_schedule(current)
-            best_cost = current_cost
-        if not improved:
+        if not unscheduled:
             break
 
-    return best
-
-
-def _blockers_for_slot(schedule, moving_idx, room_id, timeslot_id):
-    blockers = []
-    moving = schedule[moving_idx]
-    for idx, other in enumerate(schedule):
-        if idx == moving_idx or other.timeslot_id != timeslot_id:
-            continue
-        if other.room_id == room_id:
-            blockers.append(idx)
-            continue
-        if (
-            moving.instructor_id is not None
-            and other.instructor_id == moving.instructor_id
-        ):
-            blockers.append(idx)
-    return list(dict.fromkeys(blockers))
-
-
-def _targeted_swap_repair(schedule, sections, option_cache, static_memo):
-    """Depth-two ejection moves, accepted only for a strict objective decrease."""
-    best = clone_schedule(schedule)
-    best_cost = _objective(best)
-    current = clone_schedule(best)
-
-    for _ in range(TARGETED_SWAP_STEPS):
-        room_counts, instructor_counts = _build_occupancy(current)
-        problems = _problem_indices(current, room_counts, instructor_counts)
-        if not problems:
-            return current
-
-        moving_idx = random.choice(problems)
-        if _requirement(moving_idx, option_cache) != "NEEDS_ROOM_AND_TIME":
-            continue
-
-        trial_base = clone_schedule(current)
-        base_room_counts, base_instructor_counts = _build_occupancy(trial_base)
-        _remove_assignment(
-            trial_base[moving_idx], base_room_counts, base_instructor_counts
+        # Hardest sections first gives flexible sections fewer chances to take
+        # the scarce placements needed by constrained sections.
+        unscheduled.sort(
+            key=lambda idx: (
+                _domain_size(idx, option_cache),
+                -getattr(sections[idx], "capacity", 0),
+            )
         )
 
-        moving_candidates = _bounded_ranked_candidates(
-            moving_idx, trial_base, sections, option_cache,
-            base_room_counts, base_instructor_counts, static_memo,
-            TARGETED_SWAP_PAIR_SAMPLES, top_k=14,
-        )
+        improved_this_round = False
 
-        accepted = False
-        for _, room, timeslot in moving_candidates:
-            if room is None or timeslot is None:
+        for idx in unscheduled:
+            candidate = _try_ejection_chain(
+                best,
+                idx,
+                sections,
+                option_cache,
+                static_memo,
+                EJECTION_MAX_DEPTH,
+                set(),
+            )
+            if candidate is None:
                 continue
-            blockers = _blockers_for_slot(
-                trial_base, moving_idx, room.id, timeslot.id
-            )
-            if len(blockers) != 1:
-                continue
 
-            blocker_idx = blockers[0]
-            candidate = clone_schedule(current)
-            rc, ic = _build_occupancy(candidate)
-            _remove_assignment(candidate[moving_idx], rc, ic)
-            _remove_assignment(candidate[blocker_idx], rc, ic)
+            candidate_cost = _objective(candidate)
+            if candidate_cost < best_cost:
+                best = candidate
+                best_cost = candidate_cost
+                improved_this_round = True
 
-            # Put the problem item in the desired slot first.
-            _add_assignment(
-                candidate[moving_idx], room.id, timeslot.id, rc, ic
-            )
-
-            blocker_candidates = _bounded_ranked_candidates(
-                blocker_idx, candidate, sections, option_cache,
-                rc, ic, static_memo,
-                TARGETED_SWAP_PAIR_SAMPLES, top_k=12,
-            )
-            for _, blocker_room, blocker_ts in blocker_candidates:
-                if blocker_room is None:
-                    continue
-                _add_assignment(
-                    candidate[blocker_idx],
-                    blocker_room.id,
-                    blocker_ts.id if blocker_ts is not None else None,
-                    rc,
-                    ic,
-                )
-                candidate_cost = _objective_from_counts(candidate, rc, ic)
-                if candidate_cost < best_cost:
-                    current = candidate
-                    best = clone_schedule(candidate)
-                    best_cost = candidate_cost
-                    accepted = True
-                    break
-                _remove_assignment(candidate[blocker_idx], rc, ic)
-
-            if accepted:
-                break
+        if not improved_this_round:
+            break
 
     return best
 
@@ -1049,19 +1027,16 @@ def genetic_schedule(sections, timeslots, rooms, cache=None, option_cache=None):
     best = _min_conflicts(
         best, sections, option_cache, static_memo
     )
+    best = _ejection_chain_repair(
+        best, sections, option_cache, static_memo
+    )
     best = _large_neighborhood_search(
         best, sections, option_cache, static_memo
     )
     best = _min_conflicts(
         best, sections, option_cache, static_memo
     )
-    best = _targeted_rescue_unscheduled(
-        best, sections, option_cache, static_memo
-    )
-    best = _targeted_swap_repair(
-        best, sections, option_cache, static_memo
-    )
-    best = _targeted_rescue_unscheduled(
+    best = _ejection_chain_repair(
         best, sections, option_cache, static_memo
     )
     best = _soft_polish(
