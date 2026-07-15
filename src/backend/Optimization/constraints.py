@@ -1,6 +1,6 @@
 # constraints.py
 # Single source of truth for ALL scheduling constraints and preprocessing.
-# Every algorithm (greedy, genetic, etc.) imports from here 
+# Every algorithm (greedy, genetic, etc.) imports from here
 
 
 import re
@@ -11,7 +11,7 @@ from collections import defaultdict
 NEEDS_ROOM_AND_TIME = {
     "Lecture Undergraduate",
     "Lecture Graduate",
-    "Lecutre / Studio Undergraduate",  
+    "Lecutre / Studio Undergraduate",
     "Lecture/Lab",
     "Laboratory",
     "Seminar Graduate",
@@ -98,7 +98,7 @@ PRIORITY_LATE  = "LATE"   # schedule after main courses, later in the day
 PRIORITY_MAIN  = "MAIN"   # normal scheduling window
 
 
-# internal helpers 
+# internal helpers
 
 def _section_suffix(section_no: str) -> str:
     """
@@ -575,29 +575,24 @@ def is_department_match(section, room) -> bool:
     """
     Department matching rules:
 
-    For LABS (room.type == 'lab'):
-      HARD — room.dept_id must equal section.course.dept OR room.dept_id is None/''
-      (a lab with no dept assignment is open to everyone; a dept-assigned
-       lab is exclusive to that department)
-
-    For CLASSROOMS (room.type == 'classroom'):
-      SOFT treated as HARD here — prefer dept match, but allow undept-rooms.
-      Rooms assigned to a dept are RESERVED for that dept (hard).
-      Rooms with no dept can be used by anyone .
-
-    Returns True  → assignment is allowed
-    Returns False → hard violation (dept-locked room, wrong dept)
+    - Rooms without a department can be used by everyone.
+    - Department-specific labs remain restricted to the same department.
+    - Classrooms can be shared between departments.
+    - Campus restrictions are still enforced separately by is_campus_match().
     """
-    room_dept = room.dept_id  # may be None / ''
+    room_dept = room.dept_id
     course_dept = section.course.dept
 
-    # Room has no department restriction → always allowed
+    # Room has no department restriction
     if not room_dept:
         return True
 
-    # Room IS dept-restricted → must match course dept
-    return room_dept == course_dept
+    # Keep department restriction for labs
+    if str(room.type).strip().lower() == "lab":
+        return room_dept == course_dept
 
+    # Allow classrooms to be shared across departments
+    return True
 
 def is_capacity_ok(section, room) -> bool:
     """Room capacity must be >= section enrolment capacity."""
