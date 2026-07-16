@@ -44,16 +44,9 @@ EJECTION_TOP_K = 20
 
 # Direct unscheduled rescue: first use conflict-free openings, then try a
 # single-blocker relocation. This is cheaper than deep recursive ejection.
-DIRECT_RESCUE_ROUNDS = 2
-DIRECT_RESCUE_PAIR_SAMPLES = 700
-DIRECT_RESCUE_BLOCKER_SAMPLES = 260
-
-# Allow a small temporary conflict to schedule difficult sections.
-# Min-conflicts runs immediately afterward to clean those conflicts.
-FORCE_SCHEDULE_ROUNDS = 2
-FORCE_SCHEDULE_PAIR_SAMPLES = 1200
-FORCE_SCHEDULE_TOP_K = 60
-MAX_TEMPORARY_PLACEMENT_COST = 2000
+DIRECT_RESCUE_ROUNDS = 3
+DIRECT_RESCUE_PAIR_SAMPLES = 900
+DIRECT_RESCUE_BLOCKER_SAMPLES = 360
 
 SOFT_POLISH_STEPS = 60
 SOFT_POLISH_PAIR_SAMPLES = 60
@@ -911,97 +904,6 @@ def _direct_rescue_unscheduled(
     return best
 
 
-
-# ============================================================
-# FORCE-SCHEDULE THEN REPAIR
-# ============================================================
-def _force_schedule_unscheduled(
-    schedule,
-    sections,
-    option_cache,
-    static_memo,
-):
-    """
-    Schedule difficult remaining sections even when the best placement creates
-    one or two temporary room/instructor conflicts. The later min-conflicts
-    phase repairs those collisions.
-    """
-    best = clone_schedule(schedule)
-
-    for _ in range(FORCE_SCHEDULE_ROUNDS):
-        room_counts, instructor_counts = _build_occupancy(best)
-        unscheduled = [
-            idx
-            for idx, item in enumerate(best)
-            if not _is_scheduled(item)
-            and _requirement(idx, option_cache) != "NEEDS_NOTHING"
-        ]
-        if not unscheduled:
-            break
-
-        # Hardest sections first so flexible sections remain available later.
-        unscheduled.sort(
-            key=lambda idx: (
-                _domain_size(idx, option_cache),
-                -getattr(sections[idx], "capacity", 0),
-            )
-        )
-
-        placed_any = False
-        for idx in unscheduled:
-            requirement = _requirement(idx, option_cache)
-
-            if requirement == "NEEDS_ROOM_ONLY":
-                rooms = option_cache[idx]["rooms"]
-                if rooms:
-                    best[idx].room_id = random.choice(rooms).id
-                    best[idx].timeslot_id = None
-                    placed_any = True
-                continue
-
-            candidates = _best_candidates(
-                idx,
-                best,
-                sections,
-                option_cache,
-                room_counts,
-                instructor_counts,
-                static_memo,
-                FORCE_SCHEDULE_PAIR_SAMPLES,
-                top_k=FORCE_SCHEDULE_TOP_K,
-            )
-            if not candidates:
-                continue
-
-            # Prefer the lowest-conflict placement. Permit at most two
-            # temporary collisions (cost 2000 with the current weights).
-            minimum_cost = candidates[0][0]
-            if minimum_cost > MAX_TEMPORARY_PLACEMENT_COST:
-                continue
-
-            near_best = [
-                candidate for candidate in candidates
-                if candidate[0] == minimum_cost
-            ]
-            _, room, timeslot = random.choice(near_best)
-            if room is None:
-                continue
-
-            _add_assignment(
-                best[idx],
-                room.id,
-                timeslot.id if timeslot is not None else None,
-                room_counts,
-                instructor_counts,
-            )
-            placed_any = True
-
-        if not placed_any:
-            break
-
-    return best
-
-
 # ============================================================
 # EJECTION-CHAIN REPAIR
 # ============================================================
@@ -1294,348 +1196,47 @@ def _soft_polish(
     return best
 
 
-
-# ============================================================
-# CSP + GENETIC ALGORITHM
-# ============================================================
-CSP_POPULATION_SIZE = 8
-CSP_GENERATIONS = 8
-CSP_ELITE_SIZE = 2
-CSP_TOURNAMENT_SIZE = 3
-CSP_CROSSOVER_RATE = 0.75
-CSP_MUTATION_RATE = 0.10
-CSP_CONSTRUCTION_SAMPLES = 360
-CSP_TOP_CANDIDATES = 12
-CSP_REPAIR_STEPS = 3500
-
-
-def _forward_pressure(idx, room_id, timeslot_id, sections, option_cache):
-    """Estimate how much a placement consumes scarce future resources."""
-    pressure = 0.0
-    instructor_id = sections[idx].instructor_id
-
-    # Scarce sections should avoid popular room-timeslot combinations.
-    domain = max(1, _domain_size(idx, option_cache))
-    pressure += 1000.0 / domain
-
-    # Penalize placing heavily loaded instructors in very common timeslots.
-    if instructor_id is not None:
-        pressure += 0.5
-
-    # Small deterministic tie-break based on IDs, avoiding full random noise.
-    pressure += (hash((room_id, timeslot_id)) & 255) / 100000.0
-    return pressure
-
-
-def _csp_candidates(
-    idx,
-    schedule,
-    sections,
-    option_cache,
-    room_counts,
-    instructor_counts,
-    static_memo,
-):
-    """Return conflict-free candidates ranked by least-constraining value."""
-    requirement = _requirement(idx, option_cache)
-    if requirement == "NEEDS_NOTHING":
-        return [(0.0, None, None)]
-
-    rooms = option_cache[idx]["rooms"]
-    if not rooms:
-        return []
-
-    if requirement == "NEEDS_ROOM_ONLY":
-        choices = list(rooms)
-        random.shuffle(choices)
-        return [(0.0, room, None) for room in choices[:CSP_TOP_CANDIDATES]]
-
-    timeslots = option_cache[idx]["timeslots"]
-    if not timeslots:
-        return []
-
-    ranked = []
-    for room, timeslot in _sample_pairs(
-        rooms, timeslots, CSP_CONSTRUCTION_SAMPLES
-    ):
-        if not _static_ok(idx, room, timeslot, sections, static_memo):
-            continue
-
-        # Forward checking: only accept values currently free for both room
-        # and instructor. This prevents construction-time hard conflicts.
-        if room_counts.get((room.id, timeslot.id), 0):
-            continue
-        instructor_id = sections[idx].instructor_id
-        if (
-            instructor_id is not None
-            and instructor_counts.get((instructor_id, timeslot.id), 0)
-        ):
-            continue
-
-        pressure = _forward_pressure(
-            idx, room.id, timeslot.id, sections, option_cache
-        )
-        # Prefer larger rooms only slightly; do not waste them unnecessarily.
-        excess = max(0, getattr(room, "capacity", 0) - sections[idx].capacity)
-        score = pressure + excess / 100000.0 + random.random() * 0.01
-        ranked.append((score, room, timeslot))
-
-    ranked.sort(key=lambda value: value[0])
-    return ranked[:CSP_TOP_CANDIDATES]
-
-
-def _dynamic_mrv_order(remaining, sections, option_cache):
-    """Choose the most constrained remaining section with load tie-breaks."""
-    instructor_load = defaultdict(int)
-    for idx in remaining:
-        instructor_id = sections[idx].instructor_id
-        if instructor_id is not None:
-            instructor_load[instructor_id] += 1
-
-    return min(
-        remaining,
-        key=lambda idx: (
-            _domain_size(idx, option_cache),
-            -instructor_load.get(sections[idx].instructor_id, 0),
-            -getattr(sections[idx], "capacity", 0),
-            random.random(),
-        ),
-    )
-
-
-def _csp_construct(sections, option_cache, static_memo):
-    """Build one conflict-free schedule using dynamic MRV and forward checks."""
-    schedule = _new_schedule(sections)
-    room_counts = defaultdict(int)
-    instructor_counts = defaultdict(int)
-
-    # Precompute MRV order once. Recomputing it after every placement would
-    # be O(n^2) for the full university dataset. Forward checks still use
-    # the current occupancy for every candidate.
-    order = _construction_order(sections, option_cache)
-
-    for idx in order:
-        candidates = _csp_candidates(
-            idx,
-            schedule,
-            sections,
-            option_cache,
-            room_counts,
-            instructor_counts,
-            static_memo,
-        )
-        if not candidates:
-            continue
-
-        # Randomized least-constraining-value choice creates population diversity.
-        pool = candidates[: min(4, len(candidates))]
-        _, room, timeslot = random.choice(pool)
-        if room is None:
-            continue
-
-        _add_assignment(
-            schedule[idx],
-            room.id,
-            timeslot.id if timeslot is not None else None,
-            room_counts,
-            instructor_counts,
-        )
-
-    return schedule
-
-
-def _schedule_key(schedule):
-    room_counts, instructor_counts = _build_occupancy(schedule)
-    room_conflicts, instructor_conflicts = _conflict_totals(
-        room_counts, instructor_counts
-    )
-    return (
-        count_unscheduled(schedule),
-        room_conflicts + instructor_conflicts,
-    )
-
-
-def _tournament_select(population):
-    size = min(CSP_TOURNAMENT_SIZE, len(population))
-    competitors = random.sample(population, size)
-    return min(competitors, key=_schedule_key)
-
-
-def _uniform_crossover(parent_a, parent_b, sections, option_cache, static_memo):
-    """Combine two CSP schedules, preserving only conflict-free assignments."""
-    child = _new_schedule(sections)
-    room_counts = defaultdict(int)
-    instructor_counts = defaultdict(int)
-
-    indices = list(range(len(child)))
-    indices.sort(key=lambda idx: (_domain_size(idx, option_cache), random.random()))
-
-    for idx in indices:
-        requirement = _requirement(idx, option_cache)
-        if requirement == "NEEDS_NOTHING":
-            continue
-
-        source_first = parent_a[idx] if random.random() < 0.5 else parent_b[idx]
-        source_second = parent_b[idx] if source_first is parent_a[idx] else parent_a[idx]
-
-        placed = False
-        for source in (source_first, source_second):
-            if source.room_id is None:
-                continue
-
-            if requirement == "NEEDS_ROOM_ONLY":
-                _add_assignment(child[idx], source.room_id, None, room_counts, instructor_counts)
-                placed = True
-                break
-
-            if source.timeslot_id is None:
-                continue
-            room = option_cache[_ROOMS_BY_ID_KEY].get(source.room_id)
-            timeslot = option_cache[_TIMESLOTS_BY_ID_KEY].get(source.timeslot_id)
-            if room is None or timeslot is None:
-                continue
-            if not _static_ok(idx, room, timeslot, sections, static_memo):
-                continue
-            if room_counts.get((room.id, timeslot.id), 0):
-                continue
-            instructor_id = sections[idx].instructor_id
-            if instructor_id is not None and instructor_counts.get(
-                (instructor_id, timeslot.id), 0
-            ):
-                continue
-
-            _add_assignment(
-                child[idx], room.id, timeslot.id, room_counts, instructor_counts
-            )
-            placed = True
-            break
-
-        if placed:
-            continue
-
-        # Forward-checking fallback for genes that could not be inherited.
-        candidates = _csp_candidates(
-            idx,
-            child,
-            sections,
-            option_cache,
-            room_counts,
-            instructor_counts,
-            static_memo,
-        )
-        if candidates:
-            _, room, timeslot = candidates[0]
-            if room is not None:
-                _add_assignment(
-                    child[idx],
-                    room.id,
-                    timeslot.id if timeslot is not None else None,
-                    room_counts,
-                    instructor_counts,
-                )
-
-    return child
-
-
-def _mutate_schedule(schedule, sections, option_cache, static_memo):
-    """Reassign a small number of difficult sections conflict-free."""
-    child = clone_schedule(schedule)
-    room_counts, instructor_counts = _build_occupancy(child)
-
-    problems = _problem_indices(child, room_counts, instructor_counts)
-    unscheduled = [idx for idx, item in enumerate(child) if not _is_scheduled(item)]
-    pool = list(dict.fromkeys(unscheduled + problems))
-    if not pool:
-        pool = [
-            idx for idx in range(len(child))
-            if _requirement(idx, option_cache) != "NEEDS_NOTHING"
-        ]
-
-    mutation_count = max(1, min(20, int(len(child) * CSP_MUTATION_RATE / 10)))
-    random.shuffle(pool)
-    for idx in pool[:mutation_count]:
-        _remove_assignment(child[idx], room_counts, instructor_counts)
-        candidates = _csp_candidates(
-            idx,
-            child,
-            sections,
-            option_cache,
-            room_counts,
-            instructor_counts,
-            static_memo,
-        )
-        if candidates:
-            _, room, timeslot = random.choice(candidates[: min(3, len(candidates))])
-            if room is not None:
-                _add_assignment(
-                    child[idx],
-                    room.id,
-                    timeslot.id if timeslot is not None else None,
-                    room_counts,
-                    instructor_counts,
-                )
-
-    return child
-
-
-def _csp_ga_search(sections, option_cache, static_memo):
-    """Generate CSP seeds and evolve them with a lightweight GA."""
-    population = [
-        _csp_construct(sections, option_cache, static_memo)
-        for _ in range(CSP_POPULATION_SIZE)
-    ]
-
-    for _ in range(CSP_GENERATIONS):
-        population.sort(key=_schedule_key)
-        next_population = [
-            clone_schedule(item) for item in population[:CSP_ELITE_SIZE]
-        ]
-
-        while len(next_population) < CSP_POPULATION_SIZE:
-            parent_a = _tournament_select(population)
-            parent_b = _tournament_select(population)
-
-            if random.random() < CSP_CROSSOVER_RATE:
-                child = _uniform_crossover(
-                    parent_a,
-                    parent_b,
-                    sections,
-                    option_cache,
-                    static_memo,
-                )
-            else:
-                child = clone_schedule(parent_a)
-
-            if random.random() < CSP_MUTATION_RATE:
-                child = _mutate_schedule(
-                    child, sections, option_cache, static_memo
-                )
-
-            next_population.append(child)
-
-        population = next_population
-
-    return min(population, key=_schedule_key)
-
-
 # ============================================================
 # PUBLIC FUNCTIONS EXPECTED BY THE WEBSITE
 # ============================================================
 def genetic_schedule(sections, timeslots, rooms, cache=None, option_cache=None):
-    """Pure-Python CSP + GA hybrid with final min-conflicts/LNS repair."""
+    """
+    Retains the historical function name used by the project, but runs a
+    classification-aware MRV + LNS + min-conflicts hybrid.
+    """
     if cache is None:
         cache = build_timeslot_guideline_cache(sections, timeslots)
+
     if option_cache is None:
         option_cache = build_option_cache(sections, rooms, timeslots)
 
     static_memo = {}
-    best = _csp_ga_search(sections, option_cache, static_memo)
 
-    # Short cleanup only. The CSP/GA phase should do most of the construction.
-    best = _direct_rescue_unscheduled(best, sections, option_cache, static_memo)
-    best = _min_conflicts(best, sections, option_cache, static_memo)
-    best = _large_neighborhood_search(best, sections, option_cache, static_memo)
-    best = _min_conflicts(best, sections, option_cache, static_memo)
+    best = _initial_construction(sections, option_cache, static_memo)
+    best = _direct_rescue_unscheduled(
+        best, sections, option_cache, static_memo
+    )
+    best = _large_neighborhood_search(
+        best, sections, option_cache, static_memo
+    )
+    best = _min_conflicts(
+        best, sections, option_cache, static_memo
+    )
+    best = _direct_rescue_unscheduled(
+        best, sections, option_cache, static_memo
+    )
+    best = _large_neighborhood_search(
+        best, sections, option_cache, static_memo
+    )
+    best = _min_conflicts(
+        best, sections, option_cache, static_memo
+    )
+    best = _ejection_chain_repair(
+        best, sections, option_cache, static_memo
+    )
+    best = _direct_rescue_unscheduled(
+        best, sections, option_cache, static_memo
+    )
     best = _soft_polish(
         best,
         sections,
@@ -1645,17 +1246,22 @@ def genetic_schedule(sections, timeslots, rooms, cache=None, option_cache=None):
         option_cache,
         static_memo,
     )
+
     return best
 
 
 def genetic_runs(sections, timeslots, rooms, num_runs=1):
-    """Website-compatible wrapper; returns the best CSP + GA schedule."""
+    """
+    Wrapper required by engine.py. Runs the hybrid one or more times and
+    returns the best schedule. No other project file needs to change.
+    """
     run_count = max(1, int(num_runs or 1))
     cache = build_timeslot_guideline_cache(sections, timeslots)
     option_cache = build_option_cache(sections, rooms, timeslots)
 
     best_schedule = None
     best_key = None
+
     for _ in range(run_count):
         candidate = genetic_schedule(
             sections,
@@ -1664,6 +1270,7 @@ def genetic_runs(sections, timeslots, rooms, num_runs=1):
             cache=cache,
             option_cache=option_cache,
         )
+
         candidate_objective = _objective(candidate)
         candidate_fitness = calculate_fitness(
             candidate,
@@ -1672,6 +1279,8 @@ def genetic_runs(sections, timeslots, rooms, num_runs=1):
             timeslots=timeslots,
             valid_timeslot_cache=cache,
         )
+
+        # Hard feasibility first; fitness breaks ties.
         candidate_key = (candidate_objective, -candidate_fitness)
         if best_key is None or candidate_key < best_key:
             best_key = candidate_key
