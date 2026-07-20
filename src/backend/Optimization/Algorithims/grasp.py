@@ -1,6 +1,7 @@
 import random
 import copy
 import statistics
+from collections import Counter
 
 from backend.models.models import ScheduleItem
 from backend.Optimization.constraints import (
@@ -8,10 +9,15 @@ from backend.Optimization.constraints import (
     get_viable_rooms,
     get_viable_rooms_for_schedule_item,
     passes_hard_constraints,
+    get_section_campus,
+    get_building_campus,
+    get_required_room_type,
 )
 from backend.Optimization.evaluation import (
     calculate_fitness,
     build_timeslot_guideline_cache,
+    count_conflicts,
+    count_scheduled_sections,
 )
 
 # ============================================================
@@ -136,9 +142,50 @@ def construct_grasp_solution(sections, rooms, timeslots, section_candidates):
 
 
 # ============================================================
+# Per-item conflict check
+# Of the 7 conflict types in count_conflicts(), 5 depend only on a single
+# item's own (room, timeslot) -- not on any other item in the schedule:
+# campus, room type, department, capacity, timeslot guidelines. This
+# computes just those 5 for one item in O(1), instead of the O(sections)
+# cost of rescanning the whole schedule via the count_*_conflicts helpers.
+# ============================================================
+def _item_local_conflicts(item, room, timeslot_id, valid_timeslot_cache):
+    conflicts = 0
+
+    if get_section_campus(item.section) != get_building_campus(room.building):
+        conflicts += 1
+
+    required_room_type = get_required_room_type(item.course_type)
+    if required_room_type and room.type != required_room_type:
+        conflicts += 1
+
+    if room.dept_id and item.course_dept != room.dept_id:
+        conflicts += 1
+
+    if item.capacity > room.capacity:
+        conflicts += 1
+
+    valid_ids = valid_timeslot_cache.get((item.course_id, item.section), set())
+    if timeslot_id not in valid_ids:
+        conflicts += 1
+
+    return conflicts
+
+
+# ============================================================
 # Local Search
-# KEY FIX: avoid calling calculate_fitness() inside inner loop
-# Instead: only evaluate after a swap, restore if worse
+#
+# The only two conflict types that depend on OTHER items in the schedule
+# are instructor and room double-booking. Those are tracked incrementally
+# via occupancy counters (room_occupancy / instructor_occupancy) instead of
+# recounting the whole schedule: count_room_conflicts() sums
+# max(0, occupants_at_slot - 1) across slots, so removing an occupant from
+# a slot with >=2 occupants reduces the total by exactly 1 (0 otherwise),
+# and adding one to a slot with >=1 existing occupant increases it by
+# exactly 1 (0 otherwise) -- an exact O(1) equivalent of the O(sections)
+# full recount, combined with the O(1) per-item check above. This makes
+# evaluating one candidate move O(1) instead of O(sections), which is what
+# was making runs take hours on real-sized datasets.
 # ============================================================
 def local_search(
     schedule,
@@ -147,14 +194,38 @@ def local_search(
     sections,
     valid_timeslot_cache,
 ):
-    best_schedule = schedule  # NO deepcopy here, we restore manually
-    best_fitness = calculate_fitness(
+    best_schedule = schedule
+    room_map = {r.id: r for r in rooms}
+
+    total_sections = len(sections)
+    scheduled_count = count_scheduled_sections(best_schedule, sections)
+    unscheduled = max(0, total_sections - scheduled_count)
+    # local_search only relocates already-scheduled items -- it never
+    # schedules or unschedules anything -- so this term never changes for
+    # the whole call and only needs to be computed once.
+    unscheduled_penalty = (unscheduled / total_sections) * 2.0 if total_sections else 0.0
+
+    total_conflicts = count_conflicts(
         best_schedule,
         rooms,
         sections=sections,
         timeslots=timeslots,
         valid_timeslot_cache=valid_timeslot_cache,
     )
+
+    def fitness_from_conflicts(conflicts):
+        conflict_penalty = (conflicts / total_sections) if total_sections else 0.0
+        return round(1.0 / (1.0 + unscheduled_penalty + conflict_penalty), 4)
+
+    best_fitness = fitness_from_conflicts(total_conflicts)
+
+    room_occupancy = Counter()
+    instructor_occupancy = Counter()
+    for it in best_schedule:
+        if it.room_id is not None and it.timeslot_id is not None:
+            room_occupancy[(it.room_id, it.timeslot_id)] += 1
+            if it.instructor_id is not None:
+                instructor_occupancy[(it.instructor_id, it.timeslot_id)] += 1
 
     # Pre-shuffle timeslots once per local search call
     timeslot_list = timeslots[:]
@@ -169,11 +240,18 @@ def local_search(
             if item.room_id is None or item.timeslot_id is None:
                 continue
 
-            original_room = item.room_id
-            original_timeslot = item.timeslot_id
+            original_room_id = item.room_id
+            original_timeslot_id = item.timeslot_id
+            original_room = room_map.get(original_room_id)
+            if original_room is None:
+                continue
 
-            # Pre-fetch viable rooms once per item, then sample a bounded
-            # neighborhood instead of scanning every room x timeslot pair
+            old_local = _item_local_conflicts(
+                item, original_room, original_timeslot_id, valid_timeslot_cache
+            )
+
+            # Sample a bounded neighborhood instead of scanning every
+            # room x timeslot pair
             viable_rooms = get_viable_rooms_for_schedule_item(item, rooms)
             room_sample = random.sample(
                 viable_rooms, min(NEIGHBORHOOD_ROOM_SAMPLE, len(viable_rooms))
@@ -188,45 +266,68 @@ def local_search(
                 for timeslot in timeslot_sample:
 
                     # Skip if same assignment
-                    if room.id == original_room and timeslot.id == original_timeslot:
+                    if room.id == original_room_id and timeslot.id == original_timeslot_id:
                         continue
 
-                    # Apply swap
-                    item.room_id = room.id
-                    item.timeslot_id = timeslot.id
-
-                    new_fitness = calculate_fitness(
-                        best_schedule,
-                        rooms,
-                        sections=sections,
-                        timeslots=timeslots,
-                        valid_timeslot_cache=valid_timeslot_cache,
+                    new_local = _item_local_conflicts(
+                        item, room, timeslot.id, valid_timeslot_cache
                     )
+                    delta = new_local - old_local
+
+                    old_room_count = room_occupancy[(original_room_id, original_timeslot_id)]
+                    if old_room_count >= 2:
+                        delta -= 1
+
+                    if item.instructor_id is not None:
+                        old_instr_count = instructor_occupancy[
+                            (item.instructor_id, original_timeslot_id)
+                        ]
+                        if old_instr_count >= 2:
+                            delta -= 1
+
+                    new_room_count = room_occupancy[(room.id, timeslot.id)]
+                    if new_room_count >= 1:
+                        delta += 1
+
+                    if item.instructor_id is not None:
+                        new_instr_count = instructor_occupancy[
+                            (item.instructor_id, timeslot.id)
+                        ]
+                        if new_instr_count >= 1:
+                            delta += 1
+
+                    new_total_conflicts = total_conflicts + delta
+                    new_fitness = fitness_from_conflicts(new_total_conflicts)
 
                     if new_fitness > best_fitness:
+                        # Commit: update occupancy, move the item, update
+                        # the running totals. Nothing is mutated unless a
+                        # candidate is actually accepted, so there's no
+                        # restore-on-failure needed.
+                        room_occupancy[(original_room_id, original_timeslot_id)] -= 1
+                        room_occupancy[(room.id, timeslot.id)] += 1
+                        if item.instructor_id is not None:
+                            instructor_occupancy[
+                                (item.instructor_id, original_timeslot_id)
+                            ] -= 1
+                            instructor_occupancy[(item.instructor_id, timeslot.id)] += 1
+
+                        item.room_id = room.id
+                        item.timeslot_id = timeslot.id
+
+                        total_conflicts = new_total_conflicts
                         best_fitness = new_fitness
-                        original_room = room.id
-                        original_timeslot = timeslot.id
                         improved = True
                         found = True
                         break  # accept first improvement
-                    else:
-                        # Restore immediately
-                        item.room_id = original_room
-                        item.timeslot_id = original_timeslot
 
                 if found:
                     break
 
-            # Ensure restored if no improvement found
-            if not found:
-                item.room_id = original_room
-                item.timeslot_id = original_timeslot
-
         if not improved:
             break  # early exit — no point continuing
 
-    return best_schedule, best_fitness  # return fitness so we don't recompute it
+    return best_schedule, best_fitness
 
 
 # ============================================================
