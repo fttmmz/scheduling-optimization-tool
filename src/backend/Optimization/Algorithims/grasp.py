@@ -22,6 +22,15 @@ MAX_ITERATIONS = 20
 LOCAL_SEARCH_ITERATIONS = 30
 NO_IMPROVE_LIMIT = 5  # NEW: stop early if no improvement
 
+# Local search tries this many (room, timeslot) candidates per item instead
+# of the full room x timeslot cross product. Each candidate costs a full
+# calculate_fitness() call over the whole schedule (O(sections)), so
+# exhaustively trying every combination for every item, every pass, every
+# GRASP restart, every run made runtime blow up combinatorially on
+# real-sized datasets. Sampling bounds that cost to a small constant.
+NEIGHBORHOOD_ROOM_SAMPLE = 5
+NEIGHBORHOOD_TIMESLOT_SAMPLE = 5
+
 
 # ============================================================
 # Candidate Evaluation
@@ -163,14 +172,20 @@ def local_search(
             original_room = item.room_id
             original_timeslot = item.timeslot_id
 
-            # Pre-fetch viable rooms once per item
+            # Pre-fetch viable rooms once per item, then sample a bounded
+            # neighborhood instead of scanning every room x timeslot pair
             viable_rooms = get_viable_rooms_for_schedule_item(item, rooms)
-            random.shuffle(viable_rooms)
+            room_sample = random.sample(
+                viable_rooms, min(NEIGHBORHOOD_ROOM_SAMPLE, len(viable_rooms))
+            )
+            timeslot_sample = random.sample(
+                timeslot_list, min(NEIGHBORHOOD_TIMESLOT_SAMPLE, len(timeslot_list))
+            )
 
             found = False
 
-            for room in viable_rooms:
-                for timeslot in timeslot_list:
+            for room in room_sample:
+                for timeslot in timeslot_sample:
 
                     # Skip if same assignment
                     if room.id == original_room and timeslot.id == original_timeslot:
