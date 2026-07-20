@@ -37,6 +37,15 @@ NO_IMPROVE_LIMIT = 5  # NEW: stop early if no improvement
 NEIGHBORHOOD_ROOM_SAMPLE = 5
 NEIGHBORHOOD_TIMESLOT_SAMPLE = 5
 
+# choose_grasp_assignment must rank candidates to build the RCL, so unlike
+# genetic.py's first-match construction it can't early-exit on the first
+# feasible slot -- it was scanning the full room x timeslot cross product
+# for every section, every GRASP restart, every run. Sample a bounded
+# subset instead, and only fall back to the full scan if the sample turns
+# up nothing feasible (keeps hard-to-place sections correctly placeable).
+CONSTRUCTION_ROOM_SAMPLE = 15
+CONSTRUCTION_TIMESLOT_SAMPLE = 15
+
 
 # ============================================================
 # Candidate Evaluation
@@ -53,20 +62,12 @@ def score_candidate(section, room, timeslot):
 # ============================================================
 # Choose Assignment
 # ============================================================
-def choose_grasp_assignment(
-    section,
-    rooms,
-    timeslots,
-    occupied_instructors,
-    occupied_rooms,
-):
+def _scan_candidates(section, rooms, timeslots, occupied_instructors, occupied_rooms):
     candidates = []
-
-    instructor_id = section.instructor_id  # cache lookup
+    instructor_id = section.instructor_id
 
     for timeslot in timeslots:
 
-        # Check instructor conflict once per timeslot
         if (
             instructor_id is not None
             and (instructor_id, timeslot.id) in occupied_instructors
@@ -88,7 +89,38 @@ def choose_grasp_assignment(
                 continue
 
             score = score_candidate(section, room, timeslot)
-            candidates.append((score, room, timeslot))  # tuple faster than dict
+            candidates.append((score, room, timeslot))
+
+    return candidates
+
+
+def choose_grasp_assignment(
+    section,
+    rooms,
+    timeslots,
+    occupied_instructors,
+    occupied_rooms,
+):
+    room_sample = (
+        rooms if len(rooms) <= CONSTRUCTION_ROOM_SAMPLE
+        else random.sample(rooms, CONSTRUCTION_ROOM_SAMPLE)
+    )
+    timeslot_sample = (
+        timeslots if len(timeslots) <= CONSTRUCTION_TIMESLOT_SAMPLE
+        else random.sample(timeslots, CONSTRUCTION_TIMESLOT_SAMPLE)
+    )
+
+    candidates = _scan_candidates(
+        section, room_sample, timeslot_sample, occupied_instructors, occupied_rooms
+    )
+
+    if not candidates:
+        # Sampled subset had nothing feasible -- fall back to the full scan
+        # so a section doesn't go unscheduled just because sampling missed
+        # its only valid slot.
+        candidates = _scan_candidates(
+            section, rooms, timeslots, occupied_instructors, occupied_rooms
+        )
 
     if not candidates:
         return None, None
