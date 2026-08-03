@@ -26,7 +26,7 @@ from backend.Optimization.evaluation import (
 RCL_SIZE = 3
 MAX_ITERATIONS = 20
 LOCAL_SEARCH_ITERATIONS = 30
-NO_IMPROVE_LIMIT = 5  # NEW: stop early if no improvement
+NO_IMPROVE_LIMIT = 5  # stop early if no improvement
 
 # Local search tries this many (room, timeslot) candidates per item instead
 # of the full room x timeslot cross product. Each candidate costs a full
@@ -49,25 +49,80 @@ CONSTRUCTION_TIMESLOT_SAMPLE = 15
 
 # ============================================================
 # Candidate Evaluation
+# Scores capacity fit + room type + campus + department + timeslot
+# guideline match, so the RCL is ranked on all hard-constraint dimensions
+# instead of capacity alone -- still O(1) per candidate.
 # ============================================================
-def score_candidate(section, room, timeslot):
+def score_candidate(section, room, timeslot, valid_timeslot_cache=None):
     score = 0
+
     remaining_capacity = room.capacity - section.capacity
     if remaining_capacity >= 0:
-        score += 100 - remaining_capacity
-    score += 10
+        score += 100 - min(remaining_capacity, 50)
+    else:
+        score -= 200  # heavily penalize undersized rooms
+
+    required_room_type = get_required_room_type(section.course.type)
+    if required_room_type:
+        if room.type == required_room_type:
+            score += 80
+        else:
+            score -= 150
+
+    section_campus = get_section_campus(getattr(section, "no", None))
+    room_campus = get_building_campus(room.building)
+    if section_campus and room_campus:
+        if section_campus == room_campus:
+            score += 60
+        else:
+            score -= 100
+
+    if getattr(room, "dept_id", None):
+        course_dept = getattr(section.course, "dept", None)
+        if course_dept == room.dept_id:
+            score += 40
+        else:
+            score -= 30
+
+    if valid_timeslot_cache is not None:
+        course_id = getattr(section.course, "id", None)
+        section_no = getattr(section, "no", None)
+        valid_ids = valid_timeslot_cache.get((course_id, section_no), set())
+        if timeslot.id in valid_ids:
+            score += 50
+        else:
+            score -= 50
+
     return score
 
 
 # ============================================================
-# Choose Assignment
+# Section Ordering
+# Schedule hardest sections first (fewest room/timeslot options) so they
+# don't get stuck with whatever slots are left over once occupancy fills
+# up. Computed once per run (not per construction call) since the
+# room/timeslot viability of each section never changes across GRASP
+# iterations.
 # ============================================================
-def _scan_candidates(section, rooms, timeslots, occupied_instructors, occupied_rooms):
+def order_sections_by_difficulty(section_candidates):
+    return sorted(
+        section_candidates,
+        key=lambda e: len(e[1]) * len(e[2]),  # viable_rooms x valid_timeslots
+    )
+
+
+# ============================================================
+# Candidate Scan
+# ============================================================
+def _scan_candidates(
+    section, rooms, timeslots,
+    occupied_instructors, occupied_rooms,
+    valid_timeslot_cache=None,
+):
     candidates = []
     instructor_id = section.instructor_id
 
     for timeslot in timeslots:
-
         if (
             instructor_id is not None
             and (instructor_id, timeslot.id) in occupied_instructors
@@ -75,31 +130,32 @@ def _scan_candidates(section, rooms, timeslots, occupied_instructors, occupied_r
             continue
 
         for room in rooms:
-
             if (room.id, timeslot.id) in occupied_rooms:
                 continue
 
             if not passes_hard_constraints(
-                section,
-                room,
-                timeslot,
+                section, room, timeslot,
                 occupied_instructors=occupied_instructors,
                 occupied_rooms=occupied_rooms,
             ):
                 continue
 
-            score = score_candidate(section, room, timeslot)
+            score = score_candidate(
+                section, room, timeslot,
+                valid_timeslot_cache=valid_timeslot_cache,
+            )
             candidates.append((score, room, timeslot))
 
     return candidates
 
 
+# ============================================================
+# Choose Assignment
+# ============================================================
 def choose_grasp_assignment(
-    section,
-    rooms,
-    timeslots,
-    occupied_instructors,
-    occupied_rooms,
+    section, rooms, timeslots,
+    occupied_instructors, occupied_rooms,
+    valid_timeslot_cache=None,
 ):
     room_sample = (
         rooms if len(rooms) <= CONSTRUCTION_ROOM_SAMPLE
@@ -111,7 +167,9 @@ def choose_grasp_assignment(
     )
 
     candidates = _scan_candidates(
-        section, room_sample, timeslot_sample, occupied_instructors, occupied_rooms
+        section, room_sample, timeslot_sample,
+        occupied_instructors, occupied_rooms,
+        valid_timeslot_cache=valid_timeslot_cache,
     )
 
     if not candidates:
@@ -119,14 +177,15 @@ def choose_grasp_assignment(
         # so a section doesn't go unscheduled just because sampling missed
         # its only valid slot.
         candidates = _scan_candidates(
-            section, rooms, timeslots, occupied_instructors, occupied_rooms
+            section, rooms, timeslots,
+            occupied_instructors, occupied_rooms,
+            valid_timeslot_cache=valid_timeslot_cache,
         )
 
     if not candidates:
         return None, None
 
     candidates.sort(key=lambda x: x[0], reverse=True)
-
     rcl = candidates[: min(RCL_SIZE, len(candidates))]
     selected = random.choice(rcl)
 
@@ -135,8 +194,15 @@ def choose_grasp_assignment(
 
 # ============================================================
 # Construction Phase
+# section_candidates must already be ordered (see order_sections_by_
+# difficulty) -- ordering is done once by the caller and reused across
+# every GRASP iteration/run instead of re-sorting on every call.
 # ============================================================
-def construct_grasp_solution(sections, rooms, timeslots, section_candidates):
+def construct_grasp_solution(
+    sections, rooms, timeslots,
+    section_candidates,
+    valid_timeslot_cache=None,
+):
     schedule = []
     occupied_rooms = set()
     occupied_instructors = set()
@@ -144,11 +210,9 @@ def construct_grasp_solution(sections, rooms, timeslots, section_candidates):
     for section, viable_rooms, valid_ts in section_candidates:
 
         room, timeslot = choose_grasp_assignment(
-            section,
-            viable_rooms,
-            valid_ts,
-            occupied_instructors,
-            occupied_rooms,
+            section, viable_rooms, valid_ts,
+            occupied_instructors, occupied_rooms,
+            valid_timeslot_cache=valid_timeslot_cache,
         )
 
         item = ScheduleItem(
@@ -218,6 +282,13 @@ def _item_local_conflicts(item, room, timeslot_id, valid_timeslot_cache):
 # full recount, combined with the O(1) per-item check above. This makes
 # evaluating one candidate move O(1) instead of O(sections), which is what
 # was making runs take hours on real-sized datasets.
+#
+# Best-improvement: each item scans its full sampled neighborhood (still
+# bounded to NEIGHBORHOOD_ROOM_SAMPLE x NEIGHBORHOOD_TIMESLOT_SAMPLE
+# candidates -- same O(1) cost per item as before) and takes the best move
+# found instead of the first improving one, which gives noticeably better
+# converged fitness for the same per-candidate cost. Item order is
+# reshuffled every pass for diversity.
 # ============================================================
 def local_search(
     schedule,
@@ -259,15 +330,18 @@ def local_search(
             if it.instructor_id is not None:
                 instructor_occupancy[(it.instructor_id, it.timeslot_id)] += 1
 
-    # Pre-shuffle timeslots once per local search call
+    # Pre-shuffle timeslots once per pass
     timeslot_list = timeslots[:]
 
     for _ in range(LOCAL_SEARCH_ITERATIONS):
 
         improved = False
-        random.shuffle(timeslot_list)  # shuffle once per iteration, not per item
+        random.shuffle(timeslot_list)
 
-        for item in best_schedule:
+        item_order = list(best_schedule)
+        random.shuffle(item_order)
+
+        for item in item_order:
 
             if item.room_id is None or item.timeslot_id is None:
                 continue
@@ -292,12 +366,12 @@ def local_search(
                 timeslot_list, min(NEIGHBORHOOD_TIMESLOT_SAMPLE, len(timeslot_list))
             )
 
-            found = False
+            best_delta = 0
+            best_move = None
 
             for room in room_sample:
                 for timeslot in timeslot_sample:
 
-                    # Skip if same assignment
                     if room.id == original_room_id and timeslot.id == original_timeslot_id:
                         continue
 
@@ -328,33 +402,34 @@ def local_search(
                         if new_instr_count >= 1:
                             delta += 1
 
-                    new_total_conflicts = total_conflicts + delta
-                    new_fitness = fitness_from_conflicts(new_total_conflicts)
+                    if delta < best_delta:
+                        best_delta = delta
+                        best_move = (room, timeslot)
 
-                    if new_fitness > best_fitness:
-                        # Commit: update occupancy, move the item, update
-                        # the running totals. Nothing is mutated unless a
-                        # candidate is actually accepted, so there's no
-                        # restore-on-failure needed.
-                        room_occupancy[(original_room_id, original_timeslot_id)] -= 1
-                        room_occupancy[(room.id, timeslot.id)] += 1
-                        if item.instructor_id is not None:
-                            instructor_occupancy[
-                                (item.instructor_id, original_timeslot_id)
-                            ] -= 1
-                            instructor_occupancy[(item.instructor_id, timeslot.id)] += 1
+            if best_move is not None:
+                room, timeslot = best_move
+                new_total_conflicts = total_conflicts + best_delta
+                new_fitness = fitness_from_conflicts(new_total_conflicts)
 
-                        item.room_id = room.id
-                        item.timeslot_id = timeslot.id
+                if new_fitness > best_fitness:
+                    # Commit: update occupancy, move the item, update the
+                    # running totals. Nothing is mutated unless a candidate
+                    # is actually accepted, so there's no restore-on-
+                    # failure needed.
+                    room_occupancy[(original_room_id, original_timeslot_id)] -= 1
+                    room_occupancy[(room.id, timeslot.id)] += 1
+                    if item.instructor_id is not None:
+                        instructor_occupancy[
+                            (item.instructor_id, original_timeslot_id)
+                        ] -= 1
+                        instructor_occupancy[(item.instructor_id, timeslot.id)] += 1
 
-                        total_conflicts = new_total_conflicts
-                        best_fitness = new_fitness
-                        improved = True
-                        found = True
-                        break  # accept first improvement
+                    item.room_id = room.id
+                    item.timeslot_id = timeslot.id
 
-                if found:
-                    break
+                    total_conflicts = new_total_conflicts
+                    best_fitness = new_fitness
+                    improved = True
 
         if not improved:
             break  # early exit — no point continuing
@@ -370,25 +445,24 @@ def grasp_schedule(
     timeslots,
     rooms,
     valid_timeslot_cache=None,
-    section_candidates=None,  # NEW: pass in precomputed candidates
+    section_candidates=None,  # pass in precomputed, pre-ordered candidates
 ):
     if valid_timeslot_cache is None:
         valid_timeslot_cache = build_timeslot_guideline_cache(sections, timeslots)
 
-    # Precompute once and reuse across all iterations
     if section_candidates is None:
-        section_candidates = [
+        section_candidates = order_sections_by_difficulty([
             (
                 section,
                 get_viable_rooms(section, rooms),
                 get_valid_timeslots(section, timeslots),
             )
             for section in sections
-        ]
+        ])
 
     best_schedule = None
     best_fitness = -1
-    no_improve_count = 0  # NEW: early stopping counter
+    no_improve_count = 0
 
     for _ in range(MAX_ITERATIONS):
 
@@ -396,7 +470,8 @@ def grasp_schedule(
             sections,
             rooms,
             timeslots,
-            section_candidates,  # reuse precomputed candidates
+            section_candidates,  # reuse precomputed, pre-ordered candidates
+            valid_timeslot_cache=valid_timeslot_cache,
         )
 
         schedule, fitness = local_search(  # fitness returned, not recomputed
@@ -414,7 +489,6 @@ def grasp_schedule(
         else:
             no_improve_count += 1
 
-        # NEW: early stopping
         if no_improve_count >= NO_IMPROVE_LIMIT:
             break
 
@@ -440,15 +514,17 @@ def grasp_runs(sections, timeslots, rooms, num_runs=30):
     # Build cache ONCE for all runs
     valid_timeslot_cache = build_timeslot_guideline_cache(sections, timeslots)
 
-    # Precompute section candidates ONCE for all runs
-    section_candidates = [
+    # Precompute section candidates ONCE for all runs, ordered hardest
+    # (fewest viable rooms/timeslots) first so they aren't left with
+    # whatever slots remain once occupancy fills up.
+    section_candidates = order_sections_by_difficulty([
         (
             section,
             get_viable_rooms(section, rooms),
             get_valid_timeslots(section, timeslots),
         )
         for section in sections
-    ]
+    ])
 
     for run in range(num_runs):
 
