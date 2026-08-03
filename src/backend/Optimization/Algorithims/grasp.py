@@ -114,7 +114,7 @@ def order_sections_by_difficulty(section_candidates):
 # ============================================================
 # Candidate Scan
 # ============================================================
-def _scan_candidates(
+def scan_candidates(
     section, rooms, timeslots,
     occupied_instructors, occupied_rooms,
     valid_timeslot_cache=None,
@@ -166,7 +166,7 @@ def choose_grasp_assignment(
         else random.sample(timeslots, CONSTRUCTION_TIMESLOT_SAMPLE)
     )
 
-    candidates = _scan_candidates(
+    candidates = scan_candidates(
         section, room_sample, timeslot_sample,
         occupied_instructors, occupied_rooms,
         valid_timeslot_cache=valid_timeslot_cache,
@@ -176,7 +176,7 @@ def choose_grasp_assignment(
         # Sampled subset had nothing feasible -- fall back to the full scan
         # so a section doesn't go unscheduled just because sampling missed
         # its only valid slot.
-        candidates = _scan_candidates(
+        candidates = scan_candidates(
             section, rooms, timeslots,
             occupied_instructors, occupied_rooms,
             valid_timeslot_cache=valid_timeslot_cache,
