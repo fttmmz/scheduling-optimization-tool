@@ -762,12 +762,35 @@ def check_all(schedule: list, data: dict) -> bool:
 # 8. HELPER FUNCTIONS FOR GENETIC ALGORITHM
 
 def get_viable_rooms(section, rooms):
-    """Return rooms that satisfy the section's static constraints."""
-    return [
+    """
+    Return rooms that satisfy the section's static constraints.
+
+    Falls back to allowing department-locked rooms outside the section's
+    own department if -- and only if -- the section's own department has
+    no viable room at all (room type/capacity/campus all still apply).
+    Confirmed as acceptable scheduling policy: a section with no room in
+    its own department should borrow another department's room rather
+    than go unscheduled, but department is still preferred by default
+    (see score_candidate()'s department scoring in grasp.py/pso.py) --
+    this only kicks in as a last resort, same bounded-then-fallback
+    pattern used everywhere else in this codebase (e.g. GRASP's
+    CONSTRUCTION_ROOM_SAMPLE, PSO's rescue_unscheduled).
+    """
+    own_department = [
         room
         for room in rooms
         if is_room_type_match(section, room)
         and is_department_match(section, room)
+        and is_capacity_ok(section, room)
+        and is_campus_match(section, room)
+    ]
+    if own_department:
+        return own_department
+
+    return [
+        room
+        for room in rooms
+        if is_room_type_match(section, room)
         and is_capacity_ok(section, room)
         and is_campus_match(section, room)
     ]
