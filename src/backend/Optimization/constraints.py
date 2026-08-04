@@ -428,15 +428,25 @@ def get_section_campus(section_no) -> str:
 
 
 def get_building_campus(building) -> str:
-    """Derive campus from building code (e.g. 'M3', 'W8')."""
+    """
+    Derive campus from building code (e.g. 'M3', 'W8').
+
+    Annex buildings (e.g. 'M3A', 'W7A') follow the same numbering as their
+    base building and belong to the same campus, so the trailing letter
+    suffix is stripped before parsing -- without this, int("3A") raised
+    ValueError and silently misrouted every annex building into the
+    MEDICAL fallback below, even though they're regular MEN/WOMEN/MAIN
+    buildings.
+    """
     if not isinstance(building, str):
         return "MEDICAL"
 
     building = building.upper()
+    numeric_part = re.sub(r"[A-Za-z]+$", "", building[1:])
 
     if building.startswith("M"):
         try:
-            num = int(building[1:])
+            num = int(numeric_part)
         except ValueError:
             return "MEDICAL"
         if 1 <= num <= 6:
@@ -446,7 +456,7 @@ def get_building_campus(building) -> str:
 
     elif building.startswith("W"):
         try:
-            num = int(building[1:])
+            num = int(numeric_part)
         except ValueError:
             return "MEDICAL"
         if 1 <= num <= 6:
@@ -454,6 +464,9 @@ def get_building_campus(building) -> str:
         if 7 <= num <= 12:
             return "MAIN"
 
+    # Building numbers above 12 (e.g. 'M23', 'M31') are a genuine separate
+    # medical campus at this university, confirmed against real data --
+    # this is an intentional 4th campus identity, not an accidental catch-all.
     return "MEDICAL"
 
 
