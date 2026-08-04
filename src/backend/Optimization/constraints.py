@@ -141,31 +141,57 @@ def _is_intensive_english(section) -> bool:
     return "intensive english" in name.lower()
 
 
+def _parse_time_to_minutes(value):
+    """
+    Convert a time value to minutes-since-midnight. Accepts a
+    datetime.time-like object (.hour/.minute) or a string in "HH:MM[:SS]"
+    format -- Timeslot.start/.end (models.py) are loaded straight from
+    Supabase as "HH:MM:SS" strings, not datetime.time objects. Returns
+    None if the value is missing or unparseable.
+    """
+    if value is None:
+        return None
+    if hasattr(value, "hour") and hasattr(value, "minute"):
+        return value.hour * 60 + value.minute
+    try:
+        parts = str(value).split(":")
+        return int(parts[0]) * 60 + int(parts[1])
+    except (ValueError, IndexError):
+        return None
+
+
 def _timeslot_duration(ts) -> int:
     """
-    Return the duration of a timeslot in minutes.
-    Assumes timeslot objects expose .start_time and .end_time as
-    datetime.time (or anything with .hour / .minute).
-    Falls back to 0 if attributes are missing.
+    Return the duration of a timeslot in minutes. Falls back to 0 if
+    start/end are missing or unparseable.
+
+    Previously looked for ts.start_time/.end_time (the actual attributes
+    are ts.start/.end -- see Timeslot in models.py) and assumed
+    datetime.time objects, when they're actually "HH:MM:SS" strings. Both
+    mismatches independently guaranteed an AttributeError on every real
+    timeslot, so this always returned 0 -- meaning every duration-based
+    rule below (lecture=75min, lab=170min, etc.) silently never matched
+    and every course type fell through to its day-only fallback,
+    regardless of the timeslot's actual length.
     """
-    try:
-        start = ts.start_time.hour * 60 + ts.start_time.minute
-        end   = ts.end_time.hour   * 60 + ts.end_time.minute
-        return max(0, end - start)
-    except AttributeError:
+    start = _parse_time_to_minutes(getattr(ts, "start", None))
+    end = _parse_time_to_minutes(getattr(ts, "end", None))
+    if start is None or end is None:
         return 0
+    return max(0, end - start)
 
 
 def _is_later_in_day(ts, cutoff_hour: int = 15) -> bool:
     """
     Return True if the timeslot starts at or after cutoff_hour (24-h clock).
     Used to push low-priority sections (Office Hours, Project, …) later.
-    Default cutoff: 15:00 (3 PM).
+    Default cutoff: 15:00 (3 PM). Same start_time/.start mismatch as
+    _timeslot_duration() above -- fixed the same way.
     """
-    try:
-        return ts.start_time.hour >= cutoff_hour
-    except AttributeError:
+    start = _parse_time_to_minutes(getattr(ts, "start", None))
+    if start is None:
         return False
+    return start >= cutoff_hour * 60
 
 
 def _days_apart(day_a: str, day_b: str) -> int:
