@@ -140,6 +140,8 @@ def load_schedule(schedule_id):
             room_id=row["room_id"],
             timeslot_id=row["timeslot_id"],
             section=row["section"],
+            level=course.get("level"),
+            course_class=course.get("course_class"),
         )
         schedule_items.append(item)
 

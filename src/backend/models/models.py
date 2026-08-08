@@ -1,11 +1,17 @@
 # models.py
 
 class Course:
-    def __init__(self, id, name, type, dept_id):
+    def __init__(self, id, name, type, dept_id, level=None, course_class=None):
         self.id = id
         self.name = name
         self.type = type
         self.dept = dept_id
+        # level ('Undergraduate' / 'Master' / 'Doctorate' / ...) and course_class
+        # ('UG Year 1', 'Postgraduate', ...) are needed by classify_section:
+        # the same course_type (e.g. 'Laboratory') needs a room at undergrad
+        # level but not at grad level. Optional so older callers still work.
+        self.level = level
+        self.course_class = course_class
 
 
 class Room:
@@ -32,6 +38,8 @@ class Section:
             name=data["courses"]["name"],
             type=data["courses"]["course_type"],
             dept_id=data["courses"]["dept_id"],
+            level=data["courses"].get("level"),
+            course_class=data["courses"].get("course_class"),
         )
         self.instructor_id = data["instructor_id"]
         self.no = data["section"]
@@ -58,6 +66,8 @@ class ScheduleItem:
         room_id,
         timeslot_id,
         section,
+        level=None,
+        course_class=None,
     ):
         self.course_id = course_id
         self.course_name = course_name
@@ -68,6 +78,11 @@ class ScheduleItem:
         self.room_id = room_id
         self.timeslot_id = timeslot_id
         self.section = section
+        # Optional: carried so item-level classification (hybrid.py) can be
+        # level-aware, same reason as Course.level above. Defaults to None so
+        # existing ScheduleItem(...) call sites in the algorithms still work.
+        self.level = level
+        self.course_class = course_class
 
     def __repr__(self):
         return (
