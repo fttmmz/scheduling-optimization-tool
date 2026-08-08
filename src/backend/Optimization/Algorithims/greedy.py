@@ -104,10 +104,34 @@ def greedy_schedule(sections, timeslots, rooms):
             schedule.append(make_item(None, None))
             continue
 
+        # NEEDS_TIME_ONLY — needs a timeslot but no room (studios, graduate
+        # labs, office hours, training, ...). Pick the first valid slot that
+        # doesn't double-book the instructor (or a same-instructor neighbour).
+        if classification == "NEEDS_TIME_ONLY":
+            blocked_by_neighbors = {
+                assigned_timeslots[nei]
+                for nei in G.neighbors(node_id)
+                if nei in assigned_timeslots
+            }
+            chosen_ts = None
+            for timeslot in get_valid_timeslots(section, timeslots):
+                ts_id = timeslot.id
+                if instructor_id and (instructor_id, ts_id) in occupied_instructors:
+                    continue
+                if ts_id in blocked_by_neighbors:
+                    continue
+                chosen_ts = ts_id
+                if instructor_id:
+                    occupied_instructors.add((instructor_id, ts_id))
+                assigned_timeslots[node_id] = ts_id
+                break
+            schedule.append(make_item(None, chosen_ts))
+            continue
+
         room_type = get_required_room_type(course_type) or "classroom"
         viable = cached_viable_rooms(room_type, course_dept, section_campus)
 
-        # NEEDS_ROOM_ONLY 
+        # NEEDS_ROOM_ONLY
         if classification == "NEEDS_ROOM_ONLY":
             assigned_room = next(
                 (r for r in viable if r.capacity >= capacity_needed), None

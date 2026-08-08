@@ -5,7 +5,10 @@ from collections import defaultdict
 from backend.Optimization.constraints import (
     NEEDS_NOTHING,
     NEEDS_ROOM_ONLY,
+    NEEDS_TIME_ONLY,
     classify_section,
+    needs_for,
+    needs_to_label,
     get_valid_timeslots,
     get_viable_rooms,
     passes_hard_constraints,
@@ -76,6 +79,11 @@ def clone_item(item):
         room_id=item.room_id,
         timeslot_id=item.timeslot_id,
         section=item.section,
+        # level/course_class must survive cloning: _item_requirement reads
+        # item.level, so dropping it here would silently mis-classify every
+        # cloned schedule (and hybrid clones constantly).
+        level=getattr(item, "level", None),
+        course_class=getattr(item, "course_class", None),
     )
 
 
@@ -97,17 +105,16 @@ def _new_schedule(sections):
             room_id=None,
             timeslot_id=None,
             section=section.no,
+            level=getattr(section.course, "level", None),
+            course_class=getattr(section.course, "course_class", None),
         )
         for section in sections
     ]
 
 
 def _item_requirement(item):
-    if item.course_type in NEEDS_NOTHING:
-        return "NEEDS_NOTHING"
-    if item.course_type in NEEDS_ROOM_ONLY:
-        return "NEEDS_ROOM_ONLY"
-    return "NEEDS_ROOM_AND_TIME"
+    # Level-aware, mined classification (matches constraints.classify_section).
+    return needs_to_label(needs_for(item.course_type, getattr(item, "level", None)))
 
 
 def _is_scheduled(item):
@@ -116,6 +123,8 @@ def _is_scheduled(item):
         return True
     if requirement == "NEEDS_ROOM_ONLY":
         return item.room_id is not None
+    if requirement == "NEEDS_TIME_ONLY":
+        return item.timeslot_id is not None
     return item.room_id is not None and item.timeslot_id is not None
 
 
@@ -141,6 +150,9 @@ def build_option_cache(sections, rooms, timeslots):
         elif requirement == "NEEDS_ROOM_ONLY":
             viable_rooms = list(get_viable_rooms(section, rooms))
             valid_timeslots = []
+        elif requirement == "NEEDS_TIME_ONLY":
+            viable_rooms = []
+            valid_timeslots = list(get_valid_timeslots(section, timeslots))
         else:
             viable_rooms = list(get_viable_rooms(section, rooms))
             valid_timeslots = list(get_valid_timeslots(section, timeslots))
@@ -164,6 +176,8 @@ def _domain_size(idx, option_cache):
         return 0
     if requirement == "NEEDS_ROOM_ONLY":
         return len(option_cache[idx]["rooms"])
+    if requirement == "NEEDS_TIME_ONLY":
+        return len(option_cache[idx]["timeslots"])
     return len(option_cache[idx]["rooms"]) * len(option_cache[idx]["timeslots"])
 
 
@@ -175,27 +189,33 @@ def _build_occupancy(schedule):
     instructor_counts = defaultdict(int)
 
     for schedule_item in schedule:
-        # Room-only activities have no timeslot and therefore do not create
-        # a room-time or instructor-time collision.
-        if schedule_item.room_id is None or schedule_item.timeslot_id is None:
+        # A timeslot with no room (time-only sections: studios, grad labs,
+        # office hours...) still consumes the instructor's time, so it must
+        # count toward instructor conflicts even though it holds no room.
+        # Room-only activities have no timeslot and create no collision.
+        timeslot_id = schedule_item.timeslot_id
+        if timeslot_id is None:
             continue
 
-        room_counts[(schedule_item.room_id, schedule_item.timeslot_id)] += 1
+        if schedule_item.room_id is not None:
+            room_counts[(schedule_item.room_id, timeslot_id)] += 1
         if schedule_item.instructor_id is not None:
-            instructor_counts[(schedule_item.instructor_id, schedule_item.timeslot_id)] += 1
+            instructor_counts[(schedule_item.instructor_id, timeslot_id)] += 1
 
     return room_counts, instructor_counts
 
 
 def _remove_assignment(schedule_item, room_counts, instructor_counts):
-    if schedule_item.room_id is not None and schedule_item.timeslot_id is not None:
-        room_key = (schedule_item.room_id, schedule_item.timeslot_id)
-        room_counts[room_key] -= 1
-        if room_counts[room_key] <= 0:
-            del room_counts[room_key]
+    timeslot_id = schedule_item.timeslot_id
+    if timeslot_id is not None:
+        if schedule_item.room_id is not None:
+            room_key = (schedule_item.room_id, timeslot_id)
+            room_counts[room_key] -= 1
+            if room_counts[room_key] <= 0:
+                del room_counts[room_key]
 
         if schedule_item.instructor_id is not None:
-            instructor_key = (schedule_item.instructor_id, schedule_item.timeslot_id)
+            instructor_key = (schedule_item.instructor_id, timeslot_id)
             instructor_counts[instructor_key] -= 1
             if instructor_counts[instructor_key] <= 0:
                 del instructor_counts[instructor_key]
@@ -208,10 +228,11 @@ def _add_assignment(schedule_item, room_id, timeslot_id, room_counts, instructor
     schedule_item.room_id = room_id
     schedule_item.timeslot_id = timeslot_id
 
-    if room_id is None or timeslot_id is None:
+    if timeslot_id is None:
         return
 
-    room_counts[(room_id, timeslot_id)] += 1
+    if room_id is not None:
+        room_counts[(room_id, timeslot_id)] += 1
     if schedule_item.instructor_id is not None:
         instructor_counts[(schedule_item.instructor_id, timeslot_id)] += 1
 
@@ -356,6 +377,20 @@ def _best_candidates(
     if requirement == "NEEDS_NOTHING":
         return [(0, None, None)]
 
+    if requirement == "NEEDS_TIME_ONLY":
+        # Needs a timeslot but no room; the only cost is instructor collision.
+        valid_timeslots = option_cache[idx]["timeslots"]
+        if not valid_timeslots:
+            return []
+        ranked = []
+        for timeslot in valid_timeslots:
+            cost = _placement_cost(
+                schedule_item, None, timeslot.id, room_counts, instructor_counts
+            )
+            ranked.append((cost, random.random(), timeslot))
+        ranked.sort(key=lambda value: (value[0], value[1]))
+        return [(cost, None, timeslot) for cost, _, timeslot in ranked[:top_k]]
+
     viable_rooms = option_cache[idx]["rooms"]
     if not viable_rooms:
         return []
@@ -442,13 +477,17 @@ def _construct_once(sections, option_cache, static_memo):
         chosen = random.choice(zero_cost if zero_cost else candidates[:3])
         _, room, timeslot = chosen
 
-        if room is None:
+        room_id = room.id if room is not None else None
+        timeslot_id = timeslot.id if timeslot is not None else None
+        # Skip only if there is genuinely nothing to place; a time-only
+        # section has room_id=None but a real timeslot_id and must be applied.
+        if room_id is None and timeslot_id is None:
             continue
 
         _add_assignment(
             schedule[idx],
-            room.id,
-            timeslot.id if timeslot is not None else None,
+            room_id,
+            timeslot_id,
             room_counts,
             instructor_counts,
         )
@@ -579,13 +618,15 @@ def _rebuild_neighborhood(
         ]
         _, room, timeslot = random.choice(near_best)
 
-        if room is None:
+        room_id = room.id if room is not None else None
+        timeslot_id = timeslot.id if timeslot is not None else None
+        if room_id is None and timeslot_id is None:
             continue
 
         _add_assignment(
             schedule[idx],
-            room.id,
-            timeslot.id if timeslot is not None else None,
+            room_id,
+            timeslot_id,
             room_counts,
             instructor_counts,
         )
@@ -697,11 +738,13 @@ def _min_conflicts(schedule, sections, option_cache, static_memo):
             ]
             _, room, timeslot = random.choice(best_local)
 
-        if room is not None:
+        room_id = room.id if room is not None else None
+        timeslot_id = timeslot.id if timeslot is not None else None
+        if room_id is not None or timeslot_id is not None:
             _add_assignment(
                 schedule_item,
-                room.id,
-                timeslot.id if timeslot is not None else None,
+                room_id,
+                timeslot_id,
                 room_counts,
                 instructor_counts,
             )
