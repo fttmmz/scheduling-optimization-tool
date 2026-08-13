@@ -81,7 +81,30 @@ import statistics
 import numpy as np
 
 from backend.models.models import ScheduleItem
-from backend.Optimization.constraints import get_valid_timeslots, get_viable_rooms
+from backend.Optimization.constraints import (
+    get_valid_timeslots,
+    get_viable_rooms,
+    section_needs,
+)
+
+
+def build_section_candidates(sections, rooms, timeslots):
+    """(section, needs, viable_rooms, valid_timeslots) per section.
+
+    Candidates are only generated along the axes a section actually uses, so
+    thesis/supervision sections no longer consume rooms and roomless studio and
+    graduate-lab sections stop competing for them.
+    """
+    candidates = []
+    for section in sections:
+        needs = section_needs(section)
+        candidates.append((
+            section,
+            needs,
+            get_viable_rooms(section, rooms) if needs.room else [],
+            get_valid_timeslots(section, timeslots) if needs.time else [],
+        ))
+    return candidates
 from backend.Optimization.evaluation import (
     calculate_fitness,
     build_timeslot_guideline_cache,
@@ -211,13 +234,30 @@ def decode(position, section_candidates, valid_timeslot_cache):
     occupied_instructors = set()
 
     for idx in order:
-        section, viable_rooms, valid_ts = section_candidates[idx]
+        section, needs, viable_rooms, valid_ts = section_candidates[idx]
 
-        room, timeslot = choose_best_assignment(
-            section, viable_rooms, valid_ts,
-            occupied_instructors, occupied_rooms,
-            valid_timeslot_cache=valid_timeslot_cache,
-        )
+        if not needs.room and not needs.time:
+            room = timeslot = None
+        elif not needs.room:
+            # Time only: first slot that leaves the instructor free.
+            room = None
+            timeslot = next(
+                (
+                    ts for ts in valid_ts
+                    if section.instructor_id is None
+                    or (section.instructor_id, ts.id) not in occupied_instructors
+                ),
+                valid_ts[0] if valid_ts else None,
+            )
+        elif not needs.time:
+            room = viable_rooms[0] if viable_rooms else None
+            timeslot = None
+        else:
+            room, timeslot = choose_best_assignment(
+                section, viable_rooms, valid_ts,
+                occupied_instructors, occupied_rooms,
+                valid_timeslot_cache=valid_timeslot_cache,
+            )
 
         item = ScheduleItem(
             course_id=section.course.id,
@@ -229,11 +269,17 @@ def decode(position, section_candidates, valid_timeslot_cache):
             room_id=room.id if room else None,
             timeslot_id=timeslot.id if timeslot else None,
             section=str(section.no),
+            # Classification is keyed on level -- without it a detached item
+            # looks like an ordinary room+time lecture.
+            level=getattr(section.course, "level", None),
+            course_class=getattr(section.course, "course_class", None),
         )
         schedule[idx] = item
 
-        if room is not None and timeslot is not None:
-            occupied_rooms.add((room.id, timeslot.id))
+        # A roomless section still occupies its instructor's time.
+        if timeslot is not None:
+            if room is not None:
+                occupied_rooms.add((room.id, timeslot.id))
             if section.instructor_id is not None:
                 occupied_instructors.add((section.instructor_id, timeslot.id))
 
@@ -305,14 +351,26 @@ def rescue_unscheduled(schedule, section_candidates, valid_timeslot_cache):
         _build_occupancy_maps(schedule)
     )
 
-    unscheduled = [
-        idx for idx, item in enumerate(schedule)
-        if item.room_id is None or item.timeslot_id is None
-    ]
+    # "Unscheduled" is relative to what the section needs: a time-only section
+    # with no room is correctly placed, not a gap to be filled. Treating a
+    # missing room as unscheduled regardless would drag roomless sections back
+    # into the room competition this rescue exists to relieve.
+    unscheduled = []
+    for idx, item in enumerate(schedule):
+        needs = section_candidates[idx][1]
+        if needs.room and item.room_id is None:
+            unscheduled.append(idx)
+        elif needs.time and item.timeslot_id is None:
+            unscheduled.append(idx)
 
     for idx in unscheduled:
         item = schedule[idx]
-        section, viable_rooms, valid_ts = section_candidates[idx]
+        section, needs, viable_rooms, valid_ts = section_candidates[idx]
+
+        # The ejection chain trades (room, timeslot) pairs, so it only applies
+        # to sections that need both.
+        if not (needs.room and needs.time):
+            continue
 
         # Ignore current occupancy here -- we want statically feasible
         # slots so we can identify who (if anyone) is blocking them.
@@ -349,7 +407,9 @@ def rescue_unscheduled(schedule, section_candidates, valid_timeslot_cache):
                 continue
 
             blocker = schedule[blocker_idx]
-            b_section, b_rooms, b_ts = section_candidates[blocker_idx]
+            b_section, b_needs, b_rooms, b_ts = section_candidates[blocker_idx]
+            if not (b_needs.room and b_needs.time):
+                continue  # can't relocate a blocker that doesn't use both axes
 
             trial_rooms = occupied_rooms - {(blocker.room_id, blocker.timeslot_id)}
             trial_instructors = occupied_instructors
@@ -410,10 +470,7 @@ def pso_schedule(sections, timeslots, rooms, valid_timeslot_cache=None, section_
         valid_timeslot_cache = build_timeslot_guideline_cache(sections, timeslots)
 
     if section_candidates is None:
-        section_candidates = [
-            (section, get_viable_rooms(section, rooms), get_valid_timeslots(section, timeslots))
-            for section in sections
-        ]
+        section_candidates = build_section_candidates(sections, rooms, timeslots)
 
     n = len(sections)
     rng = np.random.default_rng(seed)
@@ -478,10 +535,7 @@ def pso_runs(sections, timeslots, rooms, num_runs=30):
     print(f"Total sections: {len(sections)}, rooms: {len(rooms)}, timeslots: {len(timeslots)}")
 
     valid_timeslot_cache = build_timeslot_guideline_cache(sections, timeslots)
-    section_candidates = [
-        (section, get_viable_rooms(section, rooms), get_valid_timeslots(section, timeslots))
-        for section in sections
-    ]
+    section_candidates = build_section_candidates(sections, rooms, timeslots)
 
     for run in range(num_runs):
         best_schedule, score = pso_schedule(
