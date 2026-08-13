@@ -110,6 +110,105 @@ def classify_section(section) -> str:
     return needs_to_label(section_needs(section))
 
 
+# 1b. COMBINED / CROSS-LISTED COURSE GROUPS
+#
+# Some courses are deliberately taught as ONE class under several course codes
+# (cross-listing, or a lecture and its lab registered separately). They share a
+# room and a timeslot on purpose, so counting them as a double-booking is wrong:
+# they are the reason the real manual schedule appears to contain 30 room
+# collisions despite being in active use.
+#
+# There is NO flag for this in the data -- it has to be inferred. Mined from
+# schedule_id=10 on 2026-08-13: distinct courses co-located in the same room at
+# the same timeslot, and corroborated by a shared instructor or a near-identical
+# course name. Co-location ALONE is deliberately not enough, because that rule
+# would be circular -- it would excuse any double-booking our own algorithms
+# produced, and quietly destroy the hard tier.
+#
+# One entry (405311/405312) is NOT co-located: the pair sits in two different
+# rooms at the same 75-minute slot with the same instructor and near-identical
+# names, i.e. one class whose room record disagrees with itself. The already
+# co-located Ergonomics pair (405341/405342) shows exactly the same split on
+# other days, which is what makes this reading safe rather than a guess.
+#
+# Deliberately NOT included: thesis, internship, senior-project and clinical
+# "Advanced EP" placements. One supervisor legitimately covers many of those at
+# one nominal time, so they look combined but are not one class -- they are
+# supervision, and they are handled by classification (NEEDS_TIME_ONLY /
+# NEEDS_NOTHING) plus the zero-span placeholder rule below, not by grouping.
+COMBINED_COURSE_GROUPS = [
+    frozenset((401314, 401315)),    # Reinforced Concrete Design 1 (x2)
+    frozenset((401701, 401706)),    # Directed Studies in CE (x2)
+    frozenset((405103, 405105)),    # Introduction to IE&EM / Introduction to IEEM
+    frozenset((405311, 405312)),    # Operations Research-1 / Operations Research I
+
+    frozenset((405341, 405342)),    # Erg. Work & Process Improvt. / Fundamentals of Ergonomics
+    frozenset((500105, 500150)),    # Biology Laboratory / Biology
+    frozenset((602531, 602560)),    # Public Int. Law (E)(In-depth) / Public International Law (E)
+    frozenset((1102113, 1102230)),  # Pathophysiology 1 / Pathophysiology
+    frozenset((1103221, 1103599)),  # Cosmetics & Para-pharm. / Cosmetics & Parapharmaceutical
+    frozenset((1103411, 1103470)),  # Pharmaceutics II A / Biopharmaceutics & Pharmacokin.
+    frozenset((1103511, 1103590)),  # Pharmaceutics3 / Drug Delivery Systems
+    frozenset((1104359, 1104452)),  # Self Care & OTC Therapy / Principle of OTC Therapy
+    frozenset((1104453, 1104479)),  # Law and Ethics / Pharmacy Ethics and Law
+    frozenset((1426106, 1426155)),  # General Chemistry Lab for HS / General Chemistry for HS
+    frozenset((1426216, 1426217)),  # Organic Chemistry Lab for HS / Organic Chemistry for HS
+    frozenset((1502230, 1502231, 1502232)),  # Micro. & Assembly Language (+ Lab)
+    frozenset((1502334, 1502336)),  # Embedded Systems Design / Microcontroller Based Design
+]
+
+# Co-located course pairs that could NOT be corroborated and are therefore still
+# counted as real conflicts. Recorded for transparency, not used by any rule.
+# Most are same-department graduate clusters whose instructor field is simply
+# empty, so they are probably combined too -- but "probably" is not evidence,
+# and a loose rule here would let our own algorithms hide double-bookings.
+# Resolving these needs a source outside the schedule table (a catalog or
+# registrar export), so the oracle keeps ~11 unexplained collisions until then.
+UNCORROBORATED_COLOCATIONS = [
+    frozenset((306620, 306622)),    # Leadership and Org. Behavior / International Business
+    frozenset((203221, 203330)),    # History of the Umayyad State / Islamic Civilization(2)
+    frozenset((402202, 402240)),    # Circuit Analysis I / Signals and Systems
+    frozenset((404513, 404514, 404516)),  # Cultural Heritage graduate cluster
+    frozenset((405102, 405262)),    # Engineering Graphics / Database Mang. & Ind. Inf. Systems
+    frozenset((807511, 807513, 807515)),  # Digital Media graduate cluster
+    frozenset((1502461, 1502463)),  # S. T. in Cyber Security / Special Topics in SCA
+]
+
+
+def _build_combined_index():
+    """course_id -> group key, for the whitelisted combined groups."""
+    index = {}
+    for group in COMBINED_COURSE_GROUPS:
+        key = min(group)  # stable, readable representative
+        for course_id in group:
+            index[course_id] = key
+    return index
+
+
+COMBINED_COURSE_INDEX = _build_combined_index()
+
+
+def combined_group_key(course_id):
+    """Return the shared key for a cross-listed course, else None.
+
+    Two sections whose courses return the same non-None key are the same class
+    taught once, so they may share a room and a timeslot without conflict.
+    """
+    return COMBINED_COURSE_INDEX.get(course_id)
+
+
+def occupancy_key(course_id, section_no):
+    """Identity of the *class* occupying a room/instructor slot.
+
+    Cross-listed courses collapse onto one key so their shared booking counts
+    once; everything else stays distinct per (course, section).
+    """
+    group = COMBINED_COURSE_INDEX.get(course_id)
+    if group is not None:
+        return ("combined", group)
+    return ("section", course_id, str(section_no))
+
+
 # 2. COURSE-TYPE → ROOM-TYPE MAPPING
 
 COURSE_TYPE_TO_ROOM_TYPE = {
@@ -238,6 +337,25 @@ def _timeslot_duration(ts) -> int:
     if start is None or end is None:
         return 0
     return max(0, end - start)
+
+
+def is_placeholder_timeslot(ts) -> bool:
+    """True for rows that encode "no real meeting time" rather than a slot.
+
+    Two encodings exist in this dataset:
+      * day IS NULL            -- timeslot_id=1, the TBA bucket (already
+                                  filtered out by loader.load_timeslots)
+      * start == end           -- 13 zero-duration slots
+
+    The zero-duration ones are not a modelling guess: across the whole manual
+    schedule they carry 50 rows and NOT ONE of them has a room. They hold
+    supervision-style activities (Prof. Exp. placements, thesis), where several
+    sections share the same nominal time under one instructor. Counting them as
+    real bookings invented instructor double-bookings that nobody experiences.
+    """
+    if getattr(ts, "day", None) is None:
+        return True
+    return _timeslot_duration(ts) <= 0
 
 
 def _is_later_in_day(ts, cutoff_hour: int = 15) -> bool:
