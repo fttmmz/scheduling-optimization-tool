@@ -53,7 +53,7 @@ def build_conflict_graph(sections):
 def greedy_schedule(sections, timeslots, rooms):
     
     G = build_conflict_graph(sections)
-    dept_typed, open_typed = _build_room_lookup(rooms)
+    dept_typed, open_typed, all_rooms = _build_room_lookup(rooms)
 
     
     occupied_rooms = set() 
@@ -66,11 +66,31 @@ def greedy_schedule(sections, timeslots, rooms):
             if key not in room_list_cache:
                 room_list_cache[key] = list(
                     _viable_rooms(
-                        dept_typed, open_typed, room_type, course_dept, section_campus
+                        dept_typed,
+                        open_typed,
+                        room_type,
+                        course_dept,
+                        section_campus,
+                        all_rooms=all_rooms,
                     )
                 )
             return room_list_cache[key]
 
+
+    def order_by_capacity(viable, capacity_needed):
+        """Rooms that seat the section first (in their existing best-fit order),
+        then the ones that overflow, least-overflow first.
+
+        Capacity used to be a hard skip, so a section larger than every room in
+        its department/campus/type bucket went unscheduled. Overbooking is
+        normal in the real schedule (11% of manual placements), so it is now
+        only a preference -- an overfull room beats no room.
+        """
+        fits, overflows = [], []
+        for room in viable:
+            (fits if room.capacity >= capacity_needed else overflows).append(room)
+        overflows.sort(key=lambda room: -room.capacity)
+        return fits + overflows
 
     schedule = []
     nodes_by_priority = sorted(G.nodes, key=lambda n: G.degree[n], reverse=True)
@@ -129,13 +149,14 @@ def greedy_schedule(sections, timeslots, rooms):
             continue
 
         room_type = get_required_room_type(course_type) or "classroom"
-        viable = cached_viable_rooms(room_type, course_dept, section_campus)
+        viable = order_by_capacity(
+            cached_viable_rooms(room_type, course_dept, section_campus),
+            capacity_needed,
+        )
 
         # NEEDS_ROOM_ONLY
         if classification == "NEEDS_ROOM_ONLY":
-            assigned_room = next(
-                (r for r in viable if r.capacity >= capacity_needed), None
-            )
+            assigned_room = viable[0] if viable else None
             schedule.append(
                 make_item(assigned_room.id if assigned_room else None, None)
             )
@@ -164,15 +185,14 @@ def greedy_schedule(sections, timeslots, rooms):
                 continue
 
             for room in viable:
-                # check room double-booked
+                # check room double-booked -- the only hard reason to skip a
+                # room. Capacity/type/dept/campus are soft and already reflected
+                # in the order of `viable`, so the first free room here is the
+                # best-fit one still available.
                 if (room.id, ts_id) in occupied_rooms:
                     continue
 
-                # capacity  per-section check
-                if room.capacity < capacity_needed:
-                    continue
-
-                # assignment 
+                # assignment
                 occupied_rooms.add((room.id, ts_id))
                 if instructor_id:
                     occupied_instructors.add((instructor_id, ts_id))

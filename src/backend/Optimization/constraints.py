@@ -616,7 +616,132 @@ def tag_section_links(all_sections: list) -> None:
         elif suffix.upper() in {"X", "Y"}:
             sec.lab_parent_id = parent_id
 
-# 6. HARD CONSTRAINT VALIDATORS  (item-level — used inside algorithm loops)
+# 6. CONSTRAINT TIERS
+#
+# THE HARD/SOFT SPLIT (2026-08-13). Validated against the real manual schedule
+# (schedule_id=10, 4698 sections, 0 unscheduled): that schedule is in active use,
+# yet it breaks the rules this module used to enforce as HARD —
+#
+#     campus 32%   department 31%   duration 27%   room_type 13%   capacity 11%
+#
+# Treating those as hard meant forbidding ~30% of the placements the university
+# actually makes, which is why the algorithms hit a ~502-unscheduled ceiling: not
+# a facility shortage and not algorithm weakness, but a model that outlawed the
+# real answer. So the tiers are now:
+#
+#   HARD  — physical impossibility only: a room or an instructor in two places at
+#           the same time. Never violated; still gates every placement.
+#   SOFT  — campus / department / room_type / capacity. Strongly preferred and
+#           priced into the objective, but NEVER a reason to leave a section
+#           unscheduled. An unscheduled class is worse than an imperfect room.
+#
+# Consequence for callers: get_viable_rooms() no longer filters, it RANKS. It
+# returns the cheapest rooms first and only drops candidates to bound the list
+# size, never because a soft rule was broken.
+
+# ── Soft-constraint weights ───────────────────────────────────────────────────
+# Penalty units, all relative to each other. Rationale (revisit in Phase 2 once
+# the fair evaluator separates our own measurement bugs from genuine manual
+# suboptimality — several of these rates are inflated by known data defects):
+#
+#   room_type  — a lab course in a plain classroom is a real teaching failure,
+#                so it is the most expensive. Held below "impossible" because
+#                room.type is a `"lab" in description` substring flatten that
+#                misfiles Design Studios as classrooms.
+#   campus     — MEN/WOMEN campus separation is institutionally real, so it is
+#                priced high. The 32% manual "violation" rate is largely our
+#                crude section-number→campus proxy being wrong, so it must not
+#                be cheap just because the proxy is noisy.
+#   capacity   — graded, not binary: 5 seats short is not 50 short. The manual
+#                schedule overbooks deliberately (planned enrolment exceeds the
+#                room), so a small overflow is nearly free.
+#   department — weakest. Dept-locked rooms are a courtesy, and 142/375 rooms
+#                have no dept_id at all.
+SOFT_WEIGHT_ROOM_TYPE = 4.0
+SOFT_WEIGHT_CAMPUS = 3.0
+SOFT_WEIGHT_DEPARTMENT = 1.0
+SOFT_WEIGHT_CAPACITY = 2.0          # flat cost of overflowing at all
+SOFT_WEIGHT_CAPACITY_OVERFLOW = 4.0  # extra, scaled by how badly it overflows
+
+# How many ranked rooms get_viable_rooms() returns when soft rules force it to
+# choose. Every zero-penalty room is always returned; this only bounds the
+# imperfect tail, so downstream random sampling (hybrid's _sample_pairs, GRASP's
+# construction sample) stays concentrated on good rooms instead of being diluted
+# by hundreds of bad ones.
+DEFAULT_ROOM_CANDIDATES = 25
+
+
+def _soft_profile(obj):
+    """Extract (course_type, dept, capacity, section_no) from either a Section
+    or a ScheduleItem, so one set of soft-penalty rules serves both paths.
+
+    The two used to drift: get_viable_rooms() scored campus and department while
+    get_viable_rooms_for_schedule_item() silently ignored both, so a section
+    could be rescued into a room the constructor would never have chosen.
+    """
+    course = getattr(obj, "course", None)
+    if course is not None:                      # Section
+        return course.type, course.dept, obj.capacity, obj.no
+    return obj.course_type, obj.course_dept, obj.capacity, obj.section  # ScheduleItem
+
+
+def capacity_penalty(needed, available) -> float:
+    """Graded capacity cost: free when the room fits, then a flat cost plus a
+    term proportional to the overflow fraction (capped at 1.0 so a wildly
+    undersized room is expensive but still finite/comparable)."""
+    if needed is None or available is None:
+        return 0.0
+    if available <= 0:
+        # Capacity 0 means "unknown", not "a room with no seats" -- it is a data
+        # gap. Charging the full overflow cost keeps such rooms usable as a last
+        # resort while stopping them from scoring as a perfect fit and
+        # outranking real rooms (a zero-capacity room otherwise sorts first).
+        return SOFT_WEIGHT_CAPACITY + SOFT_WEIGHT_CAPACITY_OVERFLOW
+    if available >= needed:
+        return 0.0
+    overflow_ratio = min(1.0, (needed - available) / available)
+    return SOFT_WEIGHT_CAPACITY + SOFT_WEIGHT_CAPACITY_OVERFLOW * overflow_ratio
+
+
+def room_soft_penalty_parts(obj, room) -> dict:
+    """Per-rule soft cost of putting *obj* (Section or ScheduleItem) in *room*.
+    Returned split out so the evaluator can report which rule was bent."""
+    course_type, course_dept, capacity, section_no = _soft_profile(obj)
+
+    required_type = get_required_room_type(course_type)
+    type_cost = (
+        SOFT_WEIGHT_ROOM_TYPE
+        if required_type is not None and room.type != required_type
+        else 0.0
+    )
+
+    # An unrestricted room (no dept_id) is open to everyone — no cost.
+    dept_cost = (
+        SOFT_WEIGHT_DEPARTMENT
+        if room.dept_id and room.dept_id != course_dept
+        else 0.0
+    )
+
+    campus_cost = (
+        SOFT_WEIGHT_CAMPUS
+        if get_section_campus(section_no) != get_building_campus(room.building)
+        else 0.0
+    )
+
+    return {
+        "room_type": type_cost,
+        "department": dept_cost,
+        "campus": campus_cost,
+        "capacity": capacity_penalty(capacity, room.capacity),
+    }
+
+
+def room_soft_penalty(obj, room) -> float:
+    """Total soft cost of this room for this section/item. 0.0 == perfect fit."""
+    return sum(room_soft_penalty_parts(obj, room).values())
+
+
+# ── HARD CONSTRAINT VALIDATORS  (item-level — used inside algorithm loops) ────
 # Each function returns True / False (violation).
 
 
@@ -658,11 +783,15 @@ def is_room_free_map(occupied_rooms: set, room_id, timeslot_id) -> bool:
     return (room_id, timeslot_id) not in occupied_rooms
 
 
+# ── SOFT predicates ───────────────────────────────────────────────────────────
+# These are the boolean form of the four soft rules priced by
+# room_soft_penalty(). They are NOT gates: nothing may refuse a placement on
+# their say-so. They survive because the evaluator and the UI report violation
+# COUNTS per rule, which needs a crisp yes/no per rule.
+
 def is_room_type_match(section, room) -> bool:
-    """
-    The required room type (derived from course type) must equal the
-    actual room type.  Returns True for course types that need no room.
-    """
+    """SOFT: does the room's type match the one the course type implies?
+    True for course types that imply no particular room."""
     required = get_required_room_type(section.course.type)
     if required is None:
         return True
@@ -670,40 +799,32 @@ def is_room_type_match(section, room) -> bool:
 
 
 def is_department_match(section, room) -> bool:
-    """
-    Department matching rules:
+    """SOFT: is this room available to the course's department?
 
-    For LABS (room.type == 'lab'):
-      HARD — room.dept_id must equal section.course.dept OR room.dept_id is None/''
-      (a lab with no dept assignment is open to everyone; a dept-assigned
-       lab is exclusive to that department)
-
-    For CLASSROOMS (room.type == 'classroom'):
-      SOFT treated as HARD here — prefer dept match, but allow undept-rooms.
-      Rooms assigned to a dept are RESERVED for that dept (hard).
-      Rooms with no dept can be used by anyone .
-
-    Returns True  → assignment is allowed
-    Returns False → hard violation (dept-locked room, wrong dept)
+    A room with no dept_id is unrestricted and always matches; a dept-assigned
+    room 'belongs' to that department. Formerly enforced as hard (labs
+    exclusive, classrooms 'soft treated as hard'), which locked sections out of
+    rooms the real schedule uses freely — the manual schedule breaks this on 31%
+    of placements, and 142/375 rooms have no dept_id at all.
     """
     room_dept = room.dept_id  # may be None / ''
-    course_dept = section.course.dept
-
-    # Room has no department restriction → always allowed
     if not room_dept:
         return True
-
-    # Room IS dept-restricted → must match course dept
-    return room_dept == course_dept
+    return room_dept == section.course.dept
 
 
 def is_capacity_ok(section, room) -> bool:
-    """Room capacity must be >= section enrolment capacity."""
+    """SOFT: does the room seat the section's planned enrolment?
+
+    Overbooking is deliberate in the real data (sec_capacity is planned
+    enrolment, and the manual schedule overflows the room 11% of the time), so
+    the graded capacity_penalty() is the better signal — this stays for counting.
+    """
     return room.capacity >= section.capacity
 
 
 def is_campus_match(section, room) -> bool:
-    """Section campus (derived from section number) must match room campus."""
+    """SOFT: does the room's campus match the one implied by the section number?"""
     section_campus = get_section_campus(section.no)
     building_campus = get_building_campus(room.building)
     return section_campus == building_campus
@@ -718,7 +839,15 @@ def passes_hard_constraints(
     occupied_rooms: set = None,
 ) -> bool:
     """
-    run ALL hard constraints for a candidate (section, room, timeslot).
+    Run the HARD constraints for a candidate (section, room, timeslot):
+    no double-booked room, no double-booked instructor. That is all — see the
+    tier note at the top of section 6.
+
+    This used to also require room_type/department/capacity/campus to match,
+    which made a merely-imperfect room indistinguishable from a physically
+    impossible one and left ~30% of the real schedule's placements unreachable.
+    Those four are now priced by room_soft_penalty() instead, so a section takes
+    an imperfect room rather than going unscheduled.
 
     If occupancy maps are provided, use those for instructor/room checks
     instead of scanning the partial schedule.
@@ -745,14 +874,7 @@ def passes_hard_constraints(
             schedule, room.id if room else None, timeslot.id if timeslot else None
         )
 
-    return (
-        instructor_free
-        and room_free
-        and is_room_type_match(section, room)
-        and is_department_match(section, room)
-        and is_capacity_ok(section, room)
-        and is_campus_match(section, room)
-    )
+    return instructor_free and room_free
 
 #  FULL-SCHEDULE VALIDATORS  (used for final verification / testing)
 
@@ -846,78 +968,69 @@ def check_all(schedule: list, data: dict) -> bool:
 
 # 8. HELPER FUNCTIONS FOR GENETIC ALGORITHM
 
-def get_viable_rooms(section, rooms):
+def rank_rooms(obj, rooms, limit=DEFAULT_ROOM_CANDIDATES):
     """
-    Return rooms that satisfy the section's static constraints.
+    Rank every room for *obj* (a Section or a ScheduleItem) cheapest-first by
+    soft penalty, and return the best ones. This REPLACES the old filter-based
+    viable-room logic — see the tier note in section 6.
 
-    Falls back to allowing department-locked rooms outside the section's
-    own department if -- and only if -- the section's own department has
-    no viable room at all (room type/capacity/campus all still apply).
-    Confirmed as acceptable scheduling policy: a section with no room in
-    its own department should borrow another department's room rather
-    than go unscheduled, but department is still preferred by default
-    (see score_candidate()'s department scoring in grasp.py/pso.py) --
-    this only kicks in as a last resort, same bounded-then-fallback
-    pattern used everywhere else in this codebase (e.g. GRASP's
-    CONSTRUCTION_ROOM_SAMPLE, PSO's rescue_unscheduled).
+    Two properties make the switch safe:
+
+      * Every zero-penalty (perfect) room is always returned, and the sort is
+        stable, so for any section that already had viable rooms the old viable
+        set is exactly the prefix of this list, in its original order. Nothing
+        that used to be chosen becomes unreachable or worse-ranked.
+      * *limit* only ever truncates the imperfect tail. It exists so downstream
+        random sampling stays concentrated on good rooms rather than being
+        diluted by hundreds of bad ones; pass limit=None to get all of them.
+
+    So a section whose department/campus/type/capacity rules previously left it
+    with NO viable room — the direct cause of the unscheduled ceiling — now gets
+    the least-bad rooms instead of an empty list.
     """
-    own_department = [
-        room
-        for room in rooms
-        if is_room_type_match(section, room)
-        and is_department_match(section, room)
-        and is_capacity_ok(section, room)
-        and is_campus_match(section, room)
-    ]
-    if own_department:
-        return own_department
+    if not rooms:
+        return []
 
-    return [
-        room
-        for room in rooms
-        if is_room_type_match(section, room)
-        and is_capacity_ok(section, room)
-        and is_campus_match(section, room)
-    ]
+    scored = [(room_soft_penalty(obj, room), room) for room in rooms]
+    scored.sort(key=lambda pair: pair[0])  # stable: ties keep input order
+
+    if limit is None:
+        return [room for _, room in scored]
+
+    perfect = sum(1 for penalty, _ in scored if penalty == 0.0)
+    keep = max(perfect, limit)
+    return [room for _, room in scored[:keep]]
 
 
-def get_viable_rooms_for_schedule_item(item, rooms):
-    """Return rooms that satisfy a schedule item's constraints."""
-    return [
-        room
-        for room in rooms
-        if _schedule_item_room_type_match(item, room)
-        and _schedule_item_capacity_ok(item, room)
-    ]
+def get_viable_rooms(section, rooms, limit=DEFAULT_ROOM_CANDIDATES):
+    """Rooms for a Section, best-fit first. Never empty unless *rooms* is."""
+    return rank_rooms(section, rooms, limit=limit)
 
 
-def _schedule_item_room_type_match(item, room) -> bool:
-    """Check if room type matches schedule item's course type."""
-    required_room_type = get_required_room_type(item.course_type)
-    if required_room_type is None:
-        return True
-    return room.type == required_room_type
+def get_viable_rooms_for_schedule_item(item, rooms, limit=DEFAULT_ROOM_CANDIDATES):
+    """Rooms for a ScheduleItem, best-fit first.
 
-
-def _schedule_item_capacity_ok(item, room) -> bool:
-    """Check if room capacity is sufficient for schedule item."""
-    return item.capacity <= room.capacity
+    Now scores campus and department too. The old version checked only room type
+    and capacity, so the repair/rescue paths that use it (genetic, GRASP) could
+    place a section in a room the constructor would have rejected outright.
+    """
+    return rank_rooms(item, rooms, limit=limit)
 
 
 # greedy helpers
 def _build_room_lookup(rooms):
     """
-    Returns a dict:
-        (room_type, course_dept, section_campus) → [room, ...]
+    Returns (dept_typed, open_typed, all_rooms).
 
-    Rooms are ordered dept-match first, then open (dept_id=None).
-    Type, department, and campus are all static properties — checking them
-    once here means the inner loop only sees genuinely viable candidates and
-    only needs to check availability (O(1) set lookup) and capacity.
+    dept_typed: (room_type, dept_id, campus) → rooms
+    open_typed: (room_type, campus)          → rooms
+    all_rooms:  the full list, used for the soft fallback tail in _viable_rooms.
+
+    Type, department, and campus are static properties, so bucketing them once
+    here means the inner scheduling loop only checks availability (O(1)).
     """
-    # Intermediate buckets
-    dept_typed = defaultdict(list)  # (room_type, dept_id, campus) → rooms
-    open_typed = defaultdict(list)  # (room_type, campus) → rooms
+    dept_typed = defaultdict(list)
+    open_typed = defaultdict(list)
 
     for room in rooms:
         campus = get_building_campus(room.building)
@@ -926,14 +1039,59 @@ def _build_room_lookup(rooms):
         else:
             open_typed[(room.type, campus)].append(room)
 
-    # Collect all (room_type, course_dept, campus) combos that will be queried
-    # We can't know course_dept ahead of time, so we build on first access via cache
-    return dept_typed, open_typed
+    return dept_typed, open_typed, list(rooms)
 
 
-def _viable_rooms(dept_typed, open_typed, room_type, course_dept, section_campus):
-    """Yield rooms in priority order for a given (type, dept, campus) triple."""
+def _greedy_room_penalty(room, room_type, course_dept, section_campus) -> float:
+    """Soft penalty for greedy's lookup path, which knows only the
+    (type, dept, campus) triple rather than the Section object. Capacity is
+    scored separately by the caller, which knows the section's enrolment."""
+    penalty = 0.0
+    if room_type is not None and room.type != room_type:
+        penalty += SOFT_WEIGHT_ROOM_TYPE
+    if room.dept_id and room.dept_id != course_dept:
+        penalty += SOFT_WEIGHT_DEPARTMENT
+    if get_building_campus(room.building) != section_campus:
+        penalty += SOFT_WEIGHT_CAMPUS
+    return penalty
+
+
+def _viable_rooms(
+    dept_typed,
+    open_typed,
+    room_type,
+    course_dept,
+    section_campus,
+    all_rooms=None,
+    limit=DEFAULT_ROOM_CANDIDATES,
+):
+    """Yield rooms best-fit first for a given (type, dept, campus) triple.
+
+    Tiers 1 and 2 are the exact matches this function used to return, in the
+    same order. Tier 3 is new: the least-bad remaining rooms, ranked. Without
+    it a section whose triple had no exact match simply went unscheduled, which
+    is the greedy-side half of the unscheduled ceiling.
+    """
+    exact_dept = dept_typed.get((room_type, course_dept, section_campus), [])
+    exact_open = open_typed.get((room_type, section_campus), [])
+
     # 1. dept-assigned rooms matching this course's department
-    yield from dept_typed.get((room_type, course_dept, section_campus), [])
-    # 2. open rooms (no dept restriction) — fallback for classrooms, also valid for labs
-    yield from open_typed.get((room_type, section_campus), [])
+    yield from exact_dept
+    # 2. open rooms (no dept restriction)
+    yield from exact_open
+
+    if not all_rooms:
+        return
+
+    # 3. soft fallback — everything else, cheapest first, so an imperfect room
+    #    beats no room at all.
+    already = {id(room) for room in exact_dept}
+    already.update(id(room) for room in exact_open)
+
+    rest = [room for room in all_rooms if id(room) not in already]
+    rest.sort(
+        key=lambda room: _greedy_room_penalty(
+            room, room_type, course_dept, section_campus
+        )
+    )
+    yield from rest[:limit] if limit is not None else rest

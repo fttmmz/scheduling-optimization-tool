@@ -11,7 +11,7 @@ from backend.Optimization.constraints import (
     needs_to_label,
     get_valid_timeslots,
     get_viable_rooms,
-    passes_hard_constraints,
+    room_soft_penalty,
 )
 from backend.models.models import ScheduleItem
 from backend.Optimization.evaluation import (
@@ -57,6 +57,11 @@ SOFT_POLISH_PAIR_SAMPLES = 60
 UNSCHEDULED_WEIGHT = 10000
 ROOM_CONFLICT_WEIGHT = 1000
 INSTRUCTOR_CONFLICT_WEIGHT = 1000
+
+# Scales constraints.room_soft_penalty() (worst realistic total ~12 units) into
+# this objective's scale. The resulting few-hundred cost keeps the tier order
+# strict: unscheduled >> double-booking >> soft violation.
+SOFT_PENALTY_WEIGHT = 20
 
 STATIC_CACHE_LIMIT = 700000
 
@@ -341,23 +346,30 @@ def _sample_pairs(viable_rooms, valid_timeslots, limit):
     return pairs
 
 
-def _static_ok(idx, room, timeslot, sections, static_memo):
-    key = (idx, room.id, timeslot.id)
-    if key in static_memo:
-        return static_memo[key]
+def _soft_cost(idx, room, sections, static_memo):
+    """Price of the soft rules (room type / campus / department / capacity) for
+    putting section *idx* in *room*.
 
-    ok = passes_hard_constraints(
-        sections[idx],
-        room,
-        timeslot,
-        occupied_instructors=set(),
-        occupied_rooms=set(),
-    )
+    This replaces the old _static_ok() gate, which called passes_hard_constraints
+    with empty occupancy sets -- i.e. it was never checking double-booking at
+    all, only the four soft rules, and REJECTED any candidate that broke one.
+    That is what made sections unschedulable rather than merely imperfect. Now
+    the same information becomes a cost: SOFT_PENALTY_WEIGHT scales the worst
+    realistic penalty (~12 units) to a few hundred, so a soft violation is
+    always cheaper than a double-booking (1000) and far cheaper than leaving the
+    section unscheduled (10000), while still being firmly preferred against.
+    """
+    key = (idx, room.id)
+    cached = static_memo.get(key)
+    if cached is not None:
+        return cached
+
+    cost = room_soft_penalty(sections[idx], room) * SOFT_PENALTY_WEIGHT
 
     if len(static_memo) < STATIC_CACHE_LIMIT:
-        static_memo[key] = bool(ok)
+        static_memo[key] = cost
 
-    return bool(ok)
+    return cost
 
 
 def _best_candidates(
@@ -408,16 +420,13 @@ def _best_candidates(
     for room, timeslot in _sample_pairs(
         viable_rooms, valid_timeslots, sample_limit
     ):
-        if not _static_ok(idx, room, timeslot, sections, static_memo):
-            continue
-
         cost = _placement_cost(
             schedule_item,
             room.id,
             timeslot.id,
             room_counts,
             instructor_counts,
-        )
+        ) + _soft_cost(idx, room, sections, static_memo)
         ranked.append((cost, random.random(), room, timeslot))
 
     ranked.sort(key=lambda value: (value[0], value[1]))
