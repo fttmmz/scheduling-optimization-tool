@@ -1,5 +1,6 @@
 from backend.models.models import Timeslot, Room, Section
 from backend.database.db import supabase
+from backend.Optimization.constraints import is_placeholder_timeslot
 
 
 def load_rooms():
@@ -8,8 +9,18 @@ def load_rooms():
 
 
 def load_timeslots():
+    """Real, bookable timeslots only.
+
+    Excludes both placeholder encodings -- day IS NULL (the TBA bucket) and
+    zero-duration slots -- so no algorithm can assign one. They are not
+    schedulable times; they mean "this activity has no fixed meeting time".
+    """
     res = supabase.table("timeslot").select("*").execute()
-    return [Timeslot(row) for row in res.data if row["day"] is not None]
+    return [
+        timeslot
+        for timeslot in (Timeslot(row) for row in res.data)
+        if not is_placeholder_timeslot(timeslot)
+    ]
 
 
 def load_section_details():

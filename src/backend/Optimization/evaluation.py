@@ -1,10 +1,13 @@
 # CONFLICT COUNTING  (for schedule scoring / comparison)
+from collections import Counter, defaultdict
+
 from backend.Optimization.constraints import (
     classify_section,
     get_required_room_type,
     get_section_campus,
     get_building_campus,
     get_valid_timeslots_for_section,
+    occupancy_key,
     room_soft_penalty,
     room_soft_penalty_parts,
 )
@@ -22,30 +25,71 @@ SOFT_PENALTY_WEIGHT = 0.5     # bent soft rules: real, but recoverable
 # ~10 penalty units is a section that breaks essentially every soft rule.
 SOFT_PENALTY_REFERENCE = 10.0
 
-def count_instructor_conflicts(schedule: list) -> int:
-    seen, conflicts = set(), 0
-    for item in schedule:
-        if item.instructor_id is None or item.timeslot_id is None:
+def _count_occupants(items) -> int:
+    """How many distinct CLASSES occupy one (room|instructor, timeslot) slot.
+
+    Cross-listed courses are one class taught once under several course codes
+    (see COMBINED_COURSE_GROUPS), so they collapse to a single occupant instead
+    of registering as a double-booking. Without this the real manual schedule --
+    which is in active use and therefore feasible by definition -- scores 57
+    hard conflicts, and the hard tier stops meaning "physically impossible".
+
+    The collapse cannot be abused to hide a genuine clash: within one combined
+    group, two different SECTIONS of the same course still count separately, so
+    placing 405341-61 and 405341-62 in one room is a conflict as it should be.
+    """
+    buckets = defaultdict(list)
+    for item in items:
+        buckets[occupancy_key(item.course_id, item.section)].append(item)
+
+    occupants = 0
+    for key, members in buckets.items():
+        if key[0] != "combined":
+            occupants += 1
             continue
-        key = (item.instructor_id, item.timeslot_id)
-        if key in seen:
-            conflicts += 1
-        else:
-            seen.add(key)
-    return conflicts
+        per_course = Counter(member.course_id for member in members)
+        occupants += max(per_course.values())
+    return occupants
+
+
+def _count_slot_conflicts(schedule: list, slot_of) -> int:
+    """Sum of (occupants - 1) over every slot, where slot_of(item) gives the
+    slot key or None to skip the item."""
+    slots = defaultdict(list)
+    for item in schedule:
+        key = slot_of(item)
+        if key is not None:
+            slots[key].append(item)
+
+    return sum(
+        max(0, _count_occupants(items) - 1)
+        for items in slots.values()
+        if len(items) > 1
+    )
+
+
+def count_instructor_conflicts(schedule: list) -> int:
+    """HARD: one instructor expected in two places at once."""
+    return _count_slot_conflicts(
+        schedule,
+        lambda item: (
+            None
+            if item.instructor_id is None or item.timeslot_id is None
+            else (item.instructor_id, item.timeslot_id)
+        ),
+    )
 
 
 def count_room_conflicts(schedule: list) -> int:
-    seen, conflicts = set(), 0
-    for item in schedule:
-        if item.room_id is None or item.timeslot_id is None:
-            continue
-        key = (item.room_id, item.timeslot_id)
-        if key in seen:
-            conflicts += 1
-        else:
-            seen.add(key)
-    return conflicts
+    """HARD: one room hosting two classes at once."""
+    return _count_slot_conflicts(
+        schedule,
+        lambda item: (
+            None
+            if item.room_id is None or item.timeslot_id is None
+            else (item.room_id, item.timeslot_id)
+        ),
+    )
 
 
 def count_campus_conflicts(schedule: list, rooms: list) -> int:
