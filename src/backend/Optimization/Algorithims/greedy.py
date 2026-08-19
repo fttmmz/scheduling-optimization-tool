@@ -8,6 +8,8 @@ from backend.Optimization.constraints import (
     get_required_room_type,
     get_valid_timeslots,
     get_section_campus,
+    instructor_occupancy_ids,
+    finalize_schedule,
     _build_room_lookup,
     _viable_rooms
 )
@@ -28,6 +30,7 @@ def build_conflict_graph(sections):
             course_type=section.course.type,
             course_dept=section.course.dept,
             instructor_id=section.instructor_id,
+            instructor_ids=section.instructor_ids,
             section_no=section.no,
             capacity=section.capacity,
             classification=classify_section(section),
@@ -35,8 +38,7 @@ def build_conflict_graph(sections):
 
     by_instructor = defaultdict(list)
     for node_id in G.nodes:
-        instr = G.nodes[node_id]["instructor_id"]
-        if instr:
+        for instr in G.nodes[node_id]["instructor_ids"]:
             by_instructor[instr].append(node_id)
 
     for node_ids in by_instructor.values():
@@ -106,6 +108,11 @@ def greedy_schedule(sections, timeslots, rooms):
         section_no = node["section_no"]
         section_campus = get_section_campus(section_no)
 
+        # The instructor identity that occupies a timeslot: None for supervision
+        # and for sections with no instructor. `instructor_id` above stays the
+        # real recorded value, because the item still has to REPORT it.
+        occupying_instructors = instructor_occupancy_ids(section)
+
         def make_item(room_id, timeslot_id):
             return ScheduleItem(
                 course_id=node["course_id"],
@@ -117,6 +124,14 @@ def greedy_schedule(sections, timeslots, rooms):
                 room_id=room_id,
                 timeslot_id=timeslot_id,
                 section=section_no,
+                instructor_ids=section.instructor_ids,
+                pattern_index=section.pattern_index,
+                # Classification is keyed on level -- without it a detached item
+                # re-classifies as an ordinary room+time lecture and the
+                # level-aware fix silently undoes itself. greedy was the one
+                # algorithm still missing this.
+                level=getattr(section.course, "level", None),
+                course_class=getattr(section.course, "course_class", None),
             )
 
         # NEEDS_NOTHING
@@ -136,12 +151,13 @@ def greedy_schedule(sections, timeslots, rooms):
             chosen_ts = None
             for timeslot in get_valid_timeslots(section, timeslots):
                 ts_id = timeslot.id
-                if instructor_id and (instructor_id, ts_id) in occupied_instructors:
+                if any((instructor_id, ts_id) in occupied_instructors
+                       for instructor_id in occupying_instructors):
                     continue
                 if ts_id in blocked_by_neighbors:
                     continue
                 chosen_ts = ts_id
-                if instructor_id:
+                for instructor_id in occupying_instructors:
                     occupied_instructors.add((instructor_id, ts_id))
                 assigned_timeslots[node_id] = ts_id
                 break
@@ -177,7 +193,8 @@ def greedy_schedule(sections, timeslots, rooms):
             ts_id = timeslot.id
 
             # check instructor double-booked
-            if instructor_id and (instructor_id, ts_id) in occupied_instructors:
+            if any((instructor_id, ts_id) in occupied_instructors
+                   for instructor_id in occupying_instructors):
                 continue
 
             # check neighbour (same instructor) already at this slot
@@ -194,7 +211,7 @@ def greedy_schedule(sections, timeslots, rooms):
 
                 # assignment
                 occupied_rooms.add((room.id, ts_id))
-                if instructor_id:
+                for instructor_id in occupying_instructors:
                     occupied_instructors.add((instructor_id, ts_id))
                 assigned_timeslots[node_id] = ts_id
                 schedule.append(make_item(room.id, ts_id))
@@ -207,4 +224,6 @@ def greedy_schedule(sections, timeslots, rooms):
         if not found:
             schedule.append(make_item(None, None))
 
-    return schedule
+    # Meeting blocks of one section need their own hour, and share one room.
+    # The placement loops have no cross-block state, so repair here.
+    return finalize_schedule(schedule, sections, timeslots)

@@ -6,6 +6,8 @@ from backend.Optimization.constraints import (
     passes_hard_constraints,
     get_viable_rooms,
     get_viable_rooms_for_schedule_item,
+    instructor_occupancy_ids,
+    finalize_schedule,
     needs_for,
     section_needs,
 )
@@ -18,9 +20,10 @@ from backend.Optimization.evaluation import (
 
 def _free_timeslot(section, timeslots, occupied_instructors):
     """First timeslot where this section's instructor is not already busy."""
+    instructor_ids = instructor_occupancy_ids(section)
     for ts in timeslots:
-        if section.instructor_id is None or \
-                (section.instructor_id, ts.id) not in occupied_instructors:
+        if all((instructor_id, ts.id) not in occupied_instructors
+               for instructor_id in instructor_ids):
             return ts
     return random.choice(timeslots) if timeslots else None
 
@@ -59,8 +62,10 @@ def choose_random_assignment(
     if not rooms or not timeslots:
         return None, None
 
+    section_instructors = instructor_occupancy_ids(section)
     for ts in timeslots:
-        if section.instructor_id is not None and (section.instructor_id, ts.id) in occupied_instructors:
+        if any((instructor_id, ts.id) in occupied_instructors
+               for instructor_id in section_instructors):
             continue
 
         for room in rooms:
@@ -124,6 +129,8 @@ def create_population(size, sections, rooms, timeslots):
                 room_id=room.id if room else None,
                 timeslot_id=timeslot.id if timeslot else None,
                 section=str(section.no),
+                instructor_ids=section.instructor_ids,
+                pattern_index=section.pattern_index,
                 # level drives classification -- without it every item looks
                 # like a plain room+time lecture once detached from its Section.
                 level=getattr(section.course, "level", None),
@@ -133,8 +140,9 @@ def create_population(size, sections, rooms, timeslots):
             schedule.append(item)
             if room is not None and timeslot is not None:
                 occupied_rooms.add((room.id, timeslot.id))
-            if section.instructor_id is not None and timeslot is not None:
-                occupied_instructors.add((section.instructor_id, timeslot.id))
+            if timeslot is not None:
+                for instructor_id in instructor_occupancy_ids(section):
+                    occupied_instructors.add((instructor_id, timeslot.id))
 
         # add this full schedule to population
         population.append(schedule)
@@ -216,8 +224,9 @@ def mutation(schedule, rooms, timeslots, sections=None):
     
     for item in schedule:
         if item != selected_item:  # Don't include the item we're about to mutate
-            if item.instructor_id is not None and item.timeslot_id is not None:
-                occupied_instructors.add((item.instructor_id, item.timeslot_id))
+            if item.timeslot_id is not None:
+                for instructor_id in instructor_occupancy_ids(item):
+                    occupied_instructors.add((instructor_id, item.timeslot_id))
             if item.room_id is not None and item.timeslot_id is not None:
                 occupied_rooms.add((item.room_id, item.timeslot_id))
 
@@ -242,11 +251,22 @@ def mutation(schedule, rooms, timeslots, sections=None):
                     break
     else:
         # Try to assign a new timeslot that doesn't create conflicts
-        # Check BOTH instructor AND room are free at new timeslot
+        # Check BOTH instructor AND room are free at new timeslot.
+        # The None guards are explicit rather than relying on a None key simply
+        # never having been inserted above: that made correctness here depend on
+        # a detail of a different loop, and it silently stops holding the moment
+        # anyone inserts unconditionally.
+        selected_instructors = instructor_occupancy_ids(selected_item)
         for ts in random.sample(timeslots, len(timeslots)):
-            instructor_free = (selected_item.instructor_id, ts.id) not in occupied_instructors
-            room_free       = (selected_item.room_id, ts.id) not in occupied_rooms
-            
+            instructor_free = all(
+                (instructor_id, ts.id) not in occupied_instructors
+                for instructor_id in selected_instructors
+            )
+            room_free = (
+                selected_item.room_id is None
+                or (selected_item.room_id, ts.id) not in occupied_rooms
+            )
+
             if instructor_free and room_free:
                 selected_item.timeslot_id = ts.id
                 break
@@ -314,7 +334,10 @@ def genetic_schedule(sections, timeslots, rooms, valid_timeslot_cache=None):
         ),
     )
 
-    return best
+    # Siblings (meeting blocks of one section) belong in one room. The
+    # placement loops have no cross-block state, so unify afterwards; the
+    # pass only ever moves a block into a room that is free at its hour.
+    return finalize_schedule(best, sections, timeslots, valid_timeslot_cache)
 
 
 def genetic_runs(sections, timeslots, rooms, num_runs=30):

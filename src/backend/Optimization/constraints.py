@@ -4,7 +4,7 @@
 
 
 import re
-from collections import defaultdict
+from collections import Counter, defaultdict
 from typing import NamedTuple
 
 # 1. COURSE-TYPE / LEVEL CLASSIFICATION
@@ -207,6 +207,334 @@ def occupancy_key(course_id, section_no):
     if group is not None:
         return ("combined", group)
     return ("section", course_id, str(section_no))
+
+
+# 1c. SUPERVISION vs TEACHING
+#
+# The instructor column mixes two unrelated relationships:
+#
+#   TEACHING     -- this person stands in this room at this hour. Two of these
+#                   at once is physically impossible.
+#   SUPERVISION  -- this person is nominally attached to a student's thesis or
+#                   project. Twenty-two supervisors on one senior project are
+#                   not twenty-two people in a room; the row is a ROSTER ENTRY.
+#
+# Counting supervision as teaching invents double-bookings nobody experiences
+# and blocks supervisors out of the hours they actually teach. 56% of rows have
+# no instructor at all, and of those that do, the widest rosters are all
+# supervision (see HANDOVER.md 4.3/4.4 and tests/test_data_invariants.py).
+#
+# Detection deliberately requires CORROBORATION, the same principle as
+# COMBINED_COURSE_GROUPS above -- a single signal is not enough:
+#
+#   * course_type is the primary signal, and is right for all but a handful of
+#     courses.
+#   * course NAME alone is NOT sufficient. 'Project Management',
+#     'Engineering Project Management' and 'Research Methods' are ordinary
+#     taught courses whose names contain supervision keywords. Mined 2026-08-18:
+#     a name keyword only counts when the source data ALSO never gives the
+#     course a room -- which is what separates 'Senior Project in Bioinfor.'
+#     (22 staff, 0 rooms, 0 meeting times) from 'Project Management' (1 room,
+#     1 meeting time).
+#   * Roster width is NOT used. It looked promising and is wrong: five
+#     instructors on 'Intensive English Foundation 1' is genuine team teaching
+#     in a real room, and five on an M.Sc. thesis is a roster.
+SUPERVISION_COURSE_TYPES = frozenset({
+    "Thesis",
+    "Thesis / Dissertation Master",
+    "Thesis / Dissertation Doctorat",
+    "Senior Project Supervision",
+    "Project",
+    "Independent Study",
+    "Proposal Doctorate",
+    "Comprehensive Exam",
+    "Qualifying Exam",
+})
+
+# Courses whose course_type does NOT say supervision but which demonstrably are.
+# Mined from schedule_id=1 on 2026-08-18: name matches project/thesis/
+# dissertation/graduation AND the course is never given a room in the source.
+# Pinned by tests/test_data_invariants.py::
+# test_supervision_courses_are_miscategorised_by_type.
+SUPERVISION_COURSE_IDS = frozenset({
+    103490,    # 'Graduation Project'            typed 'Office Hours'
+    401493,    # 'Environmental Outreach Project' typed 'Office Hours'
+    703415,    # 'VC Graduation Project II'      typed 'Office Hours'
+    1002704,   # 'Investi. Leading to Thesis I'  typed 'Seminar Graduate'
+    1501497,   # 'Senior Project in Bioinfor.'   typed 'Lecture Undergraduate'
+})
+
+
+def _course_identity(obj):
+    """(course_id, course_type) from either a Section or a ScheduleItem."""
+    course = getattr(obj, "course", None)
+    if course is not None:                       # Section
+        return course.id, course.type
+    return obj.course_id, obj.course_type        # ScheduleItem
+
+
+def is_supervision(obj) -> bool:
+    """True when this section/item is supervision rather than taught contact.
+
+    Supervision still needs a slot in the schedule -- what it does NOT do is
+    consume its instructors' teaching time. See instructor_occupancy_id().
+    """
+    course_id, course_type = _course_identity(obj)
+    if course_id in SUPERVISION_COURSE_IDS:
+        return True
+    return course_type in SUPERVISION_COURSE_TYPES
+
+
+def instructor_occupancy_ids(obj):
+    """Every instructor identity that occupies a timeslot. Possibly empty.
+
+    Returns () in two cases, which every occupancy structure must skip:
+      * no instructor recorded (the majority of rows)
+      * supervision -- a supervisor attached to a thesis is not in a room
+
+    Returns ALL of them otherwise: a team-taught class commits every one of its
+    instructors for that hour. Reading a single `.instructor_id` discarded 598
+    real assignments -- 'Intensive English Foundation 1' is taught by five
+    people, and four of them were invisible to the conflict counter.
+
+    Funnelling every occupancy site through one function is deliberate: the
+    instructor rules were previously repeated at ~20 call sites across five
+    algorithms and three different structures (sets, Counters, owner-maps), and
+    they drifted. Anything that builds instructor occupancy should call this
+    rather than reading .instructor_id / .instructor_ids directly.
+
+    Known trade-off: a handful of supervision activities are real group sessions
+    with a room and an hour (e.g. 1100599 'Graduation Project', 20 staff at
+    T 19:00). Those stop being checked for instructor clashes. That is the right
+    side to err on -- the false constraints removed vastly outnumber the genuine
+    clashes lost, and the ROOM check still applies to them unchanged.
+    """
+    if is_supervision(obj):
+        return ()
+    instructor_ids = getattr(obj, "instructor_ids", None)
+    if instructor_ids:
+        return tuple(instructor_ids)
+    instructor_id = getattr(obj, "instructor_id", None)
+    return () if instructor_id is None else (instructor_id,)
+
+
+def instructor_occupancy_id(obj):
+    """First occupying instructor, or None.
+
+    Convenience for the few places that genuinely need one value (a sort key, a
+    'who is blocking this slot' lookup). Anything COUNTING or RESERVING must use
+    instructor_occupancy_ids() -- using this instead silently ignores every
+    instructor after the first.
+    """
+    ids = instructor_occupancy_ids(obj)
+    return ids[0] if ids else None
+
+
+# ── Sibling meeting patterns ─────────────────────────────────────────────────
+# A section that meets in several blocks becomes several Sections sharing one
+# sibling_key. They are the same students, so:
+#
+#   * two siblings at the same timeslot is a HARD conflict (nobody can attend
+#     their own class twice at once), and
+#   * siblings that need a room should share ONE room -- which is what the
+#     source data does in every case: the six Studio sections of 404421 repeat
+#     the same room across both their blocks, and the clinical sections carry no
+#     room at all.
+
+
+def sibling_key(obj):
+    """Identity shared by every meeting pattern of one section."""
+    key = getattr(obj, "sibling_key", None)
+    if key is not None:
+        return key
+    course = getattr(obj, "course", None)
+    if course is not None:
+        return (course.id, str(obj.no))
+    return (obj.course_id, str(obj.section))
+
+
+def group_siblings(items):
+    """sibling_key -> [items], keeping only sections that really have siblings."""
+    groups = defaultdict(list)
+    for item in items:
+        groups[sibling_key(item)].append(item)
+    return {key: group for key, group in groups.items() if len(group) > 1}
+
+
+def count_sibling_room_splits(schedule) -> int:
+    """Sibling groups whose blocks sit in more than one room.
+
+    Blocks with no room are ignored -- most multi-pattern sections are clinical,
+    which classify as time-only and are given no room at all, so this is vacuous
+    for them. In practice it applies to the six Studio sections of course
+    404421, which in the source data already repeat one room across both blocks.
+    """
+    splits = 0
+    for group in group_siblings(schedule).values():
+        rooms = {item.room_id for item in group if item.room_id is not None}
+        if len(rooms) > 1:
+            splits += 1
+    return splits
+
+
+def _occupancy_of(schedule):
+    rooms = set()
+    instructors = set()
+    for item in schedule:
+        if item.timeslot_id is None:
+            continue
+        if item.room_id is not None:
+            rooms.add((item.room_id, item.timeslot_id))
+        for instructor_id in instructor_occupancy_ids(item):
+            instructors.add((instructor_id, item.timeslot_id))
+    return rooms, instructors
+
+
+def resolve_sibling_time_conflicts(schedule, sections, timeslots,
+                                   valid_timeslot_cache=None):
+    """Give each meeting block of one section its own hour.
+
+    The five algorithms place blocks independently and have no cross-block
+    state, so a section that meets twice happily gets both blocks at the same
+    time -- which is impossible for the students, and which nothing else in the
+    model catches: the blocks may carry no room and no instructor.
+
+    Threading a coupling constraint through five different placement loops for
+    the eleven sections this affects would be disproportionate, so it is
+    repaired here instead. A block only moves to a slot that is valid for its
+    course type and free for its room and every one of its instructors, so this
+    can never introduce a conflict; blocks with nowhere to go are left alone and
+    still register in count_sibling_conflicts().
+    """
+    groups = group_siblings(schedule)
+    if not groups:
+        return schedule
+
+    if valid_timeslot_cache is None:
+        # Only the handful of sections that actually have siblings, rather than
+        # rebuilding the whole cache.
+        valid_timeslot_cache = {
+            sibling_key(section): {
+                ts.id for ts in get_valid_timeslots_for_section(section, timeslots)
+            }
+            for section in sections
+            if sibling_key(section) in groups
+        }
+
+    occupied_rooms, occupied_instructors = _occupancy_of(schedule)
+
+    for key, group in groups.items():
+        candidates = sorted(valid_timeslot_cache.get(key) or ())
+        taken = set()
+
+        for item in group:
+            current = item.timeslot_id
+            if current is None:
+                continue
+            if current not in taken:
+                taken.add(current)
+                continue
+
+            instructors = instructor_occupancy_ids(item)
+            replacement = next(
+                (
+                    slot for slot in candidates
+                    if slot not in taken
+                    and (item.room_id is None
+                         or (item.room_id, slot) not in occupied_rooms)
+                    and all((instructor_id, slot) not in occupied_instructors
+                            for instructor_id in instructors)
+                ),
+                None,
+            )
+            if replacement is None:
+                continue
+
+            if item.room_id is not None:
+                occupied_rooms.discard((item.room_id, current))
+                occupied_rooms.add((item.room_id, replacement))
+            for instructor_id in instructors:
+                occupied_instructors.discard((instructor_id, current))
+                occupied_instructors.add((instructor_id, replacement))
+
+            item.timeslot_id = replacement
+            taken.add(replacement)
+
+    return schedule
+
+
+def finalize_schedule(schedule, sections, timeslots, valid_timeslot_cache=None):
+    """Repairs every algorithm applies to the schedule it returns.
+
+    Order matters: separate the sibling blocks in TIME first, because two blocks
+    sharing an hour can never also share a room -- unifying rooms before the
+    times are fixed would silently do nothing.
+    """
+    schedule = resolve_sibling_time_conflicts(
+        schedule, sections, timeslots, valid_timeslot_cache
+    )
+    return unify_sibling_rooms(schedule)
+
+
+def unify_sibling_rooms(schedule):
+    """Move every meeting block of one section into a single shared room.
+
+    A section that meets twice a week meets in the SAME place both times; the
+    source data does exactly that. The algorithms place each block independently
+    and have no cross-block state, so rather than thread a coupling constraint
+    through five different placement loops, this repairs it afterwards -- the
+    affected population is six sections, so a repair pass is the proportionate
+    tool.
+
+    Never creates a conflict: a block only moves if the target room is actually
+    free at that block's timeslot. Blocks that cannot move are left where they
+    are, so this can improve the schedule but never break it. Mutates in place
+    and returns the schedule.
+    """
+    occupied = {
+        (item.room_id, item.timeslot_id)
+        for item in schedule
+        if item.room_id is not None and item.timeslot_id is not None
+    }
+
+    for group in group_siblings(schedule).values():
+        roomed = [item for item in group
+                  if item.room_id is not None and item.timeslot_id is not None]
+        if len(roomed) < 2:
+            continue
+        if len({item.room_id for item in roomed}) == 1:
+            continue  # already unified
+
+        # Free the group's own bookings first, so a room is not judged busy on
+        # account of the very blocks being moved.
+        for item in roomed:
+            occupied.discard((item.room_id, item.timeslot_id))
+
+        # Try the rooms these blocks already sit in -- all are viable for this
+        # section by construction. Most-used first, ties on lowest id so repeated
+        # runs converge rather than oscillate. Trying every candidate rather than
+        # only the most common one matters: the popular room is often busy at one
+        # sibling's hour while a less popular one is free at all of them.
+        counts = Counter(item.room_id for item in roomed)
+        candidates = sorted(counts, key=lambda room_id: (-counts[room_id], room_id))
+
+        target = next(
+            (
+                room_id for room_id in candidates
+                if all((room_id, item.timeslot_id) not in occupied
+                       for item in roomed)
+            ),
+            None,
+        )
+
+        if target is not None:
+            for item in roomed:
+                item.room_id = target
+
+        for item in roomed:
+            occupied.add((item.room_id, item.timeslot_id))
+
+    return schedule
 
 
 # 2. COURSE-TYPE → ROOM-TYPE MAPPING
@@ -870,7 +1198,11 @@ def is_instructor_free(schedule: list, instructor_id, timeslot_id) -> bool:
     if instructor_id is None or timeslot_id is None:
         return True
     for item in schedule:
-        if item.instructor_id == instructor_id and item.timeslot_id == timeslot_id:
+        if item.timeslot_id != timeslot_id:
+            continue
+        # Membership, not equality: a team-taught item commits all its
+        # instructors, and equality only ever saw the first one.
+        if instructor_id in instructor_occupancy_ids(item):
             return False
     return True
 
@@ -970,15 +1302,23 @@ def passes_hard_constraints(
     If occupancy maps are provided, use those for instructor/room checks
     instead of scanning the partial schedule.
     """
+    # Supervision does not consume its instructors' teaching time, so it neither
+    # creates occupancy nor is blocked by it -- instructor_occupancy_ids returns
+    # () and the check short-circuits to free. See section 1c.
+    # EVERY instructor must be free, not just the first: a team-taught class
+    # cannot run if any one of its teachers is already committed.
+    timeslot_id = timeslot.id if timeslot else None
+    instructor_ids = instructor_occupancy_ids(section)
+
     if occupied_instructors is not None:
-        instructor_free = is_instructor_free_map(
-            occupied_instructors,
-            section.instructor_id,
-            timeslot.id if timeslot else None,
+        instructor_free = all(
+            is_instructor_free_map(occupied_instructors, instructor_id, timeslot_id)
+            for instructor_id in instructor_ids
         )
     else:
-        instructor_free = is_instructor_free(
-            schedule, section.instructor_id, timeslot.id if timeslot else None
+        instructor_free = all(
+            is_instructor_free(schedule, instructor_id, timeslot_id)
+            for instructor_id in instructor_ids
         )
 
     if occupied_rooms is not None:
@@ -999,12 +1339,22 @@ def passes_hard_constraints(
 def check_instructors(schedule: list, data=None) -> bool:
     seen = set()
     for item in schedule:
-        if item.instructor_id is None:
+        if item.timeslot_id is None:
             continue
-        key = (item.instructor_id, item.timeslot_id)
-        if key in seen:
+        for instructor_id in instructor_occupancy_ids(item):
+            key = (instructor_id, item.timeslot_id)
+            if key in seen:
+                return False
+            seen.add(key)
+    return True
+
+
+def check_siblings(schedule: list, data=None) -> bool:
+    """No section may hold two of its own meeting blocks at one timeslot."""
+    for group in group_siblings(schedule).values():
+        times = [item.timeslot_id for item in group if item.timeslot_id is not None]
+        if len(times) != len(set(times)):
             return False
-        seen.add(key)
     return True
 
 

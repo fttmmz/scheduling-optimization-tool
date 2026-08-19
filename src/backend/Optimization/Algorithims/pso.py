@@ -84,6 +84,8 @@ from backend.models.models import ScheduleItem
 from backend.Optimization.constraints import (
     get_valid_timeslots,
     get_viable_rooms,
+    instructor_occupancy_ids,
+    finalize_schedule,
     section_needs,
 )
 
@@ -241,14 +243,20 @@ def decode(position, section_candidates, valid_timeslot_cache):
         elif not needs.room:
             # Time only: first slot that leaves the instructor free.
             room = None
+            section_instructors = instructor_occupancy_ids(section)
             timeslot = next(
                 (
                     ts for ts in valid_ts
-                    if section.instructor_id is None
-                    or (section.instructor_id, ts.id) not in occupied_instructors
+                    if all((instructor_id, ts.id) not in occupied_instructors
+                           for instructor_id in section_instructors)
                 ),
-                valid_ts[0] if valid_ts else None,
+                None,
             )
+            # No free slot: leave it unscheduled rather than force a clash. An
+            # unscheduled section costs 2.0, a hard conflict 3.0, so falling
+            # back to valid_ts[0] bought a placement at more than it was worth.
+            if timeslot is None and valid_ts and not section_instructors:
+                timeslot = valid_ts[0]
         elif not needs.time:
             room = viable_rooms[0] if viable_rooms else None
             timeslot = None
@@ -269,6 +277,8 @@ def decode(position, section_candidates, valid_timeslot_cache):
             room_id=room.id if room else None,
             timeslot_id=timeslot.id if timeslot else None,
             section=str(section.no),
+            instructor_ids=section.instructor_ids,
+            pattern_index=section.pattern_index,
             # Classification is keyed on level -- without it a detached item
             # looks like an ordinary room+time lecture.
             level=getattr(section.course, "level", None),
@@ -280,8 +290,8 @@ def decode(position, section_candidates, valid_timeslot_cache):
         if timeslot is not None:
             if room is not None:
                 occupied_rooms.add((room.id, timeslot.id))
-            if section.instructor_id is not None:
-                occupied_instructors.add((section.instructor_id, timeslot.id))
+            for instructor_id in instructor_occupancy_ids(section):
+                occupied_instructors.add((instructor_id, timeslot.id))
 
     return schedule
 
@@ -300,8 +310,8 @@ def _build_occupancy_maps(schedule):
             key = (item.room_id, item.timeslot_id)
             room_owner[key] = idx
             occupied_rooms.add(key)
-            if item.instructor_id is not None:
-                ikey = (item.instructor_id, item.timeslot_id)
+            for instructor_id in instructor_occupancy_ids(item):
+                ikey = (instructor_id, item.timeslot_id)
                 instructor_owner[ikey] = idx
                 occupied_instructors.add(ikey)
 
@@ -314,8 +324,8 @@ def _place(item, idx, room, timeslot, room_owner, instructor_owner, occupied_roo
     key = (room.id, timeslot.id)
     room_owner[key] = idx
     occupied_rooms.add(key)
-    if item.instructor_id is not None:
-        ikey = (item.instructor_id, timeslot.id)
+    for instructor_id in instructor_occupancy_ids(item):
+        ikey = (instructor_id, timeslot.id)
         instructor_owner[ikey] = idx
         occupied_instructors.add(ikey)
 
@@ -324,8 +334,8 @@ def _evict(item, room_owner, instructor_owner, occupied_rooms, occupied_instruct
     key = (item.room_id, item.timeslot_id)
     room_owner.pop(key, None)
     occupied_rooms.discard(key)
-    if item.instructor_id is not None:
-        ikey = (item.instructor_id, item.timeslot_id)
+    for instructor_id in instructor_occupancy_ids(item):
+        ikey = (instructor_id, item.timeslot_id)
         instructor_owner.pop(ikey, None)
         occupied_instructors.discard(ikey)
     item.room_id = None
@@ -366,6 +376,9 @@ def rescue_unscheduled(schedule, section_candidates, valid_timeslot_cache):
     for idx in unscheduled:
         item = schedule[idx]
         section, needs, viable_rooms, valid_ts = section_candidates[idx]
+        # None for supervision and for items with no instructor, matching what
+        # _build_occupancy_maps / _place / _evict record.
+        item_instructors = instructor_occupancy_ids(item)
 
         # The ejection chain trades (room, timeslot) pairs, so it only applies
         # to sections that need both.
@@ -388,9 +401,12 @@ def rescue_unscheduled(schedule, section_candidates, valid_timeslot_cache):
 
         for _, room, timeslot in candidates:
             room_blocker = room_owner.get((room.id, timeslot.id))
-            instr_blocker = (
-                instructor_owner.get((item.instructor_id, timeslot.id))
-                if item.instructor_id is not None else None
+            instr_blocker = next(
+                (owner for owner in (
+                    instructor_owner.get((instructor_id, timeslot.id))
+                    for instructor_id in item_instructors
+                ) if owner is not None),
+                None,
             )
 
             if room_blocker is None and instr_blocker is None:
@@ -413,8 +429,12 @@ def rescue_unscheduled(schedule, section_candidates, valid_timeslot_cache):
 
             trial_rooms = occupied_rooms - {(blocker.room_id, blocker.timeslot_id)}
             trial_instructors = occupied_instructors
-            if blocker.instructor_id is not None:
-                trial_instructors = occupied_instructors - {(blocker.instructor_id, blocker.timeslot_id)}
+            blocker_instructors = instructor_occupancy_ids(blocker)
+            if blocker_instructors:
+                trial_instructors = occupied_instructors - {
+                    (instructor_id, blocker.timeslot_id)
+                    for instructor_id in blocker_instructors
+                }
 
             if room_blocker is not None:
                 # Room-block: the blocker sits at exactly (room, timeslot),
@@ -523,7 +543,12 @@ def pso_schedule(sections, timeslots, rooms, valid_timeslot_cache=None, section_
         np.clip(velocities, -V_CLAMP, V_CLAMP, out=velocities)
         positions = positions + velocities
 
-    return gbest_sched, gbest_score
+    # Siblings (meeting blocks of one section) belong in one room. The
+    # placement loops have no cross-block state, so unify afterwards; the
+    # pass only ever moves a block into a room that is free at its hour.
+    return finalize_schedule(
+        gbest_sched, sections, timeslots, valid_timeslot_cache
+    ), gbest_score
 
 
 def pso_runs(sections, timeslots, rooms, num_runs=30):

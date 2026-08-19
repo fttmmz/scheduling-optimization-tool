@@ -8,6 +8,8 @@ from backend.Optimization.constraints import (
     get_valid_timeslots,
     get_viable_rooms,
     get_viable_rooms_for_schedule_item,
+    instructor_occupancy_ids,
+    finalize_schedule,
     passes_hard_constraints,
     get_section_campus,
     get_building_campus,
@@ -150,12 +152,12 @@ def scan_candidates(
     valid_timeslot_cache=None,
 ):
     candidates = []
-    instructor_id = section.instructor_id
+    instructor_ids = instructor_occupancy_ids(section)
 
     for timeslot in timeslots:
-        if (
-            instructor_id is not None
-            and (instructor_id, timeslot.id) in occupied_instructors
+        if any(
+            (instructor_id, timeslot.id) in occupied_instructors
+            for instructor_id in instructor_ids
         ):
             continue
 
@@ -242,16 +244,27 @@ def construct_grasp_solution(
         if not needs.room and not needs.time:
             room = timeslot = None
         elif not needs.room:
-            # Time only: pick the first slot that leaves the instructor free.
+            # Time only: pick the first slot that leaves EVERY instructor free.
+            # Checking only section.instructor_id missed the 2nd and 3rd teacher
+            # of a team-taught clinical section and booked them over their own
+            # other classes.
             room = None
+            section_instructors = instructor_occupancy_ids(section)
             timeslot = next(
                 (
                     ts for ts in valid_ts
-                    if section.instructor_id is None
-                    or (section.instructor_id, ts.id) not in occupied_instructors
+                    if all((instructor_id, ts.id) not in occupied_instructors
+                           for instructor_id in section_instructors)
                 ),
-                valid_ts[0] if valid_ts else None,
+                None,
             )
+            # No free slot: leave it unscheduled rather than force a clash.
+            # Under the agreed weights an unscheduled section (2.0) is cheaper
+            # than a hard conflict (3.0), and the old fallback to valid_ts[0]
+            # created exactly the impossible bookings the hard tier exists to
+            # forbid.
+            if timeslot is None and valid_ts and not section_instructors:
+                timeslot = valid_ts[0]
         elif not needs.time:
             room = viable_rooms[0] if viable_rooms else None
             timeslot = None
@@ -272,6 +285,8 @@ def construct_grasp_solution(
             room_id=room.id if room else None,
             timeslot_id=timeslot.id if timeslot else None,
             section=str(section.no),
+            instructor_ids=section.instructor_ids,
+            pattern_index=section.pattern_index,
             # Classification is keyed on level; without it a detached item
             # looks like an ordinary room+time lecture.
             level=getattr(section.course, "level", None),
@@ -282,11 +297,13 @@ def construct_grasp_solution(
 
         # A roomless section still consumes its instructor's time, so book the
         # instructor whenever a timeslot was assigned -- not only when a room was.
+        # Supervision is the exception and returns None here: a thesis
+        # supervisor is not occupying an hour of teaching.
         if timeslot is not None:
             if room is not None:
                 occupied_rooms.add((room.id, timeslot.id))
-            if section.instructor_id is not None:
-                occupied_instructors.add((section.instructor_id, timeslot.id))
+            for instructor_id in instructor_occupancy_ids(section):
+                occupied_instructors.add((instructor_id, timeslot.id))
 
     return schedule
 
@@ -384,10 +401,18 @@ def local_search(
     room_occupancy = Counter()
     instructor_occupancy = Counter()
     for it in best_schedule:
-        if it.room_id is not None and it.timeslot_id is not None:
+        if it.timeslot_id is None:
+            continue
+        if it.room_id is not None:
             room_occupancy[(it.room_id, it.timeslot_id)] += 1
-            if it.instructor_id is not None:
-                instructor_occupancy[(it.instructor_id, it.timeslot_id)] += 1
+        # Instructor occupancy is NOT conditional on having a room. Time-only
+        # classes (clinical, studios, office hours, graduate labs) hold no room
+        # but do hold their teachers' hours; seeding this from roomed items only
+        # made those teachers invisible here, and local search would then move a
+        # roomed class onto an hour its instructor was already teaching. Only
+        # roomed items are ever MOVED below, so the counters stay symmetric.
+        for instructor_id in instructor_occupancy_ids(it):
+            instructor_occupancy[(instructor_id, it.timeslot_id)] += 1
 
     # Pre-shuffle timeslots once per pass
     timeslot_list = timeslots[:]
@@ -410,6 +435,11 @@ def local_search(
             original_room = room_map.get(original_room_id)
             if original_room is None:
                 continue
+
+            # Must match what built instructor_occupancy above: supervision was
+            # never counted in, so it must never be counted out either, or the
+            # Counter drifts negative and hard_delta stops meaning anything.
+            occupying_instructors = instructor_occupancy_ids(item)
 
             old_local = _item_soft_penalty(
                 item, original_room, original_timeslot_id, valid_timeslot_cache
@@ -444,22 +474,20 @@ def local_search(
                     if old_room_count >= 2:
                         hard_delta -= 1
 
-                    if item.instructor_id is not None:
-                        old_instr_count = instructor_occupancy[
-                            (item.instructor_id, original_timeslot_id)
-                        ]
-                        if old_instr_count >= 2:
+                    for instructor_id in occupying_instructors:
+                        if instructor_occupancy[
+                            (instructor_id, original_timeslot_id)
+                        ] >= 2:
                             hard_delta -= 1
 
                     new_room_count = room_occupancy[(room.id, timeslot.id)]
                     if new_room_count >= 1:
                         hard_delta += 1
 
-                    if item.instructor_id is not None:
-                        new_instr_count = instructor_occupancy[
-                            (item.instructor_id, timeslot.id)
-                        ]
-                        if new_instr_count >= 1:
+                    for instructor_id in occupying_instructors:
+                        if instructor_occupancy[
+                            (instructor_id, timeslot.id)
+                        ] >= 1:
                             hard_delta += 1
 
                     # Compare moves on the same weighting the fitness uses; the
@@ -486,11 +514,11 @@ def local_search(
                     # failure needed.
                     room_occupancy[(original_room_id, original_timeslot_id)] -= 1
                     room_occupancy[(room.id, timeslot.id)] += 1
-                    if item.instructor_id is not None:
+                    for instructor_id in occupying_instructors:
                         instructor_occupancy[
-                            (item.instructor_id, original_timeslot_id)
+                            (instructor_id, original_timeslot_id)
                         ] -= 1
-                        instructor_occupancy[(item.instructor_id, timeslot.id)] += 1
+                        instructor_occupancy[(instructor_id, timeslot.id)] += 1
 
                     item.room_id = room.id
                     item.timeslot_id = timeslot.id
@@ -556,7 +584,12 @@ def grasp_schedule(
         if no_improve_count >= NO_IMPROVE_LIMIT:
             break
 
-    return best_schedule, best_fitness
+    # Siblings (meeting blocks of one section) belong in one room. The
+    # placement loops have no cross-block state, so unify afterwards; the
+    # pass only ever moves a block into a room that is free at its hour.
+    return finalize_schedule(
+        best_schedule, sections, timeslots, valid_timeslot_cache
+    ), best_fitness
 
 
 # ============================================================

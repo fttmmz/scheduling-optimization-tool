@@ -11,6 +11,8 @@ from backend.Optimization.constraints import (
     needs_to_label,
     get_valid_timeslots,
     get_viable_rooms,
+    instructor_occupancy_ids,
+    finalize_schedule,
     room_soft_penalty,
 )
 from backend.models.models import ScheduleItem
@@ -84,6 +86,8 @@ def clone_item(item):
         room_id=item.room_id,
         timeslot_id=item.timeslot_id,
         section=item.section,
+        instructor_ids=item.instructor_ids,
+        pattern_index=getattr(item, "pattern_index", 0),
         # level/course_class must survive cloning: _item_requirement reads
         # item.level, so dropping it here would silently mis-classify every
         # cloned schedule (and hybrid clones constantly).
@@ -110,6 +114,8 @@ def _new_schedule(sections):
             room_id=None,
             timeslot_id=None,
             section=section.no,
+            instructor_ids=section.instructor_ids,
+            pattern_index=section.pattern_index,
             level=getattr(section.course, "level", None),
             course_class=getattr(section.course, "course_class", None),
         )
@@ -204,8 +210,8 @@ def _build_occupancy(schedule):
 
         if schedule_item.room_id is not None:
             room_counts[(schedule_item.room_id, timeslot_id)] += 1
-        if schedule_item.instructor_id is not None:
-            instructor_counts[(schedule_item.instructor_id, timeslot_id)] += 1
+        for instructor_id in instructor_occupancy_ids(schedule_item):
+            instructor_counts[(instructor_id, timeslot_id)] += 1
 
     return room_counts, instructor_counts
 
@@ -219,8 +225,8 @@ def _remove_assignment(schedule_item, room_counts, instructor_counts):
             if room_counts[room_key] <= 0:
                 del room_counts[room_key]
 
-        if schedule_item.instructor_id is not None:
-            instructor_key = (schedule_item.instructor_id, timeslot_id)
+        for instructor_id in instructor_occupancy_ids(schedule_item):
+            instructor_key = (instructor_id, timeslot_id)
             instructor_counts[instructor_key] -= 1
             if instructor_counts[instructor_key] <= 0:
                 del instructor_counts[instructor_key]
@@ -238,8 +244,8 @@ def _add_assignment(schedule_item, room_id, timeslot_id, room_counts, instructor
 
     if room_id is not None:
         room_counts[(room_id, timeslot_id)] += 1
-    if schedule_item.instructor_id is not None:
-        instructor_counts[(schedule_item.instructor_id, timeslot_id)] += 1
+    for instructor_id in instructor_occupancy_ids(schedule_item):
+        instructor_counts[(instructor_id, timeslot_id)] += 1
 
 
 def _conflict_totals(room_counts, instructor_counts):
@@ -271,11 +277,9 @@ def _placement_cost(schedule_item, room_id, timeslot_id, room_counts, instructor
         return 0
 
     cost = room_counts.get((room_id, timeslot_id), 0) * ROOM_CONFLICT_WEIGHT
-    if schedule_item.instructor_id is not None:
+    for instructor_id in instructor_occupancy_ids(schedule_item):
         cost += (
-            instructor_counts.get(
-                (schedule_item.instructor_id, timeslot_id), 0
-            )
+            instructor_counts.get((instructor_id, timeslot_id), 0)
             * INSTRUCTOR_CONFLICT_WEIGHT
         )
     return cost
@@ -291,12 +295,9 @@ def _is_problem(schedule_item, room_counts, instructor_counts):
     if room_counts.get((schedule_item.room_id, schedule_item.timeslot_id), 0) > 1:
         return True
 
-    return (
-        schedule_item.instructor_id is not None
-        and instructor_counts.get(
-            (schedule_item.instructor_id, schedule_item.timeslot_id), 0
-        )
-        > 1
+    return any(
+        instructor_counts.get((instructor_id, schedule_item.timeslot_id), 0) > 1
+        for instructor_id in instructor_occupancy_ids(schedule_item)
     )
 
 
@@ -442,8 +443,8 @@ def _best_candidates(
 def _construction_order(sections, option_cache):
     instructor_load = defaultdict(int)
     for section in sections:
-        if section.instructor_id is not None:
-            instructor_load[section.instructor_id] += 1
+        for instructor_id in instructor_occupancy_ids(section):
+            instructor_load[instructor_id] += 1
 
     indices = [
         idx
@@ -454,7 +455,9 @@ def _construction_order(sections, option_cache):
     indices.sort(
         key=lambda idx: (
             _domain_size(idx, option_cache),
-            -instructor_load.get(sections[idx].instructor_id, 0),
+            -max((instructor_load[instructor_id]
+                  for instructor_id in instructor_occupancy_ids(sections[idx])),
+                 default=0),
             -getattr(sections[idx], "capacity", 0),
             random.random(),
         )
@@ -542,9 +545,9 @@ def _select_neighborhood(schedule, option_cache, target_size):
             and schedule_item.room_id == seed_item.room_id
             and schedule_item.timeslot_id == seed_item.timeslot_id
         )
-        same_instructor = (
-            seed_item.instructor_id is not None
-            and schedule_item.instructor_id == seed_item.instructor_id
+        seed_instructors = set(instructor_occupancy_ids(seed_item))
+        same_instructor = bool(
+            seed_instructors & set(instructor_occupancy_ids(schedule_item))
         )
         same_timeslot = (
             seed_item.timeslot_id is not None
@@ -973,8 +976,8 @@ def _blocking_indices(schedule, moving_idx, room_id, timeslot_id):
             and item.timeslot_id == timeslot_id
         )
         instructor_block = (
-            moving_item.instructor_id is not None
-            and item.instructor_id == moving_item.instructor_id
+            bool(set(instructor_occupancy_ids(moving_item))
+                 & set(instructor_occupancy_ids(item)))
             and item.timeslot_id == timeslot_id
         )
 
@@ -1299,7 +1302,10 @@ def genetic_schedule(sections, timeslots, rooms, cache=None, option_cache=None):
         static_memo,
     )
 
-    return best
+    # Siblings (meeting blocks of one section) belong in one room. The
+    # placement loops have no cross-block state, so unify afterwards; the
+    # pass only ever moves a block into a room that is free at its hour.
+    return finalize_schedule(best, sections, timeslots, cache)
 
 
 def genetic_runs(sections, timeslots, rooms, num_runs=1):
