@@ -14,14 +14,15 @@ from backend.Optimization.engine import SchedulingEngine
 from backend.Optimization.evaluation import (
     calculate_fitness,
     count_conflicts,
+    count_hard_conflicts,
     count_instructor_conflicts,
     count_room_conflicts,
-    count_campus_conflicts,
-    count_room_type_conflicts,
-    count_department_conflicts,
-    count_capacity_conflicts,
+    count_sibling_conflicts,
     count_timeslot_guideline_conflicts,
     build_timeslot_guideline_cache,
+    soft_violation_counts,
+    total_soft_penalty,
+    total_time_penalty,
 )
 from backend.database.db import supabase
 from backend.database.loader import get_scheduling_data, load_schedule, save_schedule
@@ -214,16 +215,44 @@ def run_optimization(algorithm: str, num_runs: int = 1) -> Dict[str, Any]:
         )
 
     ts_cache = build_timeslot_guideline_cache(sections, timeslots)
-    conflict_count = count_conflicts(schedule_items, rooms, sections, timeslots, valid_timeslot_cache=ts_cache)
-    conflict_detail = {
+
+    # Reported in TIERS, mirroring constraints.py section 6 and evaluation.py.
+    # This used to be one flat dict in which `instructor` and `room` sat as
+    # equals beside `campus` and `capacity`, and `conflicts` was the flat
+    # count_conflicts() total -- so the UI presented a double-booking as no
+    # worse than a campus mismatch, which is the thing the hard/soft split
+    # exists to stop the ENGINE doing. The engine was rebuilt in August 2026;
+    # this layer had not caught up, and had since fallen a further three rules
+    # behind (siblings, and the two time rules).
+    #
+    #   HARD  physically impossible -- a room, an instructor or a group of
+    #         students required in two places at once. Never acceptable, and
+    #         the only number that answers "can this timetable be run".
+    #   SOFT  bent preferences. Real, priced into the objective, and never a
+    #         reason to leave a section unscheduled.
+    hard_detail = {
         "instructor": count_instructor_conflicts(schedule_items),
         "room": count_room_conflicts(schedule_items),
-        "campus": count_campus_conflicts(schedule_items, rooms),
-        "room_type": count_room_type_conflicts(schedule_items, rooms),
-        "department": count_department_conflicts(schedule_items, rooms),
-        "capacity": count_capacity_conflicts(schedule_items, rooms),
-        "timeslot_guidelines": count_timeslot_guideline_conflicts(schedule_items, sections, timeslots, ts_cache),
+        "sibling": count_sibling_conflicts(schedule_items),
     }
+    soft_detail = soft_violation_counts(schedule_items, rooms, timeslots)
+    soft_detail["timeslot_guidelines"] = count_timeslot_guideline_conflicts(
+        schedule_items, sections, timeslots, ts_cache
+    )
+
+    hard_total = count_hard_conflicts(schedule_items)
+    room_penalty = total_soft_penalty(schedule_items, rooms)
+    time_penalty = total_time_penalty(schedule_items, timeslots)
+
+    conflict_detail = {
+        "hard": hard_detail,
+        "soft": soft_detail,
+        # Flat copy so an older client keeps rendering. Do not add to it; new
+        # rules belong in the tier they actually sit in.
+        **hard_detail,
+        **soft_detail,
+    }
+
     fitness_score = calculate_fitness(
         schedule_items, rooms, sections=sections, timeslots=timeslots, valid_timeslot_cache=ts_cache,
     )
@@ -232,8 +261,20 @@ def run_optimization(algorithm: str, num_runs: int = 1) -> Dict[str, Any]:
         "schedule": enriched,
         "scheduled": scheduled,
         "unscheduled": unscheduled_count,
-        "conflicts": conflict_count,
+        # `conflicts` now means HARD conflicts -- the count that decides whether
+        # the timetable can be run at all. It used to be the flat total, which
+        # mixed in soft violations and so never reached zero, leaving the UI
+        # permanently red for schedules that were in fact perfectly runnable.
+        "conflicts": hard_total,
+        "conflicts_flat": count_conflicts(
+            schedule_items, rooms, sections, timeslots, valid_timeslot_cache=ts_cache
+        ),
         "conflict_detail": conflict_detail,
+        "soft_penalty": {
+            "room": round(room_penalty, 3),
+            "time": round(time_penalty, 3),
+            "total": round(room_penalty + time_penalty, 3),
+        },
         "fitness": fitness_score,
         "exec_time": exec_time,
         "total_sections": len(sections),
