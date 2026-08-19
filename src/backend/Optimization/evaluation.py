@@ -12,6 +12,8 @@ from backend.Optimization.constraints import (
     occupancy_key,
     room_soft_penalty,
     room_soft_penalty_parts,
+    time_soft_penalty,
+    time_soft_penalty_parts,
 )
 
 # ── Scoring tiers ────────────────────────────────────────────────────────────
@@ -190,22 +192,39 @@ def count_hard_conflicts(schedule: list) -> int:
     )
 
 
-def soft_violation_counts(schedule: list, rooms: list) -> dict:
+def soft_violation_counts(schedule: list, rooms: list, timeslots: list = None) -> dict:
     """SOFT tier, per rule: how many placements bend each soft rule.
 
     Counts, not costs -- for reporting "this schedule breaks campus 41 times",
     which is directly comparable against the manual schedule's own rates.
     """
     room_map = {room.id: room for room in rooms}
-    counts = {"room_type": 0, "department": 0, "campus": 0, "capacity": 0}
+    counts = {
+        "room_type": 0, "department": 0, "campus": 0, "capacity": 0,
+        "supervision_daytime": 0, "teaching_evening": 0,
+    }
 
     for item in schedule:
         room = room_map.get(item.room_id)
-        if not room:
-            continue
-        for rule, cost in room_soft_penalty_parts(item, room).items():
-            if cost > 0:
-                counts[rule] += 1
+        if room:
+            for rule, cost in room_soft_penalty_parts(item, room).items():
+                if cost > 0:
+                    counts[rule] += 1
+
+    # The time rules are counted over items with a TIMESLOT, not items with a
+    # room -- supervision and clinical practice hold an hour and no room at all,
+    # and they are the population the evening preference is mostly about. Keying
+    # this off room_map like the block above would have measured almost none of
+    # them.
+    if timeslots is not None:
+        timeslot_map = {ts.id: ts for ts in timeslots}
+        for item in schedule:
+            ts = timeslot_map.get(item.timeslot_id)
+            if not ts:
+                continue
+            for rule, cost in time_soft_penalty_parts(item, ts).items():
+                if cost > 0:
+                    counts[rule] += 1
 
     return counts
 
@@ -217,6 +236,25 @@ def total_soft_penalty(schedule: list, rooms: list) -> float:
         room_soft_penalty(item, room_map[item.room_id])
         for item in schedule
         if item.room_id in room_map
+    )
+
+
+def total_time_penalty(schedule: list, timeslots: list) -> float:
+    """SOFT tier, time axis: total cost of every timeslot assignment.
+
+    Kept separate from total_soft_penalty() rather than folded into it, for two
+    reasons. The room total is quoted throughout HANDOVER section 9 as "soft per
+    roomed section", and silently changing what that number measures would make
+    every figure in that table incomparable with the ones after it. The two also
+    range over different populations -- rooms over roomed items, time over timed
+    items -- so one function would need both lists and would still be summing
+    two different denominators. calculate_fitness() adds them.
+    """
+    timeslot_map = {ts.id: ts for ts in timeslots}
+    return sum(
+        time_soft_penalty(item, timeslot_map[item.timeslot_id])
+        for item in schedule
+        if item.timeslot_id in timeslot_map
     )
 
 
@@ -388,6 +426,12 @@ def calculate_fitness(
             timeslots,
             valid_timeslot_cache=valid_timeslot_cache,
         )
+
+    # The evening preference (HANDOVER 4.7). Needs only the timeslot list, so it
+    # applies on the `sections is None` path too -- unlike the guideline check
+    # above, which needs sections to know what shape each one may take.
+    if timeslots is not None:
+        soft_penalty += total_time_penalty(schedule, timeslots)
 
     # --- Normalize each tier by total sections ---
     hard_rate        = hard_conflicts / total_sections

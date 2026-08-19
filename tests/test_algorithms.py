@@ -288,3 +288,161 @@ def test_supervision_does_not_consume_a_room_it_does_not_need(dataset):
     thesis = next(i for i in schedule if i.course_id == 6)
     assert thesis.room_id is None
     assert thesis.timeslot_id is None
+
+
+# ── The evening preference (HANDOVER.md section 10) ──────────────────────────
+
+def _pref_section(course_id, course_type, section_no, level="Undergraduate"):
+    return Section({
+        "courses": {"course_id": course_id, "name": f"C{course_id}",
+                    "course_type": course_type, "dept_id": 1,
+                    "level": level, "course_class": None},
+        # A distinct instructor each, so an instructor clash can never be the
+        # reason a section ends up on the wrong half of the day.
+        "instructor_id": f"I{course_id}",
+        "section": section_no, "sec_capacity": 30,
+    }, instructor_ids=[f"I{course_id}"])
+
+
+def _preference_dataset():
+    """Built so ONLY the time preference can decide the placement.
+
+    Three properties matter, and each was added after watching a mutation
+    survive without it:
+
+      * MORE THAN 15 valid slots per section. GRASP and PSO scan a
+        random.sample() of the candidate slots when there are more than
+        CONSTRUCTION_TIMESLOT_SAMPLE of them (15 and 8). Below that threshold no
+        sampling happens, the ranked order of get_valid_timeslots() survives
+        into the scan, and `max(candidates)` returns the first best slot -- which
+        is a preferred one whether or not the scorer knows about time. A small
+        dataset therefore passes even with the fix reverted. 24 slots per
+        population forces the sample and destroys the ordering, which is exactly
+        what happens on the real 466-slot dataset.
+
+      * BOTH requirement shapes. Lectures and Senior Project Supervision need a
+        room and a time; Thesis and Clinical Practice need a time and no room.
+        Hybrid scores those two through different branches, and reverting the
+        time term in one of them is invisible to a dataset that only exercises
+        the other.
+
+      * NO OTHER AXIS IN PLAY. Identical rooms, valid days and durations for
+        every course type, capacity far exceeding demand, and equal numbers of
+        daytime and evening slots. An algorithm that cannot see the preference
+        is choosing by coin toss across 24 sections.
+    """
+    sections = []
+    for i in range(10):     # daytime-preferring, needs room + time
+        sections.append(_pref_section(100 + i, "Lecture Undergraduate", f"6{i}"))
+    for i in range(6):      # evening-preferring, needs room + time
+        sections.append(_pref_section(200 + i, "Senior Project Supervision", f"7{i}"))
+    for i in range(4):      # evening-preferring, TIME ONLY
+        sections.append(_pref_section(300 + i, "Thesis", f"8{i}", level="Master"))
+    for i in range(4):      # daytime-preferring, TIME ONLY
+        sections.append(
+            _pref_section(400 + i, "Clinical Practice", f"9{i}", level="Master")
+        )
+
+    rooms = [
+        Room({"room_id": i, "capacity": 200, "room_type": "classroom",
+              "building": "M8", "dept_id": 1, "room_num": str(i)})
+        for i in range(1, 21)
+    ]
+
+    DAY_STARTS = ("08:00:00", "09:30:00", "11:00:00",
+                  "12:30:00", "14:00:00", "15:30:00")
+    EVE_STARTS = ("17:00:00", "18:15:00", "19:30:00",
+                  "20:45:00", "22:00:00", "23:15:00")
+
+    def plus_75(start):
+        hh, mm = int(start[:2]), int(start[3:5])
+        mm += 75
+        return f"{(hh + mm // 60) % 24:02d}:{mm % 60:02d}:00"
+
+    timeslots, tid = [], 1
+    # Lectures want MW/TR at 1h15m. 12 per day pattern, half of them evening.
+    for day in ("MW", "TR"):
+        for start in DAY_STARTS + EVE_STARTS:
+            timeslots.append(Timeslot({"timeslot_id": tid, "day": day,
+                                       "start_time": start,
+                                       "end_time": plus_75(start)}))
+            tid += 1
+    # Supervision, thesis and clinical want a single day. 6 per day, half evening.
+    for day in ("M", "T", "W", "R"):
+        for start in DAY_STARTS[:3] + EVE_STARTS[:3]:
+            timeslots.append(Timeslot({"timeslot_id": tid, "day": day,
+                                       "start_time": start,
+                                       "end_time": plus_75(start)}))
+            tid += 1
+
+    return sections, timeslots, rooms
+
+
+@pytest.fixture(scope="module")
+def preference_dataset():
+    return _preference_dataset()
+
+
+@pytest.mark.parametrize("algorithm", ALGORITHMS)
+def test_honours_the_evening_preference(algorithm, preference_dataset):
+    """Every algorithm must honour it, not only the ones that walk the list.
+
+    Ranking get_valid_timeslots() was enough for greedy and genetic, which take
+    the first FREE slot they are handed. GRASP, PSO and hybrid SAMPLE the
+    room x timeslot space and keep the cheapest candidate, so until their
+    candidate scorers priced the time axis they could not see it. On the full
+    dataset those three placed 424-473 undergraduate classes in the evening and
+    52-82 supervision sections in the daytime, while the fitness they were
+    judged by charged for every one -- the schedules looked fine and scored
+    badly for reasons nothing reported.
+    """
+    from backend.Optimization.constraints import (
+        is_evening_timeslot, prefers_daytime, prefers_evening,
+    )
+
+    sections, timeslots, rooms = preference_dataset
+    schedule = _run(algorithm, sections, timeslots, rooms)
+    timeslot_map = {ts.id: ts for ts in timeslots}
+
+    misplaced = []
+    for item in schedule:
+        ts = timeslot_map.get(item.timeslot_id)
+        if ts is None:
+            continue
+        wrong = (
+            (prefers_daytime(item) and is_evening_timeslot(ts))
+            or (prefers_evening(item) and not is_evening_timeslot(ts))
+        )
+        if wrong:
+            misplaced.append(
+                f"{item.course_id} ({item.course_type}) at {ts.start}"
+            )
+
+    assert not misplaced, f"{algorithm} ignored the time preference: {misplaced}"
+
+
+@pytest.mark.parametrize("algorithm", ALGORITHMS)
+def test_the_preference_never_costs_a_placement(algorithm, preference_dataset):
+    """A preference must not strand a section -- the point of ranking not filtering.
+
+    Unscheduled costs 2.0 against at most 0.3 of soft penalty, so an algorithm
+    that runs out of preferred slots has to spill into the rest rather than give
+    up. The rule this replaced hard-filtered supervision to slots at/after 15:00
+    and could not spill at all.
+    """
+    from backend.Optimization.constraints import section_needs
+
+    sections, timeslots, rooms = preference_dataset
+    schedule = _run(algorithm, sections, timeslots, rooms)
+
+    expected = {
+        (str(s.course.id), str(s.no))
+        for s in sections
+        if section_needs(s).time
+    }
+    placed = {
+        (str(item.course_id), str(item.section))
+        for item in schedule
+        if item.timeslot_id is not None
+    }
+    assert expected - placed == set(), f"{algorithm} left these unplaced"
