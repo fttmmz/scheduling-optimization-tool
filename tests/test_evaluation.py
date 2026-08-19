@@ -3,7 +3,7 @@
 The hard/soft split is the main result of the constraint rework: HARD means
 physically impossible, SOFT means imperfect but runnable. The failure mode these
 tests exist to catch is the tiers quietly collapsing back into one flat count --
-which is what `count_conflicts` still does, and why it must never gate anything.
+which is what `count_all_violations_flat` still does, and why it must never gate anything.
 """
 import pytest
 
@@ -12,7 +12,7 @@ from backend.Optimization.evaluation import (
     SOFT_PENALTY_WEIGHT,
     UNSCHEDULED_WEIGHT,
     calculate_fitness,
-    count_conflicts,
+    count_all_violations_flat,
     count_hard_conflicts,
     count_instructor_conflicts,
     count_room_conflicts,
@@ -174,10 +174,10 @@ def test_perfect_placement_has_no_soft_penalty():
     assert total_soft_penalty(schedule, rooms) == 0.0
 
 
-def test_count_conflicts_flattens_the_tiers_and_is_display_only():
+def test_count_all_violations_flat_flattens_the_tiers_and_is_display_only():
     """Documents the trap rather than the intent (HANDOVER.md section 6).
 
-    count_conflicts sums hard and soft at equal weight, so it cannot distinguish
+    count_all_violations_flat sums hard and soft at equal weight, so it cannot distinguish
     an impossible schedule from a merely imperfect one. Retained for the UI;
     never a feasibility test.
     """
@@ -198,7 +198,7 @@ def test_count_conflicts_flattens_the_tiers_and_is_display_only():
     assert total_soft_penalty(impossible, rooms) == 0.0
 
     # ...yet the flat count rates the runnable schedule as four times worse.
-    assert count_conflicts(imperfect, rooms) > count_conflicts(impossible, rooms)
+    assert count_all_violations_flat(imperfect, rooms) > count_all_violations_flat(impossible, rooms)
 
     # The tiered fitness gets the ordering right, which is the whole point.
     assert calculate_fitness(impossible, rooms, total_sections=2) < \

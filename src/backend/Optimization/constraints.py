@@ -463,7 +463,8 @@ def resolve_sibling_time_conflicts(schedule, sections, timeslots,
     return schedule
 
 
-def finalize_schedule(schedule, sections, timeslots, valid_timeslot_cache=None):
+def finalize_schedule(schedule, sections, timeslots, valid_timeslot_cache=None,
+                      rooms=None):
     """Repairs every algorithm applies to the schedule it returns.
 
     Order matters: separate the sibling blocks in TIME first, because two blocks
@@ -473,10 +474,10 @@ def finalize_schedule(schedule, sections, timeslots, valid_timeslot_cache=None):
     schedule = resolve_sibling_time_conflicts(
         schedule, sections, timeslots, valid_timeslot_cache
     )
-    return unify_sibling_rooms(schedule)
+    return unify_sibling_rooms(schedule, rooms)
 
 
-def unify_sibling_rooms(schedule):
+def unify_sibling_rooms(schedule, rooms=None):
     """Move every meeting block of one section into a single shared room.
 
     A section that meets twice a week meets in the SAME place both times; the
@@ -485,6 +486,17 @@ def unify_sibling_rooms(schedule):
     through five different placement loops, this repairs it afterwards -- the
     affected population is six sections, so a repair pass is the proportionate
     tool.
+
+    Pass *rooms* to search the section's whole ranked room list, not only the
+    rooms its blocks already happen to sit in. Without it the repair gives up
+    whenever those two or three rooms are busy at one of the hours, even though
+    some other perfectly good room is free at all of them -- which left one
+    section split in roughly 3% of runs. With it, a section stays split only when
+    NO room it could use is free across all of its meeting hours.
+
+    Rooms already in use by the group are tried FIRST, so a schedule that is
+    already unified is never churned, and the wider list is ranked by soft
+    penalty so the fallback prefers rooms that suit the section anyway.
 
     Never creates a conflict: a block only moves if the target room is actually
     free at that block's timeslot. Blocks that cannot move are left where they
@@ -517,6 +529,19 @@ def unify_sibling_rooms(schedule):
         # sibling's hour while a less popular one is free at all of them.
         counts = Counter(item.room_id for item in roomed)
         candidates = sorted(counts, key=lambda room_id: (-counts[room_id], room_id))
+
+        # Then every other room this section could use, best-fit first. Ranked
+        # over the FULL room list rather than the default top-25, because this
+        # is a last resort: a slightly worse room shared by both blocks beats a
+        # good room used by only one.
+        if rooms:
+            seen = set(candidates)
+            for room in get_viable_rooms_for_schedule_item(
+                roomed[0], rooms, limit=len(rooms)
+            ):
+                if room.id not in seen:
+                    seen.add(room.id)
+                    candidates.append(room.id)
 
         target = next(
             (

@@ -310,7 +310,7 @@ def count_timeslot_guideline_conflicts(
     return conflicts
 
 
-def count_conflicts(
+def count_all_violations_flat(
     schedule: list,
     rooms: list,
     sections: list = None,
@@ -319,6 +319,10 @@ def count_conflicts(
 ) -> int:
     """
     Flat count of ALL rule violations, hard and soft alike, one point each.
+
+    Named the long ugly way on purpose. As `count_conflicts` this was the most
+    obvious-looking function in the module, so it was the one people reached
+    for -- and it answers the wrong question.
 
     NOTE: this deliberately mixes the tiers, so it is a "total blemishes"
     display number only -- do NOT read it as a feasibility measure. A schedule

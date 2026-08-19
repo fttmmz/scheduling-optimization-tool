@@ -22,7 +22,6 @@ from backend.Optimization.evaluation import (
     calculate_fitness,
     total_time_penalty,
     build_timeslot_guideline_cache,
-    count_conflicts,
     count_hard_conflicts,
     count_scheduled_sections,
     count_timeslot_guideline_conflicts,
@@ -320,7 +319,7 @@ def construct_grasp_solution(
 
 # ============================================================
 # Per-item conflict check
-# Of the 7 conflict types in count_conflicts(), 5 depend only on a single
+# Of the 7 conflict types the evaluator tracks, 5 depend only on a single
 # item's own (room, timeslot) -- not on any other item in the schedule:
 # campus, room type, department, capacity, timeslot guidelines. This
 # computes just those 5 for one item in O(1), instead of the O(sections)
@@ -610,7 +609,7 @@ def grasp_schedule(
     # placement loops have no cross-block state, so unify afterwards; the
     # pass only ever moves a block into a room that is free at its hour.
     return finalize_schedule(
-        best_schedule, sections, timeslots, valid_timeslot_cache
+        best_schedule, sections, timeslots, valid_timeslot_cache, rooms=rooms
     ), best_fitness
 
 

@@ -225,3 +225,127 @@ def test_pattern_counts_match_group_sizes(sections):
     by_key = Counter(s.sibling_key for s in sections)
     for section in sections:
         assert section.pattern_count == by_key[section.sibling_key]
+
+
+# ── Sibling room unification searches the whole room list ────────────────────
+
+def _sibling_pair_scenario():
+    """Two blocks of one section, in rooms 1 and 2, that cannot both use either.
+
+    Room 1 is busy at block B's hour, room 2 is busy at block A's hour -- so the
+    only rooms the blocks currently occupy are each blocked at one of the two
+    times. Room 3 is free at both.
+
+    This is the shape that used to defeat the repair: it only ever tried the
+    rooms the blocks already sat in, so it gave up and left the section split
+    even though room 3 was sitting empty.
+    """
+    from backend.models.models import Room, ScheduleItem
+
+    rooms = [
+        Room({"room_id": rid, "capacity": 40, "room_type": "classroom",
+              "building": "M8", "dept_id": 1, "room_num": str(rid)})
+        for rid in (1, 2, 3)
+    ]
+
+    def item(course_id, section, pattern_index, room_id, timeslot_id):
+        return ScheduleItem(
+            course_id=course_id, course_name=f"C{course_id}",
+            course_type="Studio Undergraduate", course_dept=1, capacity=30,
+            instructor_id=None, room_id=room_id, timeslot_id=timeslot_id,
+            section=section, level="Undergraduate", instructor_ids=[],
+            pattern_index=pattern_index,
+        )
+
+    schedule = [
+        item(1, "61", 0, 1, 10),      # block A, room 1, hour 10
+        item(1, "61", 1, 2, 20),      # block B, room 2, hour 20
+        item(2, "61", 0, 1, 20),      # blocks room 1 at hour 20
+        item(3, "61", 0, 2, 10),      # blocks room 2 at hour 10
+    ]
+    return schedule, rooms
+
+
+def test_sibling_rooms_unify_via_a_room_neither_block_was_using():
+    """A section splits across rooms only if NO room is free at all its hours.
+
+    Without the room list the repair can only consider rooms the blocks already
+    occupy, and leaves the section split whenever those are busy -- which is what
+    happened to one section in about 3% of full-dataset runs.
+    """
+    from backend.Optimization.constraints import (
+        count_sibling_room_splits, unify_sibling_rooms,
+    )
+
+    schedule, rooms = _sibling_pair_scenario()
+    assert count_sibling_room_splits(schedule) == 1, "scenario must start split"
+
+    unify_sibling_rooms(schedule, rooms)
+
+    assert count_sibling_room_splits(schedule) == 0
+    blocks = [i for i in schedule if i.course_id == 1]
+    assert {i.room_id for i in blocks} == {3}, "should have moved to the free room"
+
+
+def test_sibling_unification_never_double_books():
+    """The wider search must still only move into genuinely free rooms."""
+    from backend.Optimization.constraints import unify_sibling_rooms
+    from backend.Optimization.evaluation import count_room_conflicts
+
+    schedule, rooms = _sibling_pair_scenario()
+    unify_sibling_rooms(schedule, rooms)
+
+    assert count_room_conflicts(schedule) == 0
+
+
+def test_sibling_unification_leaves_the_split_when_nothing_is_free():
+    """No room free at both hours: leave it split rather than break something.
+
+    A split room is a soft blemish on one section; evicting another class to fix
+    it would be a hard conflict, which is far worse.
+    """
+    from backend.Optimization.constraints import (
+        count_sibling_room_splits, unify_sibling_rooms,
+    )
+
+    schedule, rooms = _sibling_pair_scenario()
+    # Occupy room 3 at both hours, so nothing can host the pair.
+    blocker = [i for i in schedule if i.course_id == 2][0]
+    schedule.append(type(blocker)(
+        course_id=4, course_name="C4", course_type="Lecture Undergraduate",
+        course_dept=1, capacity=30, instructor_id=None, room_id=3,
+        timeslot_id=10, section="61", level="Undergraduate", instructor_ids=[],
+    ))
+    schedule.append(type(blocker)(
+        course_id=5, course_name="C5", course_type="Lecture Undergraduate",
+        course_dept=1, capacity=30, instructor_id=None, room_id=3,
+        timeslot_id=20, section="61", level="Undergraduate", instructor_ids=[],
+    ))
+
+    unify_sibling_rooms(schedule, rooms)
+
+    assert count_sibling_room_splits(schedule) == 1
+    from backend.Optimization.evaluation import count_room_conflicts
+    assert count_room_conflicts(schedule) == 0, "must not evict anyone"
+
+
+def test_sibling_unification_still_works_without_a_room_list():
+    """rooms is optional -- old callers keep the previous behaviour."""
+    from backend.Optimization.constraints import (
+        count_sibling_room_splits, unify_sibling_rooms,
+    )
+    from backend.models.models import Room, ScheduleItem
+
+    def item(course_id, pattern_index, room_id, timeslot_id):
+        return ScheduleItem(
+            course_id=course_id, course_name=f"C{course_id}",
+            course_type="Studio Undergraduate", course_dept=1, capacity=30,
+            instructor_id=None, room_id=room_id, timeslot_id=timeslot_id,
+            section="61", level="Undergraduate", instructor_ids=[],
+            pattern_index=pattern_index,
+        )
+
+    # Room 1 is free at both hours, so the narrow search alone can fix this.
+    schedule = [item(1, 0, 1, 10), item(1, 1, 2, 20)]
+    unify_sibling_rooms(schedule)
+    assert count_sibling_room_splits(schedule) == 0

@@ -547,7 +547,7 @@ def pso_schedule(sections, timeslots, rooms, valid_timeslot_cache=None, section_
     # placement loops have no cross-block state, so unify afterwards; the
     # pass only ever moves a block into a room that is free at its hour.
     return finalize_schedule(
-        gbest_sched, sections, timeslots, valid_timeslot_cache
+        gbest_sched, sections, timeslots, valid_timeslot_cache, rooms=rooms
     ), gbest_score
 
 
