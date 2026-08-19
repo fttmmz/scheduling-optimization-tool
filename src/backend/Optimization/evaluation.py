@@ -7,6 +7,8 @@ from backend.Optimization.constraints import (
     get_section_campus,
     get_building_campus,
     get_valid_timeslots_for_section,
+    group_siblings,
+    instructor_occupancy_ids,
     occupancy_key,
     room_soft_penalty,
     room_soft_penalty_parts,
@@ -69,15 +71,48 @@ def _count_slot_conflicts(schedule: list, slot_of) -> int:
 
 
 def count_instructor_conflicts(schedule: list) -> int:
-    """HARD: one instructor expected in two places at once."""
-    return _count_slot_conflicts(
-        schedule,
-        lambda item: (
-            None
-            if item.instructor_id is None or item.timeslot_id is None
-            else (item.instructor_id, item.timeslot_id)
-        ),
+    """HARD: one instructor expected in two places at once.
+
+    Counts EVERY instructor on a class, not just the first -- a team-taught
+    class commits all of them. The old single-instructor read made 598 real
+    assignments invisible here.
+
+    Supervision is excluded via instructor_occupancy_ids(): a supervisor
+    attached to a thesis or senior project is not standing in a room, so several
+    such attachments at one nominal hour are not a clash. Counting them as one
+    is what made the manual schedule -- which is in active use, and therefore
+    feasible by definition -- appear to contain hundreds of impossible bookings.
+    """
+    slots = defaultdict(list)
+    for item in schedule:
+        if item.timeslot_id is None:
+            continue
+        for instructor_id in instructor_occupancy_ids(item):
+            slots[(instructor_id, item.timeslot_id)].append(item)
+
+    return sum(
+        max(0, _count_occupants(items) - 1)
+        for items in slots.values()
+        if len(items) > 1
     )
+
+
+def count_sibling_conflicts(schedule: list) -> int:
+    """HARD: one section holding two of its own meeting blocks at one hour.
+
+    A clinical section that meets five times a week becomes five entities
+    sharing a sibling_key. They are the same students, so two of them at the
+    same timeslot is as impossible as a double-booked room -- and unlike a room
+    clash, nothing else in the model would catch it, because the blocks may
+    carry no room and no instructor at all.
+    """
+    conflicts = 0
+    for group in group_siblings(schedule).values():
+        counts = Counter(
+            item.timeslot_id for item in group if item.timeslot_id is not None
+        )
+        conflicts += sum(max(0, n - 1) for n in counts.values())
+    return conflicts
 
 
 def count_room_conflicts(schedule: list) -> int:
@@ -148,7 +183,11 @@ def count_hard_conflicts(schedule: list) -> int:
     the one the manual schedule scores ~0 on -- which is the whole point of
     separating it from the soft counts below.
     """
-    return count_instructor_conflicts(schedule) + count_room_conflicts(schedule)
+    return (
+        count_instructor_conflicts(schedule)
+        + count_room_conflicts(schedule)
+        + count_sibling_conflicts(schedule)
+    )
 
 
 def soft_violation_counts(schedule: list, rooms: list) -> dict:

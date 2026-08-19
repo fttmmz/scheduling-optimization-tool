@@ -1,4 +1,4 @@
-from backend.models.models import Timeslot, Room, Section
+from backend.models.models import Timeslot, Room, build_sections, group_rows_by_pattern
 from backend.database.db import supabase
 from backend.Optimization.constraints import is_placeholder_timeslot
 
@@ -24,7 +24,26 @@ def load_timeslots():
 
 
 def load_section_details():
-    sections_data = []
+    """The list of things to schedule -- one Section per (course, section, pattern).
+
+    The source table stores one row per INSTRUCTOR, not one per class, so the
+    4,698 rows describe 3,270 real meetings. Building one Section per row (what
+    this used to do) inflated demand by ~44%: it scheduled the same class into
+    several rooms at once, and made "0 unscheduled out of 4,698" mean far less
+    than it appeared to. See HANDOVER.md section 4.
+
+    Grouping is by (course, section, room, timeslot, capacity) -- the source
+    room/timeslot are used ONLY to count how many distinct meeting blocks a
+    section has, then discarded; the scheduler assigns fresh ones. Grouping by
+    (course, section) alone would be wrong: it merges the clinical sections that
+    genuinely meet five times a week into one entity and deletes four meetings.
+    """
+    rows = _fetch_schedule_rows(1)
+    return build_sections(rows)
+
+
+def _fetch_schedule_rows(schedule_id):
+    rows = []
     page_size = 1000
     offset = 0
 
@@ -32,17 +51,19 @@ def load_section_details():
         res = (
             supabase.table("schedule_detailes")
             .select("*, courses(*)")
-            .eq("schedule_id", 1)
+            .eq("schedule_id", schedule_id)
             .range(offset, offset + page_size - 1)
             .execute()
         )
-        sections_data.extend(res.data)
+        rows.extend(res.data)
 
         if len(res.data) < page_size:  # no more rows left
             break
         offset += page_size
 
-    return [Section(row) for row in sections_data]
+    return rows
+
+
 
 
 def get_scheduling_data():
@@ -111,49 +132,39 @@ def save_schedule(schedule_items, schedule_detailes):
 
 
 def load_schedule(schedule_id):
-    """Load a saved schedule from the database."""
+    """Load a saved schedule from the database.
+
+    Collapsed the same way as load_section_details(): one ScheduleItem per
+    (course, section, room, timeslot, capacity), carrying every instructor on
+    that block. Without this the manual schedule would be read at row
+    granularity while generated schedules are read at meeting granularity, and
+    the two would not be comparable -- the manual one would appear to contain
+    hundreds of double-bookings that are really just repeated rows.
+    """
     from backend.models.models import ScheduleItem
 
-    all_rows = []
-    page_size = 1000
-    offset = 0
-
-    while True:
-        res = (
-            supabase.table("schedule_detailes")
-            .select("*, courses(*)")
-            .eq("schedule_id", schedule_id)
-            .range(offset, offset + page_size - 1)
-            .execute()
-        )
-
-        if not res.data:
-            break
-
-        all_rows.extend(res.data)
-
-        # if we got less than a full page, we're done
-        if len(res.data) < page_size:
-            break
-
-        offset += page_size
+    from backend.models.models import instructors_in
 
     schedule_items = []
-    for row in all_rows:
-        course = row["courses"]
-        item = ScheduleItem(
-            course_id=row["course_id"],
-            course_name=course["name"],
-            course_type=course["course_type"],
-            course_dept=course["dept_id"],
-            capacity=row["sec_capacity"],
-            instructor_id=row["instructor_id"],
-            room_id=row["room_id"],
-            timeslot_id=row["timeslot_id"],
-            section=row["section"],
-            level=course.get("level"),
-            course_class=course.get("course_class"),
-        )
-        schedule_items.append(item)
+    for patterns in group_rows_by_pattern(_fetch_schedule_rows(schedule_id)).values():
+        for pattern_index, pattern_rows in enumerate(patterns.values()):
+            row = pattern_rows[0]
+            course = row["courses"]
+            instructor_ids = instructors_in(pattern_rows)
+            schedule_items.append(ScheduleItem(
+                course_id=row["course_id"],
+                course_name=course["name"],
+                course_type=course["course_type"],
+                course_dept=course["dept_id"],
+                capacity=row["sec_capacity"],
+                instructor_id=instructor_ids[0] if instructor_ids else None,
+                room_id=row["room_id"],
+                timeslot_id=row["timeslot_id"],
+                section=row["section"],
+                level=course.get("level"),
+                course_class=course.get("course_class"),
+                instructor_ids=instructor_ids,
+                pattern_index=pattern_index,
+            ))
 
     return schedule_items

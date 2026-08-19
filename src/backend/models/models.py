@@ -1,5 +1,55 @@
 # models.py
 
+
+def pattern_key(row):
+    """Identity of one meeting block, ignoring which instructor filed the row."""
+    return (row["room_id"], row["timeslot_id"], row["sec_capacity"])
+
+
+def group_rows_by_pattern(rows):
+    """Raw schedule rows -> {(course_id, section): {pattern_key: [rows]}}.
+
+    The source table stores one row per INSTRUCTOR, so 4,698 rows describe
+    3,270 real meetings. Grouping by (course, section, room, timeslot, capacity)
+    collapses the 777 exact repeats and 651 roster rows while keeping every
+    genuine meeting block. Grouping by (course, section) alone would merge the
+    clinical sections that meet five times a week and delete four meetings.
+
+    Source room/timeslot are used ONLY to count blocks; the scheduler assigns
+    fresh ones. Order is first-seen throughout, so runs are reproducible.
+
+    Lives here rather than in loader.py because loader.py opens a Supabase
+    client at import time, and this needs to be testable offline.
+    """
+    grouped = {}
+    for row in rows:
+        section_key = (row["course_id"], row["section"])
+        grouped.setdefault(section_key, {}).setdefault(pattern_key(row), []).append(row)
+    return grouped
+
+
+def instructors_in(rows):
+    """Distinct non-null instructor ids across rows, first-seen order."""
+    return list(dict.fromkeys(
+        row["instructor_id"] for row in rows if row["instructor_id"] is not None
+    ))
+
+
+def build_sections(rows):
+    """Raw schedule rows -> one Section per (course, section, meeting pattern)."""
+    sections = []
+    for patterns in group_rows_by_pattern(rows).values():
+        pattern_count = len(patterns)
+        for pattern_index, pattern_rows in enumerate(patterns.values()):
+            sections.append(Section(
+                pattern_rows[0],
+                instructor_ids=instructors_in(pattern_rows),
+                pattern_index=pattern_index,
+                pattern_count=pattern_count,
+            ))
+    return sections
+
+
 class Course:
     def __init__(self, id, name, type, dept_id, level=None, course_class=None):
         self.id = id
@@ -32,7 +82,25 @@ class Timeslot:
 
 
 class Section:
-    def __init__(self, data):
+    """One thing to be scheduled: a (course, section, meeting pattern).
+
+    NOT one source row. `schedule_detailes` stores one row per INSTRUCTOR, so
+    4,698 rows describe 3,270 actual meetings -- 777 exact repeats and 651
+    roster rows collapse away. See HANDOVER.md section 4.
+
+    Two structures matter here:
+
+      instructor_ids -- a class may be taught by several people. A single
+                        scalar kept only the first and silently discarded 598
+                        assignments.
+      pattern_index  -- a section may meet in several blocks (clinical practice
+                        runs morning and afternoon across different days). Each
+                        block is its own Section sharing one `sibling_key`;
+                        collapsing them to one entity would delete real
+                        meetings.
+    """
+
+    def __init__(self, data, instructor_ids=None, pattern_index=0, pattern_count=1):
         self.course = Course(
             id=data["courses"]["course_id"],
             name=data["courses"]["name"],
@@ -41,17 +109,45 @@ class Section:
             level=data["courses"].get("level"),
             course_class=data["courses"].get("course_class"),
         )
-        self.instructor_id = data["instructor_id"]
         self.no = data["section"]
         self.capacity = data["sec_capacity"]
+
+        # Callers that still build a Section from one raw row (tests, older
+        # code) get the single-instructor behaviour for free.
+        if instructor_ids is None:
+            single = data.get("instructor_id")
+            instructor_ids = (single,) if single is not None else ()
+        self.instructor_ids = tuple(instructor_ids)
+
+        self.pattern_index = pattern_index
+        self.pattern_count = pattern_count
 
         self.tutorial_parent_id = None
         self.lab_parent_id = None
 
     @property
+    def instructor_id(self):
+        """First instructor, or None.
+
+        Retained so the many call sites that only need *an* instructor -- and
+        the DB write-back, which has one instructor_id column -- keep working.
+        Never use it to decide occupancy: use instructor_occupancy_ids().
+        """
+        return self.instructor_ids[0] if self.instructor_ids else None
+
+    @property
+    def sibling_key(self):
+        """Shared by every meeting pattern of one section.
+
+        Two Sections with the same sibling_key are the same students, so they
+        must not be scheduled at the same time.
+        """
+        return (self.course.id, str(self.no))
+
+    @property
     def id(self):
         """Stable unique identifier for use in graphs and lookups."""
-        return (self.course.id, self.no)
+        return (self.course.id, self.no, self.pattern_index)
 
 
 class ScheduleItem:
@@ -68,6 +164,8 @@ class ScheduleItem:
         section,
         level=None,
         course_class=None,
+        instructor_ids=None,
+        pattern_index=0,
     ):
         self.course_id = course_id
         self.course_name = course_name
@@ -78,11 +176,23 @@ class ScheduleItem:
         self.room_id = room_id
         self.timeslot_id = timeslot_id
         self.section = section
+        # Every instructor on this class, not just the reported one. Defaults
+        # from instructor_id so existing call sites keep working; anything that
+        # decides occupancy must go through instructor_occupancy_ids().
+        if instructor_ids is None:
+            instructor_ids = (instructor_id,) if instructor_id is not None else ()
+        self.instructor_ids = tuple(instructor_ids)
+        self.pattern_index = pattern_index
         # Optional: carried so item-level classification (hybrid.py) can be
         # level-aware, same reason as Course.level above. Defaults to None so
         # existing ScheduleItem(...) call sites in the algorithms still work.
         self.level = level
         self.course_class = course_class
+
+    @property
+    def sibling_key(self):
+        """Shared by every meeting pattern of one section. See Section."""
+        return (self.course_id, str(self.section))
 
     def __repr__(self):
         return (
