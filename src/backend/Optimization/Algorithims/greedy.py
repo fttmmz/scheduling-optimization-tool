@@ -226,4 +226,4 @@ def greedy_schedule(sections, timeslots, rooms):
 
     # Meeting blocks of one section need their own hour, and share one room.
     # The placement loops have no cross-block state, so repair here.
-    return finalize_schedule(schedule, sections, timeslots)
+    return finalize_schedule(schedule, sections, timeslots, rooms=rooms)

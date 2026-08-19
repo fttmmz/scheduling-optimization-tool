@@ -13,7 +13,7 @@ from backend.Optimization.constraints import tag_intro_it_pairs, tag_section_lin
 from backend.Optimization.engine import SchedulingEngine
 from backend.Optimization.evaluation import (
     calculate_fitness,
-    count_conflicts,
+    count_all_violations_flat,
     count_hard_conflicts,
     count_instructor_conflicts,
     count_room_conflicts,
@@ -219,7 +219,7 @@ def run_optimization(algorithm: str, num_runs: int = 1) -> Dict[str, Any]:
     # Reported in TIERS, mirroring constraints.py section 6 and evaluation.py.
     # This used to be one flat dict in which `instructor` and `room` sat as
     # equals beside `campus` and `capacity`, and `conflicts` was the flat
-    # count_conflicts() total -- so the UI presented a double-booking as no
+    # flat total -- so the UI presented a double-booking as no
     # worse than a campus mismatch, which is the thing the hard/soft split
     # exists to stop the ENGINE doing. The engine was rebuilt in August 2026;
     # this layer had not caught up, and had since fallen a further three rules
@@ -266,7 +266,7 @@ def run_optimization(algorithm: str, num_runs: int = 1) -> Dict[str, Any]:
         # mixed in soft violations and so never reached zero, leaving the UI
         # permanently red for schedules that were in fact perfectly runnable.
         "conflicts": hard_total,
-        "conflicts_flat": count_conflicts(
+        "conflicts_flat": count_all_violations_flat(
             schedule_items, rooms, sections, timeslots, valid_timeslot_cache=ts_cache
         ),
         "conflict_detail": conflict_detail,

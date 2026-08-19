@@ -337,7 +337,8 @@ def genetic_schedule(sections, timeslots, rooms, valid_timeslot_cache=None):
     # Siblings (meeting blocks of one section) belong in one room. The
     # placement loops have no cross-block state, so unify afterwards; the
     # pass only ever moves a block into a room that is free at its hour.
-    return finalize_schedule(best, sections, timeslots, valid_timeslot_cache)
+    return finalize_schedule(best, sections, timeslots, valid_timeslot_cache,
+                             rooms=rooms)
 
 
 def genetic_runs(sections, timeslots, rooms, num_runs=30):
