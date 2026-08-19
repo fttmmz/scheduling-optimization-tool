@@ -14,6 +14,7 @@ from backend.Optimization.constraints import (
     instructor_occupancy_ids,
     finalize_schedule,
     room_soft_penalty,
+    time_soft_penalty,
 )
 from backend.models.models import ScheduleItem
 from backend.Optimization.evaluation import (
@@ -399,7 +400,7 @@ def _best_candidates(
         for timeslot in valid_timeslots:
             cost = _placement_cost(
                 schedule_item, None, timeslot.id, room_counts, instructor_counts
-            )
+            ) + time_soft_penalty(schedule_item, timeslot) * SOFT_PENALTY_WEIGHT
             ranked.append((cost, random.random(), timeslot))
         ranked.sort(key=lambda value: (value[0], value[1]))
         return [(cost, None, timeslot) for cost, _, timeslot in ranked[:top_k]]
@@ -421,13 +422,18 @@ def _best_candidates(
     for room, timeslot in _sample_pairs(
         viable_rooms, valid_timeslots, sample_limit
     ):
+        # _soft_cost is memoized on (idx, room) and is deliberately room-only,
+        # so the time term is added here where the timeslot is known rather than
+        # inside it -- folding it in would make the memo key wrong.
         cost = _placement_cost(
             schedule_item,
             room.id,
             timeslot.id,
             room_counts,
             instructor_counts,
-        ) + _soft_cost(idx, room, sections, static_memo)
+        ) + _soft_cost(idx, room, sections, static_memo) + (
+            time_soft_penalty(schedule_item, timeslot) * SOFT_PENALTY_WEIGHT
+        )
         ranked.append((cost, random.random(), room, timeslot))
 
     ranked.sort(key=lambda value: (value[0], value[1]))

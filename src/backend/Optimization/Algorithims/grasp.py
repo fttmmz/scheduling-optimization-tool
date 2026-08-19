@@ -6,6 +6,7 @@ from collections import Counter
 from backend.models.models import ScheduleItem
 from backend.Optimization.constraints import (
     get_valid_timeslots,
+    time_soft_penalty,
     get_viable_rooms,
     get_viable_rooms_for_schedule_item,
     instructor_occupancy_ids,
@@ -19,6 +20,7 @@ from backend.Optimization.constraints import (
 )
 from backend.Optimization.evaluation import (
     calculate_fitness,
+    total_time_penalty,
     build_timeslot_guideline_cache,
     count_conflicts,
     count_hard_conflicts,
@@ -95,6 +97,14 @@ def score_candidate(section, room, timeslot, valid_timeslot_cache=None):
         valid_ids = valid_timeslot_cache.get((course_id, section_no), set())
         if timeslot.id in valid_ids:
             score += SOFT_SCORE_SCALE * TIMESLOT_GUIDELINE_PENALTY
+
+    # The evening preference. Ranking get_valid_timeslots() is enough for the
+    # algorithms that WALK it and take the first free slot; GRASP and PSO sample
+    # the room x timeslot space and pick the best-scoring pair, so a term absent
+    # from this function is a term they are blind to. Without it both placed
+    # ~450 undergraduate classes in the evening while the fitness they were
+    # judged by charged for every one.
+    score -= time_soft_penalty(section, timeslot) * SOFT_SCORE_SCALE
 
     return score
 
@@ -316,7 +326,7 @@ def construct_grasp_solution(
 # computes just those 5 for one item in O(1), instead of the O(sections)
 # cost of rescanning the whole schedule via the count_*_conflicts helpers.
 # ============================================================
-def _item_soft_penalty(item, room, timeslot_id, valid_timeslot_cache):
+def _item_soft_penalty(item, room, timeslot_id, valid_timeslot_cache, timeslot_map):
     """Weighted SOFT cost of one item's own (room, timeslot).
 
     Was _item_local_conflicts(), which charged exactly 1 per broken rule -- so
@@ -324,12 +334,21 @@ def _item_soft_penalty(item, room, timeslot_id, valid_timeslot_cache):
     blemishes outweighed a double-booking. It now uses the shared
     room_soft_penalty() weights, keeping the O(1) cost that makes local search
     affordable while agreeing with how the fitness function scores.
+
+    `timeslot_map` is REQUIRED, not defaulted. This function has to stay in step
+    with evaluation.calculate_fitness(): local search accepts a move by
+    comparing deltas computed here, then reports a fitness computed there, so a
+    term present in one and missing from the other makes GRASP optimize a
+    different objective than it is judged by. An optional argument is how that
+    drift starts.
     """
     penalty = room_soft_penalty(item, room)
 
     valid_ids = valid_timeslot_cache.get((item.course_id, item.section), set())
     if timeslot_id not in valid_ids:
         penalty += TIMESLOT_GUIDELINE_PENALTY
+
+    penalty += time_soft_penalty(item, timeslot_map.get(timeslot_id))
 
     return penalty
 
@@ -365,6 +384,7 @@ def local_search(
 ):
     best_schedule = schedule
     room_map = {r.id: r for r in rooms}
+    timeslot_map = {t.id: t for t in timeslots}
 
     total_sections = len(sections)
     scheduled_count = count_scheduled_sections(best_schedule, sections)
@@ -385,7 +405,7 @@ def local_search(
             best_schedule, sections, timeslots,
             valid_timeslot_cache=valid_timeslot_cache,
         ) * TIMESLOT_GUIDELINE_PENALTY
-    )
+    ) + total_time_penalty(best_schedule, timeslots)
 
     def fitness_from(hard, soft):
         """Mirrors evaluation.calculate_fitness so the score GRASP optimizes is
@@ -442,7 +462,8 @@ def local_search(
             occupying_instructors = instructor_occupancy_ids(item)
 
             old_local = _item_soft_penalty(
-                item, original_room, original_timeslot_id, valid_timeslot_cache
+                item, original_room, original_timeslot_id, valid_timeslot_cache,
+                timeslot_map,
             )
 
             # Sample a bounded neighborhood instead of scanning every
@@ -465,7 +486,8 @@ def local_search(
                         continue
 
                     new_local = _item_soft_penalty(
-                        item, room, timeslot.id, valid_timeslot_cache
+                        item, room, timeslot.id, valid_timeslot_cache,
+                        timeslot_map,
                     )
                     soft_delta = new_local - old_local
                     hard_delta = 0

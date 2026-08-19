@@ -336,3 +336,97 @@ def test_supervision_is_scheduled_in_the_evening(raw_rows, timeslots_by_id):
     assert late_lectures < 0.10
     assert sorted(supervision)[len(supervision) // 2] >= 17
     assert sorted(lectures)[len(lectures) // 2] <= 12
+
+
+# -- The evidence the evening preference rests on (HANDOVER.md 4.7, 10) -------
+#
+# The tests above pin Senior Project Supervision vs Lecture Undergraduate, which
+# is the headline. These pin the rest of the per-type evidence that decides
+# WHICH types get a preference at all, because two of those verdicts overturn
+# what the old low-priority list assumed and would otherwise be one edit away
+# from being quietly reverted.
+
+MIN_ROWS_TO_JUDGE = 20      # below this a rate is noise
+STRONG = 0.80               # 80/20 one way, or no preference is recorded
+
+
+def _evening_rate(rows, timeslots_by_id, course_type):
+    """(timed rows, fraction starting at or after 17:00) for one course type."""
+    hours = _start_hours_by_type(rows, timeslots_by_id, course_type)
+    if not hours:
+        return 0, 0.0
+    return len(hours), sum(1 for h in hours if h >= 17) / len(hours)
+
+
+def test_daytime_types_really_are_daytime(raw_rows, timeslots_by_id):
+    """Every type charged for an evening slot must earn it in the data."""
+    from backend.Optimization.constraints import DAYTIME_COURSE_TYPES
+
+    for course_type in DAYTIME_COURSE_TYPES:
+        rows, rate = _evening_rate(raw_rows, timeslots_by_id, course_type)
+        assert rows, course_type
+        if rows >= MIN_ROWS_TO_JUDGE:
+            assert rate <= 1 - STRONG, f"{course_type}: {rows} rows, {rate:.0%} evening"
+
+
+def test_office_hours_has_no_time_preference(raw_rows, timeslots_by_id):
+    """47% -- a coin flip, and the reason to measure before encoding.
+
+    Office Hours was in the old low-priority list and was hard-filtered into
+    afternoon slots. Carrying that list over without checking would have priced
+    a coin flip as a rule.
+    """
+    rows, rate = _evening_rate(raw_rows, timeslots_by_id, "Office Hours")
+    assert rows >= MIN_ROWS_TO_JUDGE
+    assert 1 - STRONG < rate < STRONG
+
+
+def test_project_is_supervision_but_has_no_time_preference(raw_rows, timeslots_by_id):
+    """40% evening. Supervision for OCCUPANCY, neutral for TIMING.
+
+    The two questions are separate and here the answers differ, which is what
+    constraints.TIME_NEUTRAL_COURSE_TYPES exists for.
+    """
+    from backend.Optimization.constraints import (
+        SUPERVISION_COURSE_TYPES, TIME_NEUTRAL_COURSE_TYPES,
+    )
+
+    rows, rate = _evening_rate(raw_rows, timeslots_by_id, "Project")
+    assert rows >= MIN_ROWS_TO_JUDGE
+    assert 1 - STRONG < rate < STRONG
+    assert "Project" in SUPERVISION_COURSE_TYPES
+    assert "Project" in TIME_NEUTRAL_COURSE_TYPES
+
+
+def test_graduate_lectures_have_no_time_preference(raw_rows, timeslots_by_id):
+    """52% evening over 477 rows -- graduate teaching genuinely splits the day.
+
+    This is why the daytime rule is not simply "everything that is not
+    supervision": half of graduate teaching would be penalised for a pattern it
+    demonstrably follows.
+    """
+    from backend.Optimization.constraints import DAYTIME_COURSE_TYPES
+
+    rows, rate = _evening_rate(raw_rows, timeslots_by_id, "Lecture Graduate")
+    assert rows >= MIN_ROWS_TO_JUDGE
+    assert 1 - STRONG < rate < STRONG
+    assert "Lecture Graduate" not in DAYTIME_COURSE_TYPES
+
+
+def test_level_is_not_a_usable_key_for_the_daytime_rule(raw_rows):
+    """`level` carries eight values, and 'Lecture Undergraduate' spans five.
+
+    An earlier cut of the evening preference keyed the daytime rule on
+    level == 'Undergraduate' and silently exempted 356 undergraduate lecture
+    rows filed under 'Fine Art', 'Diploma', 'Intensive English' or
+    'Foundation Year'. Pinned so nobody reaches for that field again.
+    """
+    levels = Counter(
+        (row["courses"] or {}).get("level")
+        for row in raw_rows
+        if (row["courses"] or {}).get("course_type") == "Lecture Undergraduate"
+    )
+    assert len(levels) > 1
+    assert "Undergraduate" in levels
+    non_undergraduate = sum(v for k, v in levels.items() if k != "Undergraduate")
+    assert non_undergraduate > 300, dict(levels)

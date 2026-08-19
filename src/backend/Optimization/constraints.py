@@ -699,6 +699,191 @@ def _is_later_in_day(ts, cutoff_hour: int = 15) -> bool:
     return start >= cutoff_hour * 60
 
 
+# -- The evening preference (HANDOVER 4.7) -----------------------------------
+# A time-axis soft rule, the counterpart of the room-axis weights above.
+#
+# Measured, not assumed. Only 3 of the 148 timed Senior Project Supervision rows
+# start before 17:00, against 6% of undergraduate lectures -- far too lopsided to
+# be an accident. The university keeps daytime hours for taught contact and runs
+# supervision around them in the evening. (Full per-type rates in the table
+# further down, which is what the sets are actually chosen from.)
+#
+# It is the one Phase 3 preference recoverable from existing data -- every other
+# preference (who likes mornings, which students clash) describes what someone
+# WANTED, and the schedule table only records what WAS.
+#
+# Three things about how it is encoded:
+#
+#   * SOFT, not a filter. get_valid_timeslots_for_section() used to HARD-filter
+#     supervision down to slots at/after 15:00. That is exactly the mistake the
+#     hard/soft split exists to prevent -- a preference that can strand a
+#     section is priced at infinity, and an unscheduled class (2.0) is worse
+#     than a badly-timed one. It now ranks instead, so the preference is
+#     honoured while candidates last and degrades quietly once they run out.
+#
+#   * 17:00, not 15:00. The old cutoff was a guess made before anyone measured;
+#     the data puts the break at 17:00.
+#
+#   * Graduate lectures are NEUTRAL. At 52% evening they express no preference
+#     either way, so they are charged nothing in either direction. Penalising
+#     them would be inventing a rule the data does not contain. Same for
+#     Seminar Graduate (27%), Office Hours (47%) and Project (40%).
+EVENING_CUTOFF_HOUR = 17
+
+# Priced against the room weights above (room_type 4.0, campus 3.0, capacity
+# 2.0, department 1.0), and deliberately asymmetric:
+#
+#   supervision in a daytime slot is the more expensive direction, because it
+#   consumes a scarce daytime hour that taught contact needs -- the 98%/6% split
+#   says the institution treats daytime as lecture territory.
+#
+#   an undergraduate lecture pushed into the evening is a real inconvenience to
+#   students but takes nothing away from anyone else, so it is cheaper.
+SOFT_WEIGHT_SUPERVISION_DAYTIME = 3.0
+SOFT_WEIGHT_TEACHING_EVENING = 2.0
+
+# The three sets below are chosen from measured evening rates, NOT from the old
+# hard-coded low-priority list. Rates are over timed rows of schedule_id=1 --
+# the committed test fixture, so tests/test_data_invariants.py can pin them
+# offline and a dataset change shows up as a failure rather than as silent drift.
+#
+# A type only gets a preference when there are at least 20 timed rows to judge
+# it by AND they fall at least 80/20 one way. Anything weaker stays neutral:
+# charging a penalty for a pattern the data does not show is an opinion with a
+# number attached, and this module already carries enough of those.
+#
+#     course type                        timed   evening   verdict
+#     Senior Project Supervision           148       98%   EVENING
+#     Lecture Undergraduate              1,959        6%   DAYTIME
+#     Laboratory                           293        4%   DAYTIME
+#     Clinical Practice                    142        7%   DAYTIME
+#     Lecutre / Studio Undergraduate        77        0%   DAYTIME
+#     Studio Undergraduate                  21       14%   DAYTIME
+#     Training                              21       14%   DAYTIME
+#     Lecture Graduate                     477       52%   neutral
+#     Seminar Graduate                      56       27%   neutral
+#     Office Hours                          34       47%   neutral
+#     Project                               20       40%   neutral
+#
+# Two of those verdicts overturn what the old list assumed, and both were only
+# found by measuring:
+#
+#   Office Hours was treated as low-priority evening work. It is a 47% coin flip.
+#   Project is supervision, and still runs in the daytime 60% of the time.
+
+# Supervision by the section-1c detector, but with no measured preference about
+# WHEN it meets. Being supervision answers "does this person occupy a room at
+# this hour" (no), which is a different question from "when is this scheduled"
+# -- and for Project the two answers diverge. Hence a list rather than
+# prefers_evening() simply being is_supervision().
+TIME_NEUTRAL_COURSE_TYPES = frozenset({
+    "Project",                          # 40% of 20
+})
+
+# Not supervision -- these consume their instructors' time and are still checked
+# for clashes -- but scheduled around teaching for the same reason.
+EVENING_PREFERRED_EXTRA_TYPES = frozenset({
+    # 4 timed rows, all 4 in the evening. Below the 20-row bar, kept because it
+    # has no counter-evidence and sat beside the supervision types in the old
+    # list. Drop it if it ever grows enough rows to be judged properly.
+    "Internship",
+})
+
+# Taught contact that holds the daytime.
+#
+# Keyed on course_type, NOT on `level`. `level` looked like the natural field and
+# is not usable here: it carries eight values, and 356 of the 1,959 timed
+# 'Lecture Undergraduate' rows are filed under 'Fine Art' (157), 'Diploma' (94),
+# 'Intensive English' (55) or 'Foundation Year' (50). Keying on
+# level == 'Undergraduate' silently exempted all 356 from a rule the type obeys
+# at 94%. course_type is also what MINED_NEEDS, SUPERVISION_COURSE_TYPES and
+# get_required_room_type() key on, so this stays consistent with the module.
+DAYTIME_COURSE_TYPES = frozenset({
+    "Lecture Undergraduate",            # 6% evening of 1,959
+    "Laboratory",                       # 4% of 293
+    "Clinical Practice",                # 7% of 142
+    "Lecutre / Studio Undergraduate",   # 0% of 77   (typo is in the source data)
+    "Studio Undergraduate",             # 14% of 21
+    "Training",                         # 14% of 21
+    # Below the 20-row bar. Included because it is undergraduate taught contact
+    # agreeing in direction with every type above, over a population of 11.
+    "Seminar Undergraduate",            # 18% of 11
+})
+
+
+def is_evening_timeslot(ts) -> bool:
+    """True when the slot starts at or after EVENING_CUTOFF_HOUR."""
+    start = _parse_time_to_minutes(getattr(ts, "start", None))
+    if start is None:
+        return False
+    return start >= EVENING_CUTOFF_HOUR * 60
+
+
+def prefers_evening(obj) -> bool:
+    """True for supervision and the other activities scheduled around teaching.
+
+    Reuses is_supervision() rather than keeping a second list, so the five
+    miscategorised courses of SUPERVISION_COURSE_IDS are covered here too. The
+    old hard-coded low-priority list missed all five, and also missed three real
+    supervision types (Proposal Doctorate, Comprehensive Exam, Qualifying Exam)
+    that the supervision detector already had.
+
+    TIME_NEUTRAL_COURSE_TYPES is subtracted first, for the types that are
+    supervision but show no preference about when they meet.
+    """
+    course_type = _course_identity(obj)[1]
+    if course_type in TIME_NEUTRAL_COURSE_TYPES:
+        return False
+    if is_supervision(obj):
+        return True
+    return course_type in EVENING_PREFERRED_EXTRA_TYPES
+
+
+def prefers_daytime(obj) -> bool:
+    """True for undergraduate taught contact -- the population that holds the day.
+
+    Checked AFTER prefers_evening() so the two can never both fire: the five
+    courses in SUPERVISION_COURSE_IDS carry a taught course_type (one of them is
+    typed 'Lecture Undergraduate') and would otherwise match both sets and be
+    charged for whichever slot they were given.
+    """
+    if prefers_evening(obj):
+        return False
+    return _course_identity(obj)[1] in DAYTIME_COURSE_TYPES
+
+
+def time_soft_penalty_parts(obj, ts) -> dict:
+    """Per-rule soft cost of putting *obj* (Section or ScheduleItem) at *ts*."""
+    parts = {"supervision_daytime": 0.0, "teaching_evening": 0.0}
+    if ts is None:
+        return parts
+
+    evening = is_evening_timeslot(ts)
+    if prefers_evening(obj):
+        if not evening:
+            parts["supervision_daytime"] = SOFT_WEIGHT_SUPERVISION_DAYTIME
+    elif prefers_daytime(obj):
+        if evening:
+            parts["teaching_evening"] = SOFT_WEIGHT_TEACHING_EVENING
+    return parts
+
+
+def time_soft_penalty(obj, ts) -> float:
+    """Total soft cost of this timeslot for this section/item. 0.0 == preferred."""
+    return sum(time_soft_penalty_parts(obj, ts).values())
+
+
+def rank_timeslots(obj, timeslots: list) -> list:
+    """Preferred timeslots first. Never drops a candidate.
+
+    The sort is STABLE and keyed only on the penalty, so slots that are equally
+    preferred keep their original relative order. That matters: greedy, GRASP
+    and hybrid walk this list and take the first slot that is free, so a finer
+    key would funnel every section of a given kind onto the same few hours.
+    """
+    return sorted(timeslots, key=lambda ts: time_soft_penalty(obj, ts))
+
+
 def _days_apart(day_a: str, day_b: str) -> int:
     """
     Return the absolute calendar-day distance between two single-day codes.
@@ -716,7 +901,7 @@ def get_valid_timeslots(section, timeslots: list) -> list:
     return get_valid_timeslots_for_section(section, timeslots)
 
 
-def get_valid_timeslots_for_section(section, timeslots: list) -> list:
+def _candidate_timeslots(section, timeslots: list) -> list:
     """
     Return the subset of *timeslots* that are valid for *section*, applying
     ALL of the rules below.  Falls back to a random single-day slot if no
@@ -751,22 +936,15 @@ def get_valid_timeslots_for_section(section, timeslots: list) -> list:
     ct   = section.course.type
     sno  = str(section.no)
 
-    # ── 1. LOW-PRIORITY SECTIONS (Office Hours, Project, Internship, …) ──────
-    # These should be scheduled last and only in afternoon/evening slots.
-    low_priority_types = {
-        "Office Hours", "Project", "Internship",
-        "Senior Project Supervision", "Independent Study",
-        "Thesis", "Thesis / Dissertation Master",
-        "Thesis / Dissertation Doctorat",
-    }
-    if ct in low_priority_types:
-        late_slots = [
-            ts for ts in timeslots
-            if ts.day in SINGLE_DAY and _is_later_in_day(ts)
-        ]
-        return late_slots if late_slots else [
-            ts for ts in timeslots if ts.day in SINGLE_DAY
-        ]
+    # ── 1. SCHEDULED-AROUND-TEACHING (supervision, Office Hours, Internship) ─
+    # These belong in the evening, but that is a PREFERENCE, not a statement
+    # about what FITS. This used to hard-filter the list down to slots at/after
+    # 15:00 and return only those, so a preference could leave a section
+    # unscheduled -- 2.0 penalty units spent to save at most 0.3 of one. The
+    # shape rule (single day) is all that survives here; the evening half is
+    # priced in time_soft_penalty() and applied by the ranking below.
+    if prefers_evening(section):
+        return [ts for ts in timeslots if ts.day in SINGLE_DAY]
 
     # ── 2. INTENSIVE ENGLISH — every day, 6h50m block ────────────────────────
     if _is_intensive_english(section):
@@ -874,6 +1052,23 @@ def get_valid_timeslots_for_section(section, timeslots: list) -> list:
     # ── 10. CATCH-ALL FALLBACK — any single-day slot ─────────────────────────
     fallback = [ts for ts in timeslots if ts.day in SINGLE_DAY]
     return fallback if fallback else list(timeslots)
+
+
+def get_valid_timeslots_for_section(section, timeslots: list) -> list:
+    """Timeslots this section may use, PREFERRED ONES FIRST. Never empty.
+
+    Same split as get_viable_rooms(): _candidate_timeslots() decides what FITS
+    (duration and day pattern -- a 1h15m lecture cannot use a 6h50m block), and
+    rank_timeslots() then orders what survives by preference. Nothing is dropped
+    for a soft reason.
+
+    Ranking here rather than inside each algorithm is what makes the evening
+    preference apply everywhere at once: all five funnel their timeslot choice
+    through this one function, and greedy, GRASP and hybrid take the first free
+    slot they are handed. Genetic and PSO sample rather than scan, so for those
+    two it is the penalty in the objective that does the work.
+    """
+    return rank_timeslots(section, _candidate_timeslots(section, timeslots))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
