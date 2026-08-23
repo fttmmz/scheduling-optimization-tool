@@ -16,3 +16,7 @@ venv/
 .vscode/
 .idea/
 .pytest_cache/
+
+# Local-only working docs (kept on disk, not shared)
+CLAUDE.md
+HANDOVER.md
