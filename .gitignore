@@ -6,6 +6,7 @@ __pycache__/
 *.pyc
 venv/
 .venv/
+.venv311/
 .ruff_cache/
 
 # Vercel
@@ -14,3 +15,4 @@ venv/
 # IDE
 .vscode/
 .idea/
+.pytest_cache/

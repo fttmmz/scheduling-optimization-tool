@@ -6,6 +6,10 @@ from backend.Optimization.constraints import (
     passes_hard_constraints,
     get_viable_rooms,
     get_viable_rooms_for_schedule_item,
+    instructor_occupancy_ids,
+    finalize_schedule,
+    needs_for,
+    section_needs,
 )
 from backend.models.models import ScheduleItem
 from backend.Optimization.evaluation import (
@@ -14,20 +18,54 @@ from backend.Optimization.evaluation import (
 )
 
 
+def _free_timeslot(section, timeslots, occupied_instructors):
+    """First timeslot where this section's instructor is not already busy."""
+    instructor_ids = instructor_occupancy_ids(section)
+    for ts in timeslots:
+        if all((instructor_id, ts.id) not in occupied_instructors
+               for instructor_id in instructor_ids):
+            return ts
+    return random.choice(timeslots) if timeslots else None
+
+
 def choose_random_assignment(
     section,
     rooms,
     timeslots,
     occupied_instructors,
     occupied_rooms,
+    needs=None,
 ):
-    # If no viable rooms or timeslots, return None for that section
+    """Pick a (room, timeslot) for *section*, honouring what it actually needs.
+
+    Previously this always demanded BOTH a room and a timeslot, so thesis and
+    supervision sections were handed rooms they never use and studio/lab
+    sections that need only an hour competed for scarce rooms against real
+    lectures. *needs* says which of the two the section actually requires; the
+    unneeded half is returned as None.
+    """
+    if needs is None:
+        needs = section_needs(section)
+
+    if not needs.room and not needs.time:
+        return None, None
+
+    if not needs.room:                      # time only
+        return None, _free_timeslot(section, timeslots, occupied_instructors)
+
+    if not needs.time:                      # room only
+        free = [room for room in rooms if (room.id, None) not in occupied_rooms]
+        return (random.choice(free) if free else
+                (random.choice(rooms) if rooms else None)), None
+
+    # room AND time
     if not rooms or not timeslots:
         return None, None
 
-    # Try to find a valid assignment that passes all constraints
+    section_instructors = instructor_occupancy_ids(section)
     for ts in timeslots:
-        if section.instructor_id is not None and (section.instructor_id, ts.id) in occupied_instructors:
+        if any((instructor_id, ts.id) in occupied_instructors
+               for instructor_id in section_instructors):
             continue
 
         for room in rooms:
@@ -43,12 +81,9 @@ def choose_random_assignment(
             ):
                 return room, ts
 
-    # Fallback: if no fully valid pair exists, return random valid pair from viable options
-    # This ensures we at least try to assign from rooms/timeslots that match static constraints
-    if rooms and timeslots:
-        return random.choice(rooms), random.choice(timeslots)
-    
-    return None, None
+    # Fallback: no clash-free pair exists, so take a random one from the
+    # (already soft-ranked) candidates rather than leaving the section out.
+    return random.choice(rooms), random.choice(timeslots)
 
 
 # Create Population
@@ -56,15 +91,17 @@ def choose_random_assignment(
 def create_population(size, sections, rooms, timeslots):
     population = []
 
-    # precompute static room/timeslot viability for each section
-    section_candidates = [
-        (
+    # Precompute what each section needs and its candidates. Sections that need
+    # no room get an empty room list, so they never consume one.
+    section_candidates = []
+    for section in sections:
+        needs = section_needs(section)
+        section_candidates.append((
             section,
-            get_viable_rooms(section, rooms),
-            get_valid_timeslots(section, timeslots),
-        )
-        for section in sections
-    ]
+            needs,
+            get_viable_rooms(section, rooms) if needs.room else [],
+            get_valid_timeslots(section, timeslots) if needs.time else [],
+        ))
 
     # repeat to create many schedules
     for i in range(size):
@@ -72,14 +109,15 @@ def create_population(size, sections, rooms, timeslots):
         occupied_instructors = set()
         occupied_rooms = set()
 
-        # go through each section and assign random room + timeslot
-        for section, viable_rooms, valid_timeslots in section_candidates:
+        # go through each section and assign what it needs
+        for section, needs, viable_rooms, valid_timeslots in section_candidates:
             room, timeslot = choose_random_assignment(
                 section,
                 viable_rooms,
                 valid_timeslots,
                 occupied_instructors,
                 occupied_rooms,
+                needs=needs,
             )
             item = ScheduleItem(
                 course_id=section.course.id,
@@ -91,13 +129,20 @@ def create_population(size, sections, rooms, timeslots):
                 room_id=room.id if room else None,
                 timeslot_id=timeslot.id if timeslot else None,
                 section=str(section.no),
+                instructor_ids=section.instructor_ids,
+                pattern_index=section.pattern_index,
+                # level drives classification -- without it every item looks
+                # like a plain room+time lecture once detached from its Section.
+                level=getattr(section.course, "level", None),
+                course_class=getattr(section.course, "course_class", None),
             )
 
             schedule.append(item)
             if room is not None and timeslot is not None:
                 occupied_rooms.add((room.id, timeslot.id))
-            if section.instructor_id is not None and timeslot is not None:
-                occupied_instructors.add((section.instructor_id, timeslot.id))
+            if timeslot is not None:
+                for instructor_id in instructor_occupancy_ids(section):
+                    occupied_instructors.add((instructor_id, timeslot.id))
 
         # add this full schedule to population
         population.append(schedule)
@@ -163,35 +208,65 @@ def mutation(schedule, rooms, timeslots, sections=None):
 
     # randomly pick one item from schedule
     selected_item = random.choice(schedule)
-    
+
+    # Mutating along an axis the section does not use would re-introduce the
+    # very assignments classification exists to prevent (a room for a thesis, a
+    # timeslot for a supervision placement), so skip those.
+    item_needs = needs_for(
+        selected_item.course_type, getattr(selected_item, "level", None)
+    )
+    if not item_needs.room and not item_needs.time:
+        return schedule
+
     # check for conflicts before
     occupied_instructors = set()
     occupied_rooms = set()
     
     for item in schedule:
         if item != selected_item:  # Don't include the item we're about to mutate
-            if item.instructor_id is not None and item.timeslot_id is not None:
-                occupied_instructors.add((item.instructor_id, item.timeslot_id))
+            if item.timeslot_id is not None:
+                for instructor_id in instructor_occupancy_ids(item):
+                    occupied_instructors.add((instructor_id, item.timeslot_id))
             if item.room_id is not None and item.timeslot_id is not None:
                 occupied_rooms.add((item.room_id, item.timeslot_id))
 
-    # 50% chance to change room or timeslot
-    if random.random() < 0.5:
+    # 50% chance to change room or timeslot -- but only along an axis this
+    # section actually uses; if it uses just one, always mutate that one.
+    mutate_room = random.random() < 0.5
+    if not item_needs.room:
+        mutate_room = False
+    elif not item_needs.time:
+        mutate_room = True
+
+    if mutate_room:
         # Try to assign a new room that doesn't create conflicts
         viable_rooms = get_viable_rooms_for_schedule_item(selected_item, rooms)
-        if viable_rooms and selected_item.timeslot_id is not None:
-            # Find a room that doesn't conflict with the current timeslot
+        if viable_rooms:
+            # A room-only section has no timeslot to clash on, so any viable
+            # room will do; otherwise avoid rooms taken at our timeslot.
             for room in random.sample(viable_rooms, len(viable_rooms)):
-                if (room.id, selected_item.timeslot_id) not in occupied_rooms:
+                if selected_item.timeslot_id is None or \
+                        (room.id, selected_item.timeslot_id) not in occupied_rooms:
                     selected_item.room_id = room.id
                     break
     else:
         # Try to assign a new timeslot that doesn't create conflicts
-        # Check BOTH instructor AND room are free at new timeslot
+        # Check BOTH instructor AND room are free at new timeslot.
+        # The None guards are explicit rather than relying on a None key simply
+        # never having been inserted above: that made correctness here depend on
+        # a detail of a different loop, and it silently stops holding the moment
+        # anyone inserts unconditionally.
+        selected_instructors = instructor_occupancy_ids(selected_item)
         for ts in random.sample(timeslots, len(timeslots)):
-            instructor_free = (selected_item.instructor_id, ts.id) not in occupied_instructors
-            room_free       = (selected_item.room_id, ts.id) not in occupied_rooms
-            
+            instructor_free = all(
+                (instructor_id, ts.id) not in occupied_instructors
+                for instructor_id in selected_instructors
+            )
+            room_free = (
+                selected_item.room_id is None
+                or (selected_item.room_id, ts.id) not in occupied_rooms
+            )
+
             if instructor_free and room_free:
                 selected_item.timeslot_id = ts.id
                 break
@@ -259,7 +334,11 @@ def genetic_schedule(sections, timeslots, rooms, valid_timeslot_cache=None):
         ),
     )
 
-    return best
+    # Siblings (meeting blocks of one section) belong in one room. The
+    # placement loops have no cross-block state, so unify afterwards; the
+    # pass only ever moves a block into a room that is free at its hour.
+    return finalize_schedule(best, sections, timeslots, valid_timeslot_cache,
+                             rooms=rooms)
 
 
 def genetic_runs(sections, timeslots, rooms, num_runs=30):
