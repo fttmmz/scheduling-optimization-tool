@@ -1,1353 +1,943 @@
-import math
-import random
-from collections import defaultdict
+"""Hybrid Genetic Algorithm + Tabu Search scheduler.
 
+This implementation follows a simple two-stage hybrid design:
+    1. Genetic Algorithm (GA) performs global exploration using a population,
+       selection, crossover, mutation, and elitism.
+    2. Tabu Search (TS) starts from the best GA schedule. It first repairs
+       unscheduled items and hard conflicts, then improves soft constraints
+       while preserving feasibility.
+
+References
+----------
+- Al-Betar, M. A., Khader, A. T., & Zaman, M. (2016).
+  "A Utilization-based Genetic Algorithm for Solving the University
+  Timetabling Problem (UGA)."
+  Alexandria Engineering Journal, 55(2), 1395-1409.
+  https://doi.org/10.1016/j.aej.2016.02.017
+  -> Genetic Algorithm applied to university timetabling using population,
+     crossover, mutation, fitness evaluation, and scheduling constraints.
+
+- Jat, S. N., & Yang, S. (2012).
+  "Genetic Algorithm with Search Bank Strategies for University Course
+  Timetabling Problem."
+  Procedia Engineering, 38, 253-263.
+  https://doi.org/10.1016/j.proeng.2012.06.033
+  -> Supports combining Genetic Algorithm and Tabu Search for university
+     course timetabling.
+
+- Lu, Z., & Hao, J.-K. (2010).
+  "Adaptive Tabu Search for Course Timetabling."
+  European Journal of Operational Research, 200(1), 235-244.
+  https://doi.org/10.1016/j.ejor.2008.12.007
+  -> Tabu Search for reducing soft constraint violations while maintaining
+     satisfaction of hard constraints.
+"""
+
+import copy
+import random
+import statistics
+import time
+from collections import Counter, defaultdict
+
+from backend.models.models import ScheduleItem
 from backend.Optimization.constraints import (
     NEEDS_NOTHING,
+    NEEDS_ROOM_AND_TIME,
     NEEDS_ROOM_ONLY,
     NEEDS_TIME_ONLY,
     classify_section,
-    needs_for,
-    needs_to_label,
     get_valid_timeslots,
     get_viable_rooms,
     instructor_occupancy_ids,
-    finalize_schedule,
+    occupancy_key,
     room_soft_penalty,
+    sibling_key,
     time_soft_penalty,
 )
-from backend.models.models import ScheduleItem
 from backend.Optimization.evaluation import (
     build_timeslot_guideline_cache,
     calculate_fitness,
+    count_hard_conflicts,
+    count_instructor_conflicts,
+    count_room_conflicts,
+    count_scheduled_sections,
+    count_sibling_conflicts,
+    count_timeslot_guideline_conflicts,
+    soft_violation_counts,
+    total_soft_penalty,
+    total_time_penalty,
 )
 
+
 # ============================================================
-# PURE-PYTHON HYBRID
-# Classification-aware MRV construction + LNS + min-conflicts
+# PARAMETERS
 # ============================================================
 
-CONSTRUCTION_RESTARTS = 4
-CONSTRUCTION_PAIR_SAMPLES = 220
+POPULATION_SIZE = 10
+GENERATIONS = 12
+CROSSOVER_RATE = 0.85
+MUTATION_RATE = 0.05
+ELITE_COUNT = 2
 
-LNS_ITERATIONS = 100
-LNS_MIN_SIZE = 30
-LNS_MAX_SIZE = 100
-LNS_PAIR_SAMPLES = 280
+ROOM_LIMIT = 30
+PAIR_SAMPLE = 80
 
-MIN_CONFLICT_STEPS = 7000
-MIN_CONFLICT_PAIR_SAMPLES = 320
-RANDOM_WALK_RATE = 0.06
+TABU_ITERATIONS = 500
+TABU_TENURE = 12
+TABU_SAMPLE = 70
 
-# Ejection-chain repair: move blocking sections to make space for
-# unscheduled sections instead of leaving them unassigned.
-EJECTION_REPAIR_ROUNDS = 1
-EJECTION_MAX_DEPTH = 1
-EJECTION_MAX_BLOCKERS = 1
-EJECTION_PAIR_SAMPLES = 250
-EJECTION_TOP_K = 20
-
-
-# Direct unscheduled rescue: first use conflict-free openings, then try a
-# single-blocker relocation. This is cheaper than deep recursive ejection.
-DIRECT_RESCUE_ROUNDS = 3
-DIRECT_RESCUE_PAIR_SAMPLES = 900
-DIRECT_RESCUE_BLOCKER_SAMPLES = 360
-
-SOFT_POLISH_STEPS = 60
-SOFT_POLISH_PAIR_SAMPLES = 60
-
-UNSCHEDULED_WEIGHT = 10000
-ROOM_CONFLICT_WEIGHT = 1000
-INSTRUCTOR_CONFLICT_WEIGHT = 1000
-
-# Scales constraints.room_soft_penalty() (worst realistic total ~12 units) into
-# this objective's scale. The resulting few-hundred cost keeps the tier order
-# strict: unscheduled >> double-booking >> soft violation.
-SOFT_PENALTY_WEIGHT = 20
-
-STATIC_CACHE_LIMIT = 700000
-
-_ROOMS_BY_ID_KEY = "_rooms_by_id"
-_TIMESLOTS_BY_ID_KEY = "_timeslots_by_id"
-_REQUIREMENT_KEY = "_requirement"
+TS_SOFT_PASSES = 4
+TS_SOFT_ITEMS = 900
+TS_SOFT_PAIR_SAMPLE = 120
+TS_SWAP_PASSES = 4
+TS_SWAP_ITEMS = 1200
+TS_SWAP_PARTNERS = 80
 
 
 # ============================================================
 # BASIC HELPERS
 # ============================================================
-def clone_item(item):
-    return ScheduleItem(
-        course_id=item.course_id,
-        course_name=item.course_name,
-        course_type=item.course_type,
-        course_dept=item.course_dept,
-        capacity=item.capacity,
-        instructor_id=item.instructor_id,
-        room_id=item.room_id,
-        timeslot_id=item.timeslot_id,
-        section=item.section,
-        instructor_ids=item.instructor_ids,
-        pattern_index=getattr(item, "pattern_index", 0),
-        # level/course_class must survive cloning: _item_requirement reads
-        # item.level, so dropping it here would silently mis-classify every
-        # cloned schedule (and hybrid clones constantly).
-        level=getattr(item, "level", None),
-        course_class=getattr(item, "course_class", None),
-    )
 
-
-def clone_schedule(schedule):
-    return [clone_item(schedule_item) for schedule_item in schedule]
-
-
-def _new_schedule(sections):
-    # Preserve section.no exactly because evaluation.py uses it to match
-    # ScheduleItem objects back to Section objects.
-    return [
-        ScheduleItem(
-            course_id=section.course.id,
-            course_name=section.course.name,
-            course_type=section.course.type,
-            course_dept=section.course.dept,
-            capacity=section.capacity,
-            instructor_id=section.instructor_id,
-            room_id=None,
-            timeslot_id=None,
-            section=section.no,
-            instructor_ids=section.instructor_ids,
-            pattern_index=section.pattern_index,
-            level=getattr(section.course, "level", None),
-            course_class=getattr(section.course, "course_class", None),
-        )
-        for section in sections
-    ]
-
-
-def _item_requirement(item):
-    # Level-aware, mined classification (matches constraints.classify_section).
-    return needs_to_label(needs_for(item.course_type, getattr(item, "level", None)))
-
-
-def _is_scheduled(item):
-    requirement = _item_requirement(item)
-    if requirement == "NEEDS_NOTHING":
+def is_scheduled(item, requirement):
+    if requirement == NEEDS_NOTHING:
         return True
-    if requirement == "NEEDS_ROOM_ONLY":
+    if requirement == NEEDS_ROOM_ONLY:
         return item.room_id is not None
-    if requirement == "NEEDS_TIME_ONLY":
+    if requirement == NEEDS_TIME_ONLY:
         return item.timeslot_id is not None
     return item.room_id is not None and item.timeslot_id is not None
 
 
-def count_unscheduled(schedule):
-    return sum(1 for schedule_item in schedule if not _is_scheduled(schedule_item))
-
-
-# ============================================================
-# OPTION CACHE
-# ============================================================
-def build_option_cache(sections, rooms, timeslots):
-    cache = {
-        _ROOMS_BY_ID_KEY: {room.id: room for room in rooms},
-        _TIMESLOTS_BY_ID_KEY: {timeslot.id: timeslot for timeslot in timeslots},
-    }
-
-    for idx, section in enumerate(sections):
-        requirement = classify_section(section)
-
-        if requirement == "NEEDS_NOTHING":
-            viable_rooms = []
-            valid_timeslots = []
-        elif requirement == "NEEDS_ROOM_ONLY":
-            viable_rooms = list(get_viable_rooms(section, rooms))
-            valid_timeslots = []
-        elif requirement == "NEEDS_TIME_ONLY":
-            viable_rooms = []
-            valid_timeslots = list(get_valid_timeslots(section, timeslots))
-        else:
-            viable_rooms = list(get_viable_rooms(section, rooms))
-            valid_timeslots = list(get_valid_timeslots(section, timeslots))
-
-        cache[idx] = {
-            _REQUIREMENT_KEY: requirement,
-            "rooms": viable_rooms,
-            "timeslots": valid_timeslots,
-        }
-
-    return cache
-
-
-def _requirement(idx, option_cache):
-    return option_cache[idx][_REQUIREMENT_KEY]
-
-
-def _domain_size(idx, option_cache):
-    requirement = _requirement(idx, option_cache)
-    if requirement == "NEEDS_NOTHING":
-        return 0
-    if requirement == "NEEDS_ROOM_ONLY":
-        return len(option_cache[idx]["rooms"])
-    if requirement == "NEEDS_TIME_ONLY":
-        return len(option_cache[idx]["timeslots"])
-    return len(option_cache[idx]["rooms"]) * len(option_cache[idx]["timeslots"])
-
-
-# ============================================================
-# OCCUPANCY AND OBJECTIVE
-# ============================================================
-def _build_occupancy(schedule):
-    room_counts = defaultdict(int)
-    instructor_counts = defaultdict(int)
-
-    for schedule_item in schedule:
-        # A timeslot with no room (time-only sections: studios, grad labs,
-        # office hours...) still consumes the instructor's time, so it must
-        # count toward instructor conflicts even though it holds no room.
-        # Room-only activities have no timeslot and create no collision.
-        timeslot_id = schedule_item.timeslot_id
-        if timeslot_id is None:
-            continue
-
-        if schedule_item.room_id is not None:
-            room_counts[(schedule_item.room_id, timeslot_id)] += 1
-        for instructor_id in instructor_occupancy_ids(schedule_item):
-            instructor_counts[(instructor_id, timeslot_id)] += 1
-
-    return room_counts, instructor_counts
-
-
-def _remove_assignment(schedule_item, room_counts, instructor_counts):
-    timeslot_id = schedule_item.timeslot_id
-    if timeslot_id is not None:
-        if schedule_item.room_id is not None:
-            room_key = (schedule_item.room_id, timeslot_id)
-            room_counts[room_key] -= 1
-            if room_counts[room_key] <= 0:
-                del room_counts[room_key]
-
-        for instructor_id in instructor_occupancy_ids(schedule_item):
-            instructor_key = (instructor_id, timeslot_id)
-            instructor_counts[instructor_key] -= 1
-            if instructor_counts[instructor_key] <= 0:
-                del instructor_counts[instructor_key]
-
-    schedule_item.room_id = None
-    schedule_item.timeslot_id = None
-
-
-def _add_assignment(schedule_item, room_id, timeslot_id, room_counts, instructor_counts):
-    schedule_item.room_id = room_id
-    schedule_item.timeslot_id = timeslot_id
-
-    if timeslot_id is None:
-        return
-
-    if room_id is not None:
-        room_counts[(room_id, timeslot_id)] += 1
-    for instructor_id in instructor_occupancy_ids(schedule_item):
-        instructor_counts[(instructor_id, timeslot_id)] += 1
-
-
-def _conflict_totals(room_counts, instructor_counts):
-    room_conflicts = sum(max(0, count - 1) for count in room_counts.values())
-    instructor_conflicts = sum(
-        max(0, count - 1) for count in instructor_counts.values()
-    )
-    return room_conflicts, instructor_conflicts
-
-
-def _objective_from_counts(schedule, room_counts, instructor_counts):
-    room_conflicts, instructor_conflicts = _conflict_totals(
-        room_counts, instructor_counts
-    )
-    return (
-        count_unscheduled(schedule) * UNSCHEDULED_WEIGHT
-        + room_conflicts * ROOM_CONFLICT_WEIGHT
-        + instructor_conflicts * INSTRUCTOR_CONFLICT_WEIGHT
+def make_item(section):
+    """Create one empty ScheduleItem from a Section."""
+    return ScheduleItem(
+        course_id=section.course.id,
+        course_name=section.course.name,
+        course_type=section.course.type,
+        course_dept=section.course.dept,
+        capacity=section.capacity,
+        instructor_id=section.instructor_id,
+        room_id=None,
+        timeslot_id=None,
+        section=str(section.no),
+        instructor_ids=getattr(section, "instructor_ids", ()),
+        pattern_index=getattr(section, "pattern_index", 0),
+        level=getattr(section.course, "level", None),
+        course_class=getattr(section.course, "course_class", None),
     )
 
 
-def _objective(schedule):
-    room_counts, instructor_counts = _build_occupancy(schedule)
-    return _objective_from_counts(schedule, room_counts, instructor_counts)
+def build_cache(sections, rooms, timeslots):
+    """Precompute what each section needs and its possible rooms/timeslots."""
+    requirements = []
+    candidates = []
 
-
-def _placement_cost(schedule_item, room_id, timeslot_id, room_counts, instructor_counts):
-    if timeslot_id is None:
-        return 0
-
-    cost = room_counts.get((room_id, timeslot_id), 0) * ROOM_CONFLICT_WEIGHT
-    for instructor_id in instructor_occupancy_ids(schedule_item):
-        cost += (
-            instructor_counts.get((instructor_id, timeslot_id), 0)
-            * INSTRUCTOR_CONFLICT_WEIGHT
-        )
-    return cost
-
-
-def _is_problem(schedule_item, room_counts, instructor_counts):
-    if not _is_scheduled(schedule_item):
-        return True
-
-    if schedule_item.timeslot_id is None:
-        return False
-
-    if room_counts.get((schedule_item.room_id, schedule_item.timeslot_id), 0) > 1:
-        return True
-
-    return any(
-        instructor_counts.get((instructor_id, schedule_item.timeslot_id), 0) > 1
-        for instructor_id in instructor_occupancy_ids(schedule_item)
-    )
-
-
-def _problem_indices(schedule, room_counts=None, instructor_counts=None):
-    if room_counts is None or instructor_counts is None:
-        room_counts, instructor_counts = _build_occupancy(schedule)
-
-    return [
-        idx
-        for idx, schedule_item in enumerate(schedule)
-        if _is_problem(schedule_item, room_counts, instructor_counts)
-    ]
-
-
-# ============================================================
-# CANDIDATE GENERATION
-# ============================================================
-def _sample_pairs(viable_rooms, valid_timeslots, limit):
-    total = len(viable_rooms) * len(valid_timeslots)
-    if total == 0:
-        return []
-
-    if total <= limit:
-        pairs = [
-            (room, timeslot)
-            for timeslot in valid_timeslots
-            for room in viable_rooms
-        ]
-        random.shuffle(pairs)
-        return pairs
-
-    pairs = []
-    seen = set()
-    attempts = 0
-    max_attempts = limit * 6
-
-    while len(pairs) < limit and attempts < max_attempts:
-        attempts += 1
-        room = random.choice(viable_rooms)
-        timeslot = random.choice(valid_timeslots)
-        key = (room.id, timeslot.id)
-        if key in seen:
-            continue
-        seen.add(key)
-        pairs.append((room, timeslot))
-
-    return pairs
-
-
-def _soft_cost(idx, room, sections, static_memo):
-    """Price of the soft rules (room type / campus / department / capacity) for
-    putting section *idx* in *room*.
-
-    This replaces the old _static_ok() gate, which called passes_hard_constraints
-    with empty occupancy sets -- i.e. it was never checking double-booking at
-    all, only the four soft rules, and REJECTED any candidate that broke one.
-    That is what made sections unschedulable rather than merely imperfect. Now
-    the same information becomes a cost: SOFT_PENALTY_WEIGHT scales the worst
-    realistic penalty (~12 units) to a few hundred, so a soft violation is
-    always cheaper than a double-booking (1000) and far cheaper than leaving the
-    section unscheduled (10000), while still being firmly preferred against.
-    """
-    key = (idx, room.id)
-    cached = static_memo.get(key)
-    if cached is not None:
-        return cached
-
-    cost = room_soft_penalty(sections[idx], room) * SOFT_PENALTY_WEIGHT
-
-    if len(static_memo) < STATIC_CACHE_LIMIT:
-        static_memo[key] = cost
-
-    return cost
-
-
-def _best_candidates(
-    idx,
-    schedule,
-    sections,
-    option_cache,
-    room_counts,
-    instructor_counts,
-    static_memo,
-    sample_limit,
-    top_k=8,
-):
-    requirement = _requirement(idx, option_cache)
-    schedule_item = schedule[idx]
-
-    if requirement == "NEEDS_NOTHING":
-        return [(0, None, None)]
-
-    if requirement == "NEEDS_TIME_ONLY":
-        # Needs a timeslot but no room; the only cost is instructor collision.
-        valid_timeslots = option_cache[idx]["timeslots"]
-        if not valid_timeslots:
-            return []
-        ranked = []
-        for timeslot in valid_timeslots:
-            cost = _placement_cost(
-                schedule_item, None, timeslot.id, room_counts, instructor_counts
-            ) + time_soft_penalty(schedule_item, timeslot) * SOFT_PENALTY_WEIGHT
-            ranked.append((cost, random.random(), timeslot))
-        ranked.sort(key=lambda value: (value[0], value[1]))
-        return [(cost, None, timeslot) for cost, _, timeslot in ranked[:top_k]]
-
-    viable_rooms = option_cache[idx]["rooms"]
-    if not viable_rooms:
-        return []
-
-    if requirement == "NEEDS_ROOM_ONLY":
-        rooms_to_try = list(viable_rooms)
-        random.shuffle(rooms_to_try)
-        return [(0, room, None) for room in rooms_to_try[:top_k]]
-
-    valid_timeslots = option_cache[idx]["timeslots"]
-    if not valid_timeslots:
-        return []
-
-    ranked = []
-    for room, timeslot in _sample_pairs(
-        viable_rooms, valid_timeslots, sample_limit
-    ):
-        # _soft_cost is memoized on (idx, room) and is deliberately room-only,
-        # so the time term is added here where the timeslot is known rather than
-        # inside it -- folding it in would make the memo key wrong.
-        cost = _placement_cost(
-            schedule_item,
-            room.id,
-            timeslot.id,
-            room_counts,
-            instructor_counts,
-        ) + _soft_cost(idx, room, sections, static_memo) + (
-            time_soft_penalty(schedule_item, timeslot) * SOFT_PENALTY_WEIGHT
-        )
-        ranked.append((cost, random.random(), room, timeslot))
-
-    ranked.sort(key=lambda value: (value[0], value[1]))
-    return [
-        (cost, room, timeslot)
-        for cost, _, room, timeslot in ranked[:top_k]
-    ]
-
-
-# ============================================================
-# INITIAL MRV CONSTRUCTION
-# ============================================================
-def _construction_order(sections, option_cache):
-    instructor_load = defaultdict(int)
     for section in sections:
-        for instructor_id in instructor_occupancy_ids(section):
-            instructor_load[instructor_id] += 1
+        requirement = classify_section(section)
+        requirements.append(requirement)
 
-    indices = [
-        idx
-        for idx in range(len(sections))
-        if _requirement(idx, option_cache) != "NEEDS_NOTHING"
-    ]
+        if requirement in (NEEDS_ROOM_AND_TIME, NEEDS_ROOM_ONLY):
+            room_options = list(get_viable_rooms(section, rooms, limit=ROOM_LIMIT))
+        else:
+            room_options = []
 
-    indices.sort(
-        key=lambda idx: (
-            _domain_size(idx, option_cache),
-            -max((instructor_load[instructor_id]
-                  for instructor_id in instructor_occupancy_ids(sections[idx])),
-                 default=0),
-            -getattr(sections[idx], "capacity", 0),
-            random.random(),
-        )
-    )
-    return indices
+        if requirement in (NEEDS_ROOM_AND_TIME, NEEDS_TIME_ONLY):
+            time_options = list(get_valid_timeslots(section, timeslots))
+            time_options.sort(key=lambda ts: time_soft_penalty(section, ts))
+        else:
+            time_options = []
 
+        candidates.append({
+            "rooms": room_options,
+            "timeslots": time_options,
+        })
 
-def _construct_once(sections, option_cache, static_memo):
-    schedule = _new_schedule(sections)
-    room_counts = defaultdict(int)
-    instructor_counts = defaultdict(int)
-
-    for idx in _construction_order(sections, option_cache):
-        candidates = _best_candidates(
-            idx,
-            schedule,
-            sections,
-            option_cache,
-            room_counts,
-            instructor_counts,
-            static_memo,
-            CONSTRUCTION_PAIR_SAMPLES,
-            top_k=10,
-        )
-        if not candidates:
-            continue
-
-        zero_cost = [candidate for candidate in candidates if candidate[0] == 0]
-        chosen = random.choice(zero_cost if zero_cost else candidates[:3])
-        _, room, timeslot = chosen
-
-        room_id = room.id if room is not None else None
-        timeslot_id = timeslot.id if timeslot is not None else None
-        # Skip only if there is genuinely nothing to place; a time-only
-        # section has room_id=None but a real timeslot_id and must be applied.
-        if room_id is None and timeslot_id is None:
-            continue
-
-        _add_assignment(
-            schedule[idx],
-            room_id,
-            timeslot_id,
-            room_counts,
-            instructor_counts,
-        )
-
-    return schedule
+    return requirements, candidates
 
 
-def _initial_construction(sections, option_cache, static_memo):
-    best = None
-    best_cost = math.inf
+def sample_choices(requirement, rooms, timeslots, limit):
+    """Return a small set of room/time choices instead of checking everything."""
+    if requirement == NEEDS_NOTHING:
+        return [(None, None)]
 
-    for _ in range(CONSTRUCTION_RESTARTS):
-        candidate = _construct_once(sections, option_cache, static_memo)
-        candidate_cost = _objective(candidate)
-        if candidate_cost < best_cost:
-            best = candidate
-            best_cost = candidate_cost
+    if requirement == NEEDS_ROOM_ONLY:
+        return [(room, None) for room in rooms[:limit]]
 
-    return best
+    if requirement == NEEDS_TIME_ONLY:
+        chosen = timeslots if len(timeslots) <= limit else timeslots[:limit]
+        return [(None, ts) for ts in chosen]
 
-
-# ============================================================
-# LARGE NEIGHBORHOOD SEARCH
-# ============================================================
-def _select_neighborhood(schedule, option_cache, target_size):
-    room_counts, instructor_counts = _build_occupancy(schedule)
-    problems = _problem_indices(schedule, room_counts, instructor_counts)
-    if not problems:
+    if not rooms or not timeslots:
         return []
 
-    seed = random.choice(problems)
-    chosen = {seed}
-    seed_item = schedule[seed]
+    total = len(rooms) * len(timeslots)
+    if total <= limit:
+        return [(room, ts) for room in rooms for ts in timeslots]
 
-    related = []
-    for idx, schedule_item in enumerate(schedule):
-        if idx == seed:
-            continue
+    choices = []
+    seen = set()
 
-        same_room_time = (
-            seed_item.room_id is not None
-            and seed_item.timeslot_id is not None
-            and schedule_item.room_id == seed_item.room_id
-            and schedule_item.timeslot_id == seed_item.timeslot_id
-        )
-        seed_instructors = set(instructor_occupancy_ids(seed_item))
-        same_instructor = bool(
-            seed_instructors & set(instructor_occupancy_ids(schedule_item))
-        )
-        same_timeslot = (
-            seed_item.timeslot_id is not None
-            and schedule_item.timeslot_id == seed_item.timeslot_id
-        )
+    # Always try some of the best ranked rooms and times first.
+    for room in rooms[:8]:
+        for ts in timeslots[:8]:
+            key = (room.id, ts.id)
+            if key not in seen:
+                seen.add(key)
+                choices.append((room, ts))
+                if len(choices) >= limit:
+                    return choices
 
-        if same_room_time or same_instructor or same_timeslot:
-            related.append(idx)
+    while len(choices) < limit:
+        room = random.choice(rooms[: min(len(rooms), ROOM_LIMIT)])
+        ts = random.choice(timeslots)
+        key = (room.id, ts.id)
+        if key not in seen:
+            seen.add(key)
+            choices.append((room, ts))
 
-    random.shuffle(related)
-    for idx in related:
-        if len(chosen) >= target_size:
-            break
-        chosen.add(idx)
-
-    remaining_problems = [idx for idx in problems if idx not in chosen]
-    remaining_problems.sort(key=lambda idx: _domain_size(idx, option_cache))
-    for idx in remaining_problems:
-        if len(chosen) >= target_size:
-            break
-        chosen.add(idx)
-
-    if len(chosen) < target_size:
-        pool = [
-            idx
-            for idx in range(len(schedule))
-            if idx not in chosen
-            and _requirement(idx, option_cache) != "NEEDS_NOTHING"
-        ]
-        random.shuffle(pool)
-        chosen.update(pool[: target_size - len(chosen)])
-
-    return list(chosen)
+    return choices
 
 
-def _rebuild_neighborhood(
-    schedule,
-    neighborhood,
-    sections,
-    option_cache,
-    static_memo,
-):
-    room_counts, instructor_counts = _build_occupancy(schedule)
+# ============================================================
+# OCCUPANCY
+# ============================================================
 
-    for idx in neighborhood:
-        _remove_assignment(schedule[idx], room_counts, instructor_counts)
+class Occupancy:
+    """Stores which room, instructor and sibling is using each timeslot."""
 
-    neighborhood.sort(
-        key=lambda idx: (
-            _domain_size(idx, option_cache),
-            -getattr(sections[idx], "capacity", 0),
-            random.random(),
+    def __init__(self, schedule):
+        self.schedule = schedule
+        self.rooms = defaultdict(list)
+        self.instructors = defaultdict(list)
+        self.siblings = defaultdict(list)
+
+        for i in range(len(schedule)):
+            self.add(i)
+
+    @staticmethod
+    def _remove(mapping, key, index):
+        values = mapping.get(key)
+        if not values:
+            return
+        if index in values:
+            values.remove(index)
+        if not values:
+            mapping.pop(key, None)
+
+    def add(self, index):
+        item = self.schedule[index]
+        ts = item.timeslot_id
+        if ts is None:
+            return
+
+        if item.room_id is not None:
+            self.rooms[(item.room_id, ts)].append(index)
+
+        for instructor_id in instructor_occupancy_ids(item):
+            self.instructors[(instructor_id, ts)].append(index)
+
+        self.siblings[(sibling_key(item), ts)].append(index)
+
+    def remove(self, index):
+        item = self.schedule[index]
+        ts = item.timeslot_id
+        if ts is None:
+            return
+
+        if item.room_id is not None:
+            self._remove(self.rooms, (item.room_id, ts), index)
+
+        for instructor_id in instructor_occupancy_ids(item):
+            self._remove(self.instructors, (instructor_id, ts), index)
+
+        self._remove(self.siblings, (sibling_key(item), ts), index)
+
+    def occupant_count(self, indices):
+        """Count room/instructor occupants using the same combined-class idea as evaluation.py."""
+        groups = defaultdict(list)
+
+        for index in indices:
+            item = self.schedule[index]
+            groups[occupancy_key(item.course_id, item.section)].append(item)
+
+        count = 0
+        for key, members in groups.items():
+            if key[0] != "combined":
+                count += 1
+            else:
+                per_course = Counter(item.course_id for item in members)
+                count += max(per_course.values())
+
+        return count
+
+    def hard_cost(self, index, room_id, timeslot_id):
+        """How many new hard conflicts would this placement create?"""
+        if timeslot_id is None:
+            return 0
+
+        item = self.schedule[index]
+        cost = 0
+
+        if room_id is not None:
+            current = self.rooms.get((room_id, timeslot_id), [])
+            before = max(0, self.occupant_count(current) - 1)
+            after = max(0, self.occupant_count(current + [index]) - 1)
+            cost += after - before
+
+        for instructor_id in instructor_occupancy_ids(item):
+            current = self.instructors.get((instructor_id, timeslot_id), [])
+            before = max(0, self.occupant_count(current) - 1)
+            after = max(0, self.occupant_count(current + [index]) - 1)
+            cost += after - before
+
+        # Meeting blocks belonging to the same section cannot use the same timeslot.
+        siblings = self.siblings.get((sibling_key(item), timeslot_id), [])
+        cost += len(siblings)
+
+        return cost
+
+    def problem_indices(self, requirements):
+        problems = []
+
+        for i, item in enumerate(self.schedule):
+            if not is_scheduled(item, requirements[i]):
+                problems.append(i)
+                continue
+
+            ts = item.timeslot_id
+            if ts is None:
+                continue
+
+            bad = False
+
+            if item.room_id is not None:
+                room_users = self.rooms.get((item.room_id, ts), [])
+                if self.occupant_count(room_users) > 1:
+                    bad = True
+
+            if not bad:
+                for instructor_id in instructor_occupancy_ids(item):
+                    users = self.instructors.get((instructor_id, ts), [])
+                    if self.occupant_count(users) > 1:
+                        bad = True
+                        break
+
+            if not bad and len(self.siblings.get((sibling_key(item), ts), [])) > 1:
+                bad = True
+
+            if bad:
+                problems.append(i)
+
+        return problems
+
+
+# ============================================================
+# GENETIC ALGORITHM
+# Holland (1975); Goldberg (1989)
+# ============================================================
+
+def create_population(size, sections, requirements, candidates):
+    """Create the initial GA population."""
+    population = []
+
+    # Schedule the most constrained sections first.
+    order = list(range(len(sections)))
+    order.sort(
+        key=lambda i: (
+            max(1, len(candidates[i]["rooms"]))
+            * max(1, len(candidates[i]["timeslots"])),
+            -getattr(sections[i], "capacity", 0),
         )
     )
 
-    for idx in neighborhood:
-        requirement = _requirement(idx, option_cache)
-        if requirement == "NEEDS_NOTHING":
-            continue
+    for _ in range(size):
+        schedule = [make_item(section) for section in sections]
+        occ = Occupancy(schedule)
 
-        candidates = _best_candidates(
-            idx,
+        for i in order:
+            requirement = requirements[i]
+
+            if requirement == NEEDS_NOTHING:
+                continue
+
+            choices = sample_choices(
+                requirement,
+                candidates[i]["rooms"],
+                candidates[i]["timeslots"],
+                PAIR_SAMPLE,
+            )
+
+            best = None
+            for room, ts in choices:
+                room_id = room.id if room is not None else None
+                ts_id = ts.id if ts is not None else None
+
+                hard = occ.hard_cost(i, room_id, ts_id)
+                soft = 0
+                if room is not None:
+                    soft += room_soft_penalty(sections[i], room)
+                if ts is not None:
+                    soft += time_soft_penalty(sections[i], ts)
+
+                value = (hard, soft, random.random(), room_id, ts_id)
+                if best is None or value < best:
+                    best = value
+
+            if best is not None:
+                _, _, _, room_id, ts_id = best
+                schedule[i].room_id = room_id
+                schedule[i].timeslot_id = ts_id
+                occ.add(i)
+
+        population.append(schedule)
+
+    return population
+
+
+# GA selection: keep better schedules more likely to reproduce.
+def selection(population, sections, rooms, timeslots, cache):
+    """Keep the best half. Hard feasibility is checked before fitness."""
+    def key(schedule):
+        unscheduled = sum(
+            1
+            for item, section in zip(schedule, sections)
+            if not is_scheduled(item, classify_section(section))
+        )
+        hard = count_hard_conflicts(schedule)
+        fitness = calculate_fitness(
             schedule,
-            sections,
-            option_cache,
-            room_counts,
-            instructor_counts,
-            static_memo,
-            LNS_PAIR_SAMPLES,
-            top_k=12,
+            rooms,
+            sections=sections,
+            timeslots=timeslots,
+            valid_timeslot_cache=cache,
         )
-        if not candidates:
-            continue
+        return (unscheduled, hard, -fitness)
 
-        best_cost = candidates[0][0]
-        near_best = [
-            candidate
-            for candidate in candidates
-            if candidate[0] <= best_cost + ROOM_CONFLICT_WEIGHT
-        ]
-        _, room, timeslot = random.choice(near_best)
+    population.sort(key=key)
+    return population[: max(2, len(population) // 2)]
 
+
+# GA crossover: combine assignments from two parent schedules.
+def crossover(parent1, parent2):
+    """Uniform crossover: each class comes from one of the two parents."""
+    if random.random() > CROSSOVER_RATE:
+        return copy.deepcopy(parent1)
+
+    child = []
+    for a, b in zip(parent1, parent2):
+        child.append(copy.deepcopy(a if random.random() < 0.5 else b))
+    return child
+
+
+# GA mutation: randomly change an assignment to maintain diversity.
+def mutation(schedule, sections, requirements, candidates):
+    """Randomly move one class to another good room/timeslot."""
+    if random.random() > MUTATION_RATE:
+        return schedule
+
+    indices = [i for i, req in enumerate(requirements) if req != NEEDS_NOTHING]
+    if not indices:
+        return schedule
+
+    i = random.choice(indices)
+    occ = Occupancy(schedule)
+    occ.remove(i)
+
+    choices = sample_choices(
+        requirements[i],
+        candidates[i]["rooms"],
+        candidates[i]["timeslots"],
+        PAIR_SAMPLE // 2,
+    )
+
+    best = None
+    for room, ts in choices:
         room_id = room.id if room is not None else None
-        timeslot_id = timeslot.id if timeslot is not None else None
-        if room_id is None and timeslot_id is None:
-            continue
+        ts_id = ts.id if ts is not None else None
+        hard = occ.hard_cost(i, room_id, ts_id)
 
-        _add_assignment(
-            schedule[idx],
-            room_id,
-            timeslot_id,
-            room_counts,
-            instructor_counts,
-        )
+        soft = 0
+        if room is not None:
+            soft += room_soft_penalty(sections[i], room)
+        if ts is not None:
+            soft += time_soft_penalty(sections[i], ts)
+
+        value = (hard, soft, random.random(), room_id, ts_id)
+        if best is None or value < best:
+            best = value
+
+    if best is not None:
+        schedule[i].room_id = best[3]
+        schedule[i].timeslot_id = best[4]
 
     return schedule
 
 
-def _large_neighborhood_search(schedule, sections, option_cache, static_memo):
-    best = clone_schedule(schedule)
-    best_cost = _objective(best)
-    current = clone_schedule(best)
-    current_cost = best_cost
+def genetic_schedule(sections, timeslots, rooms, requirements, candidates, cache):
+    """Run the Genetic Algorithm."""
+    population = create_population(
+        POPULATION_SIZE,
+        sections,
+        requirements,
+        candidates,
+    )
 
-    for iteration in range(LNS_ITERATIONS):
-        target_size = random.randint(LNS_MIN_SIZE, LNS_MAX_SIZE)
-        neighborhood = _select_neighborhood(current, option_cache, target_size)
-        if not neighborhood:
-            break
+    for generation in range(GENERATIONS):
+        selected = selection(population, sections, rooms, timeslots, cache)
 
-        candidate = clone_schedule(current)
-        _rebuild_neighborhood(
-            candidate,
-            neighborhood,
-            sections,
-            option_cache,
-            static_memo,
-        )
-        candidate_cost = _objective(candidate)
+        # Keep a few of the best schedules unchanged.
+        new_population = [copy.deepcopy(s) for s in selected[:ELITE_COUNT]]
 
-        temperature = max(
-            1.0,
-            4000.0 * (1.0 - iteration / max(1, LNS_ITERATIONS)),
-        )
-        accept_worse = (
-            candidate_cost > current_cost
-            and random.random()
-            < math.exp(-(candidate_cost - current_cost) / temperature)
-        )
+        while len(new_population) < POPULATION_SIZE:
+            parent1, parent2 = random.sample(selected, 2)
+            child = crossover(parent1, parent2)
+            child = mutation(child, sections, requirements, candidates)
+            new_population.append(child)
 
-        if candidate_cost <= current_cost or accept_worse:
-            current = candidate
-            current_cost = candidate_cost
+        population = new_population
 
-        if candidate_cost < best_cost:
-            best = clone_schedule(candidate)
-            best_cost = candidate_cost
+        if generation in (0, 3, 7, GENERATIONS - 1):
+            best = selection(population, sections, rooms, timeslots, cache)[0]
+            fitness = calculate_fitness(
+                best,
+                rooms,
+                sections=sections,
+                timeslots=timeslots,
+                valid_timeslot_cache=cache,
+            )
+            unscheduled = sum(
+                not is_scheduled(item, requirements[i])
+                for i, item in enumerate(best)
+            )
+            print(
+                f"[GA] generation={generation + 1}/{GENERATIONS} "
+                f"unscheduled={unscheduled} "
+                f"hard={count_hard_conflicts(best)} "
+                f"fitness={fitness:.4f}"
+            )
 
-        if best_cost == 0:
-            break
-
-    return best
+    return selection(population, sections, rooms, timeslots, cache)[0]
 
 
 # ============================================================
-# MIN-CONFLICTS REPAIR
+# TABU SEARCH
+# Glover (1989): neighborhood moves, tabu memory, tenure, aspiration.
 # ============================================================
-def _min_conflicts(schedule, sections, option_cache, static_memo):
-    best = clone_schedule(schedule)
-    best_cost = _objective(best)
-    current = clone_schedule(schedule)
-    room_counts, instructor_counts = _build_occupancy(current)
 
-    for _ in range(MIN_CONFLICT_STEPS):
-        problems = _problem_indices(current, room_counts, instructor_counts)
+def tabu_search(schedule, sections, rooms, timeslots, requirements, candidates):
+    """Tabu Search repairs hard conflicts, then improves soft constraints."""
+    current = copy.deepcopy(schedule)
+    best = copy.deepcopy(schedule)
+    tabu = {}
+    accepted = 0
+
+    def simple_score(s):
+        unscheduled = sum(
+            not is_scheduled(item, requirements[i])
+            for i, item in enumerate(s)
+        )
+        return (unscheduled, count_hard_conflicts(s))
+
+    # --------------------------------------------------------
+    # Phase 1: repair unscheduled sections and hard conflicts.
+    # --------------------------------------------------------
+    best_score = simple_score(best)
+
+    for iteration in range(TABU_ITERATIONS):
+        occ = Occupancy(current)
+        problems = occ.problem_indices(requirements)
+
         if not problems:
-            return current
+            print(f"[TS] feasibility reached at iteration {iteration}")
+            break
 
-        idx = random.choice(problems)
-        requirement = _requirement(idx, option_cache)
-        if requirement == "NEEDS_NOTHING":
-            continue
+        random.shuffle(problems)
+        problems = problems[:8]
+        move = None
 
-        schedule_item = current[idx]
-        old_room_id = schedule_item.room_id
-        old_timeslot_id = schedule_item.timeslot_id
-        _remove_assignment(schedule_item, room_counts, instructor_counts)
+        for i in problems:
+            old_room = current[i].room_id
+            old_time = current[i].timeslot_id
+            occ.remove(i)
 
-        candidates = _best_candidates(
-            idx,
-            current,
-            sections,
-            option_cache,
-            room_counts,
-            instructor_counts,
-            static_memo,
-            MIN_CONFLICT_PAIR_SAMPLES,
-            top_k=18,
-        )
+            choices = sample_choices(
+                requirements[i],
+                candidates[i]["rooms"],
+                candidates[i]["timeslots"],
+                TABU_SAMPLE,
+            )
 
-        if not candidates:
-            if old_room_id is not None:
-                _add_assignment(
-                    schedule_item,
-                    old_room_id,
-                    old_timeslot_id,
-                    room_counts,
-                    instructor_counts,
+            for room, ts in choices:
+                room_id = room.id if room is not None else None
+                ts_id = ts.id if ts is not None else None
+                hard = occ.hard_cost(i, room_id, ts_id)
+
+                soft = 0
+                if room is not None:
+                    soft += room_soft_penalty(sections[i], room)
+                if ts is not None:
+                    soft += time_soft_penalty(sections[i], ts)
+
+                key = (i, room_id, ts_id)
+                is_tabu = tabu.get(key, -1) > iteration
+
+                # Aspiration criterion (Glover, 1989): a tabu move may still
+                # be considered if it improves the best feasibility score
+                # found so far. The full score is evaluated only for tabu
+                # candidates, so normal candidate testing stays fast.
+                aspiration = False
+                if is_tabu:
+                    saved_room = current[i].room_id
+                    saved_time = current[i].timeslot_id
+                    current[i].room_id = room_id
+                    current[i].timeslot_id = ts_id
+                    aspiration = simple_score(current) < best_score
+                    current[i].room_id = saved_room
+                    current[i].timeslot_id = saved_time
+
+                candidate = (hard, soft, random.random(), i, room_id, ts_id)
+
+                if (not is_tabu or aspiration) and (move is None or candidate < move):
+                    move = candidate
+
+            current[i].room_id = old_room
+            current[i].timeslot_id = old_time
+            occ.add(i)
+
+        if move is None:
+            break
+
+        _, _, _, i, new_room, new_time = move
+        old_key = (i, current[i].room_id, current[i].timeslot_id)
+        current[i].room_id = new_room
+        current[i].timeslot_id = new_time
+        tabu[old_key] = iteration + TABU_TENURE + random.randint(0, 4)
+        accepted += 1
+
+        score = simple_score(current)
+        if score < best_score:
+            best = copy.deepcopy(current)
+            best_score = score
+
+    # Use the best feasible schedule found by the repair phase.
+    current = copy.deepcopy(best)
+
+    # --------------------------------------------------------
+    # Phase 2: TS intensification for soft constraints.
+    # Only feasible neighborhood moves are accepted, so the 0-hard-conflict
+    # solution reached in Phase 1 is never sacrificed. This is the
+    # local-improvement part of the hybrid timetabling search.
+    # --------------------------------------------------------
+    if best_score == (0, 0):
+        room_by_id = {room.id: room for room in rooms}
+        time_by_id = {ts.id: ts for ts in timeslots}
+        soft_moves = 0
+        swap_moves = 0
+
+        # Try moving one class to a better free room/timeslot.
+        for _ in range(TS_SOFT_PASSES):
+            weighted = []
+
+            for i, item in enumerate(current):
+                if requirements[i] == NEEDS_NOTHING:
+                    continue
+
+                cost = 0
+                if item.room_id in room_by_id:
+                    cost += room_soft_penalty(sections[i], room_by_id[item.room_id])
+                if item.timeslot_id in time_by_id:
+                    cost += time_soft_penalty(sections[i], time_by_id[item.timeslot_id])
+
+                if cost > 0:
+                    weighted.append((cost, i))
+
+            weighted.sort(reverse=True)
+            occ = Occupancy(current)
+            improved = 0
+
+            for _, i in weighted[:TS_SOFT_ITEMS]:
+                old_room = current[i].room_id
+                old_time = current[i].timeslot_id
+
+                old_soft = 0
+                if old_room in room_by_id:
+                    old_soft += room_soft_penalty(sections[i], room_by_id[old_room])
+                if old_time in time_by_id:
+                    old_soft += time_soft_penalty(sections[i], time_by_id[old_time])
+
+                occ.remove(i)
+                best_move = None
+
+                choices = sample_choices(
+                    requirements[i],
+                    candidates[i]["rooms"],
+                    candidates[i]["timeslots"],
+                    TS_SOFT_PAIR_SAMPLE,
                 )
-            continue
 
-        if random.random() < RANDOM_WALK_RATE:
-            _, room, timeslot = random.choice(candidates)
-        else:
-            best_local_cost = candidates[0][0]
-            best_local = [
-                candidate
-                for candidate in candidates
-                if candidate[0] == best_local_cost
-            ]
-            _, room, timeslot = random.choice(best_local)
+                for room, ts in choices:
+                    room_id = room.id if room is not None else None
+                    ts_id = ts.id if ts is not None else None
 
-        room_id = room.id if room is not None else None
-        timeslot_id = timeslot.id if timeslot is not None else None
-        if room_id is not None or timeslot_id is not None:
-            _add_assignment(
-                schedule_item,
-                room_id,
-                timeslot_id,
-                room_counts,
-                instructor_counts,
-            )
+                    # Soft phase never introduces a hard conflict.
+                    if occ.hard_cost(i, room_id, ts_id) != 0:
+                        continue
 
-        current_cost = _objective_from_counts(
-            current, room_counts, instructor_counts
-        )
-        if current_cost < best_cost:
-            best = clone_schedule(current)
-            best_cost = current_cost
+                    new_soft = 0
+                    if room is not None:
+                        new_soft += room_soft_penalty(sections[i], room)
+                    if ts is not None:
+                        new_soft += time_soft_penalty(sections[i], ts)
 
-        if best_cost == 0:
-            break
+                    gain = old_soft - new_soft
+                    if gain > 0:
+                        value = (-gain, random.random(), room_id, ts_id)
+                        if best_move is None or value < best_move:
+                            best_move = value
 
-    return best
+                if best_move is not None:
+                    current[i].room_id = best_move[2]
+                    current[i].timeslot_id = best_move[3]
+                    occ.add(i)
+                    improved += 1
+                    soft_moves += 1
+                else:
+                    current[i].room_id = old_room
+                    current[i].timeslot_id = old_time
+                    occ.add(i)
 
-
-# ============================================================
-# DIRECT UNSCHEDULED RESCUE
-# ============================================================
-def _zero_cost_candidates(
-    idx,
-    schedule,
-    sections,
-    option_cache,
-    room_counts,
-    instructor_counts,
-    static_memo,
-    sample_limit,
-    top_k=30,
-):
-    return [
-        candidate
-        for candidate in _best_candidates(
-            idx,
-            schedule,
-            sections,
-            option_cache,
-            room_counts,
-            instructor_counts,
-            static_memo,
-            sample_limit,
-            top_k=top_k,
-        )
-        if candidate[0] == 0
-    ]
-
-
-def _try_single_blocker_rescue(
-    schedule,
-    idx,
-    sections,
-    option_cache,
-    static_memo,
-):
-    """Place idx by moving at most one blocking section to a free position."""
-    base = clone_schedule(schedule)
-    room_counts, instructor_counts = _build_occupancy(base)
-    _remove_assignment(base[idx], room_counts, instructor_counts)
-
-    candidates = _best_candidates(
-        idx,
-        base,
-        sections,
-        option_cache,
-        room_counts,
-        instructor_counts,
-        static_memo,
-        DIRECT_RESCUE_PAIR_SAMPLES,
-        top_k=40,
-    )
-
-    ranked = []
-    for cost, room, timeslot in candidates:
-        if room is None:
-            continue
-        if timeslot is None:
-            ranked.append((0, cost, random.random(), room, timeslot, []))
-            continue
-        blockers = _blocking_indices(base, idx, room.id, timeslot.id)
-        if len(blockers) <= 1:
-            ranked.append(
-                (len(blockers), cost, random.random(), room, timeslot, blockers)
-            )
-
-    ranked.sort(key=lambda value: (value[0], value[1], value[2]))
-
-    for blocker_count, _, _, room, timeslot, blockers in ranked:
-        trial = clone_schedule(base)
-        trial_room_counts, trial_instructor_counts = _build_occupancy(trial)
-
-        if blocker_count == 0:
-            _add_assignment(
-                trial[idx],
-                room.id,
-                timeslot.id if timeslot is not None else None,
-                trial_room_counts,
-                trial_instructor_counts,
-            )
-            return trial
-
-        blocker_idx = blockers[0]
-        _remove_assignment(
-            trial[blocker_idx], trial_room_counts, trial_instructor_counts
-        )
-        _add_assignment(
-            trial[idx],
-            room.id,
-            timeslot.id,
-            trial_room_counts,
-            trial_instructor_counts,
-        )
-
-        blocker_choices = _zero_cost_candidates(
-            blocker_idx,
-            trial,
-            sections,
-            option_cache,
-            trial_room_counts,
-            trial_instructor_counts,
-            static_memo,
-            DIRECT_RESCUE_BLOCKER_SAMPLES,
-            top_k=20,
-        )
-        if not blocker_choices:
-            continue
-
-        _, blocker_room, blocker_timeslot = random.choice(blocker_choices[:5])
-        _add_assignment(
-            trial[blocker_idx],
-            blocker_room.id,
-            blocker_timeslot.id if blocker_timeslot is not None else None,
-            trial_room_counts,
-            trial_instructor_counts,
-        )
-        return trial
-
-    return None
-
-
-def _direct_rescue_unscheduled(
-    schedule,
-    sections,
-    option_cache,
-    static_memo,
-):
-    """Prioritize reducing unscheduled sections without adding conflicts."""
-    best = clone_schedule(schedule)
-
-    for _ in range(DIRECT_RESCUE_ROUNDS):
-        unscheduled = [
-            idx
-            for idx, item in enumerate(best)
-            if not _is_scheduled(item)
-            and _requirement(idx, option_cache) != "NEEDS_NOTHING"
-        ]
-        if not unscheduled:
-            break
-
-        unscheduled.sort(
-            key=lambda idx: (
-                _domain_size(idx, option_cache),
-                -getattr(sections[idx], "capacity", 0),
-            )
-        )
-
-        improved = False
-        for idx in unscheduled:
-            candidate = _try_single_blocker_rescue(
-                best,
-                idx,
-                sections,
-                option_cache,
-                static_memo,
-            )
-            if candidate is None:
-                continue
-
-            # Accept only when the unscheduled count decreases and the total
-            # number of hard conflicts does not increase.
-            old_room_counts, old_instructor_counts = _build_occupancy(best)
-            new_room_counts, new_instructor_counts = _build_occupancy(candidate)
-            old_conflicts = sum(_conflict_totals(
-                old_room_counts, old_instructor_counts
-            ))
-            new_conflicts = sum(_conflict_totals(
-                new_room_counts, new_instructor_counts
-            ))
-
-            if (
-                count_unscheduled(candidate) < count_unscheduled(best)
-                and new_conflicts <= old_conflicts
-            ):
-                best = candidate
-                improved = True
-
-        if not improved:
-            break
-
-    return best
-
-
-# ============================================================
-# EJECTION-CHAIN REPAIR
-# ============================================================
-def _blocking_indices(schedule, moving_idx, room_id, timeslot_id):
-    """Return sections that prevent moving_idx from using this placement."""
-    moving_item = schedule[moving_idx]
-    blockers = []
-
-    for idx, item in enumerate(schedule):
-        if idx == moving_idx or item.timeslot_id is None:
-            continue
-
-        room_block = (
-            item.room_id == room_id
-            and item.timeslot_id == timeslot_id
-        )
-        instructor_block = (
-            bool(set(instructor_occupancy_ids(moving_item))
-                 & set(instructor_occupancy_ids(item)))
-            and item.timeslot_id == timeslot_id
-        )
-
-        if room_block or instructor_block:
-            blockers.append(idx)
-
-    return blockers
-
-
-def _try_ejection_chain(
-    schedule,
-    idx,
-    sections,
-    option_cache,
-    static_memo,
-    depth,
-    visited,
-):
-    """
-    Try to place one section. If its desired placement is occupied, move the
-    blocking section(s) recursively. Returns a repaired schedule or None.
-    """
-    if idx in visited:
-        return None
-
-    requirement = _requirement(idx, option_cache)
-    if requirement == "NEEDS_NOTHING":
-        return clone_schedule(schedule)
-
-    base = clone_schedule(schedule)
-    room_counts, instructor_counts = _build_occupancy(base)
-    _remove_assignment(base[idx], room_counts, instructor_counts)
-
-    viable_rooms = option_cache[idx]["rooms"]
-    if not viable_rooms:
-        return None
-
-    # Room-only activities do not use a timeslot, so any viable room works.
-    if requirement == "NEEDS_ROOM_ONLY":
-        chosen_room = random.choice(viable_rooms)
-        _add_assignment(
-            base[idx], chosen_room.id, None, room_counts, instructor_counts
-        )
-        return base
-
-    candidates = _best_candidates(
-        idx,
-        base,
-        sections,
-        option_cache,
-        room_counts,
-        instructor_counts,
-        static_memo,
-        EJECTION_PAIR_SAMPLES,
-        top_k=EJECTION_TOP_K,
-    )
-    if not candidates:
-        return None
-
-    ranked = []
-    for cost, room, timeslot in candidates:
-        blockers = _blocking_indices(
-            base, idx, room.id, timeslot.id
-        )
-        ranked.append(
-            (len(blockers), cost, random.random(), room, timeslot, blockers)
-        )
-
-    ranked.sort(key=lambda value: (value[0], value[1], value[2]))
-
-    for blocker_count, _, _, room, timeslot, blockers in ranked:
-        # Best case: the placement is already conflict-free.
-        if blocker_count == 0:
-            result = clone_schedule(base)
-            result_room_counts, result_instructor_counts = _build_occupancy(result)
-            _add_assignment(
-                result[idx],
-                room.id,
-                timeslot.id,
-                result_room_counts,
-                result_instructor_counts,
-            )
-            return result
-
-        if depth <= 0 or blocker_count > EJECTION_MAX_BLOCKERS:
-            continue
-
-        # Never eject a section that is already part of this repair chain.
-        if any(blocker in visited for blocker in blockers):
-            continue
-
-        trial = clone_schedule(base)
-        trial_room_counts, trial_instructor_counts = _build_occupancy(trial)
-
-        # Temporarily remove the blockers and reserve the desired placement.
-        for blocker in blockers:
-            _remove_assignment(
-                trial[blocker], trial_room_counts, trial_instructor_counts
-            )
-
-        _add_assignment(
-            trial[idx],
-            room.id,
-            timeslot.id,
-            trial_room_counts,
-            trial_instructor_counts,
-        )
-
-        repaired = trial
-        chain_ok = True
-        next_visited = set(visited)
-        next_visited.add(idx)
-
-        # Move the most constrained blocker first.
-        blockers = sorted(
-            blockers,
-            key=lambda blocker_idx: _domain_size(blocker_idx, option_cache),
-        )
-
-        for blocker in blockers:
-            repaired = _try_ejection_chain(
-                repaired,
-                blocker,
-                sections,
-                option_cache,
-                static_memo,
-                depth - 1,
-                next_visited,
-            )
-            if repaired is None:
-                chain_ok = False
+            if improved == 0:
                 break
-            next_visited.add(blocker)
 
-        if chain_ok:
-            return repaired
+        # Try room swaps between classes at the same timeslot.
+        # Times do not change, so instructor conflicts cannot be introduced.
+        for _ in range(TS_SWAP_PASSES):
+            by_time = defaultdict(list)
+            weighted = []
 
-    return None
+            for i, item in enumerate(current):
+                if requirements[i] != NEEDS_ROOM_AND_TIME:
+                    continue
+                if item.room_id is None or item.timeslot_id is None:
+                    continue
 
+                room = room_by_id.get(item.room_id)
+                if room is None:
+                    continue
 
-def _ejection_chain_repair(
-    schedule,
-    sections,
-    option_cache,
-    static_memo,
-):
-    """Repair unscheduled sections using short recursive relocation chains."""
-    best = clone_schedule(schedule)
-    best_cost = _objective(best)
+                cost = room_soft_penalty(sections[i], room)
+                by_time[item.timeslot_id].append(i)
+                if cost > 0:
+                    weighted.append((cost, i))
 
-    for _ in range(EJECTION_REPAIR_ROUNDS):
-        unscheduled = [
-            idx
-            for idx, item in enumerate(best)
-            if not _is_scheduled(item)
-            and _requirement(idx, option_cache) != "NEEDS_NOTHING"
-        ]
-        if not unscheduled:
-            break
+            weighted.sort(reverse=True)
+            changed = 0
 
-        # Hardest sections first gives flexible sections fewer chances to take
-        # the scarce placements needed by constrained sections.
-        unscheduled.sort(
-            key=lambda idx: (
-                _domain_size(idx, option_cache),
-                -getattr(sections[idx], "capacity", 0),
-            )
+            for _, i in weighted[:TS_SWAP_ITEMS]:
+                item_i = current[i]
+                room_i = room_by_id.get(item_i.room_id)
+                partners = by_time.get(item_i.timeslot_id, [])
+
+                if room_i is None or len(partners) < 2:
+                    continue
+
+                old_i = room_soft_penalty(sections[i], room_i)
+                partners = list(partners)
+                if len(partners) > TS_SWAP_PARTNERS:
+                    partners = random.sample(partners, TS_SWAP_PARTNERS)
+
+                best_swap = None
+
+                for j in partners:
+                    if i == j:
+                        continue
+
+                    item_j = current[j]
+                    if item_j.room_id is None or item_j.room_id == item_i.room_id:
+                        continue
+
+                    room_j = room_by_id.get(item_j.room_id)
+                    if room_j is None:
+                        continue
+
+                    old_j = room_soft_penalty(sections[j], room_j)
+                    new_i = room_soft_penalty(sections[i], room_j)
+                    new_j = room_soft_penalty(sections[j], room_i)
+                    gain = (old_i + old_j) - (new_i + new_j)
+
+                    if gain > 0:
+                        value = (-gain, random.random(), j)
+                        if best_swap is None or value < best_swap:
+                            best_swap = value
+
+                if best_swap is not None:
+                    j = best_swap[2]
+                    current[i].room_id, current[j].room_id = (
+                        current[j].room_id,
+                        current[i].room_id,
+                    )
+                    changed += 1
+                    swap_moves += 1
+
+            if changed == 0:
+                break
+
+        # Safety check: keep the soft-improved result only if it is still feasible.
+        if count_hard_conflicts(current) == 0:
+            best = current
+
+        print(
+            f"[TS] soft_moves={soft_moves} room_swaps={swap_moves}"
         )
 
-        improved_this_round = False
-
-        for idx in unscheduled:
-            candidate = _try_ejection_chain(
-                best,
-                idx,
-                sections,
-                option_cache,
-                static_memo,
-                EJECTION_MAX_DEPTH,
-                set(),
-            )
-            if candidate is None:
-                continue
-
-            candidate_cost = _objective(candidate)
-            if candidate_cost < best_cost:
-                best = candidate
-                best_cost = candidate_cost
-                improved_this_round = True
-
-        if not improved_this_round:
-            break
-
+    final_score = simple_score(best)
+    print(
+        f"[TS] accepted={accepted} "
+        f"best_unscheduled={final_score[0]} best_hard={final_score[1]}"
+    )
     return best
 
 
 # ============================================================
-# SOFT-CONSTRAINT POLISH
+# MAIN GA + TS FUNCTIONS
 # ============================================================
-def _soft_polish(
-    schedule,
-    sections,
-    rooms,
-    timeslots,
-    cache,
-    option_cache,
-    static_memo,
-):
-    best = clone_schedule(schedule)
-    hard_cost = _objective(best)
-    best_fitness = calculate_fitness(
+
+def hybrid_schedule(sections, timeslots, rooms, cache=None):
+    """Run GA first, then let Tabu Search repair and improve the schedule."""
+    if cache is None:
+        cache = build_timeslot_guideline_cache(sections, timeslots)
+
+    requirements, candidates = build_cache(sections, rooms, timeslots)
+
+    # 1) Genetic Algorithm
+    best = genetic_schedule(
+        sections,
+        timeslots,
+        rooms,
+        requirements,
+        candidates,
+        cache,
+    )
+
+    print(
+        f"After GA: unscheduled="
+        f"{sum(not is_scheduled(item, requirements[i]) for i, item in enumerate(best))}, "
+        f"hard={count_hard_conflicts(best)}"
+    )
+
+    # 2) Tabu Search does BOTH repair and soft improvement.
+    best = tabu_search(
         best,
+        sections,
+        rooms,
+        timeslots,
+        requirements,
+        candidates,
+    )
+
+    print(
+        f"After GA+TS: unscheduled="
+        f"{sum(not is_scheduled(item, requirements[i]) for i, item in enumerate(best))}, "
+        f"hard={count_hard_conflicts(best)}"
+    )
+
+    return best
+
+
+def genetic_runs(sections, timeslots, rooms, num_runs=1):
+    try:
+        run_count = max(1, int(num_runs or 1))
+    except (TypeError, ValueError):
+        run_count = 1
+
+    cache = build_timeslot_guideline_cache(sections, timeslots)
+    requirements = [classify_section(section) for section in sections]
+
+    best_schedule = None
+    best_key = None
+    runtimes = []
+
+    for run in range(run_count):
+        print(f"\n[GA+TS] Run {run + 1}/{run_count}")
+        start = time.perf_counter()
+
+        schedule = hybrid_schedule(sections, timeslots, rooms, cache)
+        runtime = time.perf_counter() - start
+        runtimes.append(runtime)
+
+        unscheduled = sum(
+            not is_scheduled(item, requirements[i])
+            for i, item in enumerate(schedule)
+        )
+        hard = count_hard_conflicts(schedule)
+        soft = (
+            total_soft_penalty(schedule, rooms)
+            + total_time_penalty(schedule, timeslots)
+            + count_timeslot_guideline_conflicts(
+                schedule,
+                sections,
+                timeslots,
+                valid_timeslot_cache=cache,
+            )
+        )
+        fitness = calculate_fitness(
+            schedule,
+            rooms,
+            sections=sections,
+            timeslots=timeslots,
+            valid_timeslot_cache=cache,
+        )
+
+        key = (unscheduled, hard, soft, -fitness)
+
+        print(
+            f"[GA+TS] run={run + 1} runtime={runtime:.2f}s "
+            f"unscheduled={unscheduled} hard={hard} "
+            f"soft={soft:.1f} fitness={fitness:.4f}"
+        )
+
+        if best_key is None or key < best_key:
+            best_key = key
+            best_schedule = copy.deepcopy(schedule)
+
+    if runtimes:
+        print(
+            f"[GA+TS] runtime mean={statistics.mean(runtimes):.2f}s "
+            f"min={min(runtimes):.2f}s max={max(runtimes):.2f}s"
+        )
+
+    # Final result summary
+    scheduled = count_scheduled_sections(best_schedule, sections)
+    soft_counts = soft_violation_counts(best_schedule, rooms, timeslots)
+    fitness = calculate_fitness(
+        best_schedule,
         rooms,
         sections=sections,
         timeslots=timeslots,
         valid_timeslot_cache=cache,
     )
-
-    movable_indices = [
-        idx
-        for idx in range(len(best))
-        if _requirement(idx, option_cache) == "NEEDS_ROOM_AND_TIME"
-    ]
-    if not movable_indices:
-        return best
-
-    for _ in range(SOFT_POLISH_STEPS):
-        idx = random.choice(movable_indices)
-        candidate = clone_schedule(best)
-        room_counts, instructor_counts = _build_occupancy(candidate)
-        _remove_assignment(candidate[idx], room_counts, instructor_counts)
-
-        choices = _best_candidates(
-            idx,
-            candidate,
-            sections,
-            option_cache,
-            room_counts,
-            instructor_counts,
-            static_memo,
-            SOFT_POLISH_PAIR_SAMPLES,
-            top_k=10,
-        )
-        choices = [choice for choice in choices if choice[0] == 0]
-        if not choices:
-            continue
-
-        _, room, timeslot = random.choice(choices)
-        _add_assignment(
-            candidate[idx],
-            room.id,
-            timeslot.id,
-            room_counts,
-            instructor_counts,
-        )
-
-        if _objective_from_counts(candidate, room_counts, instructor_counts) != hard_cost:
-            continue
-
-        candidate_fitness = calculate_fitness(
-            candidate,
-            rooms,
-            sections=sections,
-            timeslots=timeslots,
-            valid_timeslot_cache=cache,
-        )
-        if candidate_fitness > best_fitness:
-            best = candidate
-            best_fitness = candidate_fitness
-
-    return best
-
-
-# ============================================================
-# PUBLIC FUNCTIONS EXPECTED BY THE WEBSITE
-# ============================================================
-def genetic_schedule(sections, timeslots, rooms, cache=None, option_cache=None):
-    """
-    Retains the historical function name used by the project, but runs a
-    classification-aware MRV + LNS + min-conflicts hybrid.
-    """
-    if cache is None:
-        cache = build_timeslot_guideline_cache(sections, timeslots)
-
-    if option_cache is None:
-        option_cache = build_option_cache(sections, rooms, timeslots)
-
-    static_memo = {}
-
-    best = _initial_construction(sections, option_cache, static_memo)
-    best = _direct_rescue_unscheduled(
-        best, sections, option_cache, static_memo
-    )
-    best = _large_neighborhood_search(
-        best, sections, option_cache, static_memo
-    )
-    best = _min_conflicts(
-        best, sections, option_cache, static_memo
-    )
-    best = _direct_rescue_unscheduled(
-        best, sections, option_cache, static_memo
-    )
-    best = _large_neighborhood_search(
-        best, sections, option_cache, static_memo
-    )
-    best = _min_conflicts(
-        best, sections, option_cache, static_memo
-    )
-    best = _ejection_chain_repair(
-        best, sections, option_cache, static_memo
-    )
-    best = _direct_rescue_unscheduled(
-        best, sections, option_cache, static_memo
-    )
-    best = _soft_polish(
-        best,
-        sections,
-        rooms,
-        timeslots,
-        cache,
-        option_cache,
-        static_memo,
-    )
-
-    # Siblings (meeting blocks of one section) belong in one room. The
-    # placement loops have no cross-block state, so unify afterwards; the
-    # pass only ever moves a block into a room that is free at its hour.
-    return finalize_schedule(best, sections, timeslots, cache, rooms=rooms)
-
-
-def genetic_runs(sections, timeslots, rooms, num_runs=1):
-    """
-    Wrapper required by engine.py. Runs the hybrid one or more times and
-    returns the best schedule. No other project file needs to change.
-    """
-    run_count = max(1, int(num_runs or 1))
-    cache = build_timeslot_guideline_cache(sections, timeslots)
-    option_cache = build_option_cache(sections, rooms, timeslots)
-
-    best_schedule = None
-    best_key = None
-
-    for _ in range(run_count):
-        candidate = genetic_schedule(
+    soft = (
+        total_soft_penalty(best_schedule, rooms)
+        + total_time_penalty(best_schedule, timeslots)
+        + count_timeslot_guideline_conflicts(
+            best_schedule,
             sections,
             timeslots,
-            rooms,
-            cache=cache,
-            option_cache=option_cache,
-        )
-
-        candidate_objective = _objective(candidate)
-        candidate_fitness = calculate_fitness(
-            candidate,
-            rooms,
-            sections=sections,
-            timeslots=timeslots,
             valid_timeslot_cache=cache,
         )
+    )
 
-        # Hard feasibility first; fitness breaks ties.
-        candidate_key = (candidate_objective, -candidate_fitness)
-        if best_key is None or candidate_key < best_key:
-            best_key = candidate_key
-            best_schedule = clone_schedule(candidate)
+    print("\n========== GA + TABU RESULT ==========")
+    print(f"Scheduled: {scheduled}/{len(sections)}")
+    print(f"Unscheduled: {best_key[0]}")
+    print(f"Hard conflicts: {count_hard_conflicts(best_schedule)}")
+    print(f"  Room: {count_room_conflicts(best_schedule)}")
+    print(f"  Instructor: {count_instructor_conflicts(best_schedule)}")
+    print(f"  Sibling: {count_sibling_conflicts(best_schedule)}")
+    print(f"Soft weighted total: {soft:.2f}")
+    print(f"Soft violation counts: {soft_counts}")
+    print(f"Timeslot guideline violations: {count_timeslot_guideline_conflicts(best_schedule, sections, timeslots, valid_timeslot_cache=cache)}")
+    print(f"Fitness: {fitness:.4f}")
+    print("=============================================\n")
 
     return best_schedule
