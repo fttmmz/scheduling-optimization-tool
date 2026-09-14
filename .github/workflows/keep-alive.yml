@@ -1,12 +1,27 @@
 name: Keep Render service alive
 
+# MANUAL ONLY. The 10-minute cron was removed on 14 September 2026, when this
+# repo went private.
+#
+# Actions is free and unlimited on public repos. A private repo on the Free
+# plan includes 2,000 minutes/month, and every job is billed at a one-minute
+# minimum -- so "*/10 * * * *" is ~4,320 minutes/month and exhausts the
+# allowance in about two weeks. (Nothing is charged: the default spending
+# limit is $0, so Actions simply stops. The pings stop with it, which is the
+# actual problem.)
+#
+# The ping now runs from a free external uptime monitor instead. That is
+# independent of repo visibility and of the Actions quota, and it is more
+# punctual than Actions cron, which is frequently late on shared runners --
+# already marginal against Render's 15-minute idle timeout.
+#
+#   URL to monitor:  https://scheduling-optimization-backend.onrender.com/api/health
+#   Interval:        5 minutes
+#
+# This file is kept as a manual button: run it from the Actions tab to warm
+# the service before a demo. A few manual runs a month cost nothing.
+
 on:
-  schedule:
-    # Render's free tier spins a web service down after 15 minutes with no
-    # incoming requests. Pinging every 10 minutes keeps it warm so users
-    # don't hit a 30-60s cold start, and keeps it awake during long
-    # genetic/hybrid optimization jobs that poll infrequently.
-    - cron: "*/10 * * * *"
   workflow_dispatch: {}
 
 jobs:
