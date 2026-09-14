@@ -6,6 +6,7 @@ __pycache__/
 *.pyc
 venv/
 .venv/
+.venv311/
 .ruff_cache/
 
 # Vercel
@@ -17,8 +18,9 @@ venv/
 .venv311/
 .pytest_cache/
 
-# Local-only working docs (kept on disk, not shared)
+#docs 
 CLAUDE.md
 HANDOVER.md
 CONSTRAINT_INVESTIGATION.md
 CONSTRAINT_MODEL_PROGRESS.md
+pso_timetabling.py
