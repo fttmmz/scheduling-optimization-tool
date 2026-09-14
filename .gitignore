@@ -20,3 +20,6 @@ venv/
 # Local-only working docs (kept on disk, not shared)
 CLAUDE.md
 HANDOVER.md
+CONSTRAINT_INVESTIGATION.md
+CONSTRAINT_MODEL_PROGRESS.md
+pso_timetabling.py
