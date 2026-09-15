@@ -46,6 +46,7 @@ from backend.Optimization.constraints import (
     NEEDS_ROOM_ONLY,
     NEEDS_TIME_ONLY,
     classify_section,
+    finalize_schedule,
     get_valid_timeslots,
     get_viable_rooms,
     instructor_occupancy_ids,
@@ -841,7 +842,13 @@ def hybrid_schedule(sections, timeslots, rooms, cache=None):
         f"hard={count_hard_conflicts(best)}"
     )
 
-    return best
+    # Siblings (the meeting blocks of one section) must not share an hour and
+    # must share a room. Tabu Search prices sibling TIME clashes in its
+    # occupancy index, but nothing here unifies sibling ROOMS -- placement is
+    # per-item with no cross-block state. finalize_schedule repairs both, and
+    # only ever moves a block into a slot/room that is genuinely free, so it
+    # can improve the schedule but never break it.
+    return finalize_schedule(best, sections, timeslots, cache, rooms=rooms)
 
 
 def genetic_runs(sections, timeslots, rooms, num_runs=1):

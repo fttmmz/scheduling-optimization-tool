@@ -95,8 +95,8 @@ def _run(name, sections, timeslots, rooms):
         from backend.Optimization.Algorithims.greedy import greedy_schedule
         return greedy_schedule(sections, timeslots, rooms)
     if name == "hybrid":
-        from backend.Optimization.Algorithims.hybrid import genetic_schedule
-        return genetic_schedule(sections, timeslots, rooms)
+        from backend.Optimization.Algorithims.hybrid import hybrid_schedule
+        return hybrid_schedule(sections, timeslots, rooms)
     if name == "genetic":
         from backend.Optimization.Algorithims.genetic import genetic_schedule
         return genetic_schedule(sections, timeslots, rooms)
