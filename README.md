@@ -1,54 +1,96 @@
 # Scheduling Optimization Tool
 
-## Project Overview
-This project aims to design and develop a web-based optimization tool to support course registration and timetabling in academic institutions. The system applies optimization algorithms to generate feasible, conflict-free schedules while accounting for real-world constraints such as time clashes and capacity limits. The project also intends to expirment with and compare different optimization algorithms for scheduling purposes.
+A web-based optimization tool for academic course registration and timetabling. The system uses optimization algorithms to generate feasible schedules while considering real-world constraints such as time conflicts, room capacity, and course requirements.
 
-This repository contains work for the **Junior Project** phase and is intended for academic purposes.
+The project also explores and compares different optimization algorithms to evaluate their effectiveness for academic scheduling.
+
+This repository contains the development work for both the **Junior Project** and **Senior Project** at the University of Sharjah and is intended for academic purposes.
 
 ---
 
 ## Project Scope
-- Focus on **course registration and timetabling from an administrative perspective**
-- Design and prototype a web-based scheduling tool
-- Research, implement, and compare optimization algorithms
 
-**Out of Scope (Planned for Senior Project):**
-- Student-facing schedule generation
-- Preference-based optimization for individual students
-- Full system integration and deployment
+### Junior Project
+
+The Junior Project focused on course registration and timetable generation from an **administrative perspective**.
+
+Key objectives included:
+
+* Designing and prototyping a web-based scheduling system
+* Researching optimization algorithms for academic timetabling
+* Modeling scheduling constraints and requirements
+* Implementing and evaluating:
+
+  * Greedy-based scheduling
+  * Genetic Algorithm (GA)-based scheduling
+
+### Senior Project
+
+The Senior Project extends the system toward a **student- and instructor-facing scheduling experience**.
+
+Key objectives include:
+
+* Generating personalized student schedules
+* Incorporating student and instructor preferences
+* Supporting preference-based schedule optimization
+* Implementing and comparing up to **10 optimization algorithms**
+* Evaluating algorithm performance across different scheduling scenarios
+* Improving the system's user interface and scheduling workflow
 
 ---
 
-## Project Phases
-**Junior Project**
-
-This phase emphasizes requirements analysis, system design, algorithm research, and prototype development rather than a fully functional application.
-
-**Senior Project**
-to be added
-
----
 ## Features
 
+* Course timetable generation
+* Conflict-aware scheduling
+* Capacity-aware scheduling
+* Interactive web interface
+* Schedule generation and evaluation
+* Comparison of different optimization algorithms
+* Preference-based scheduling
+* Student-oriented schedule generation
 
 ---
 
 ## Tech Stack
-- Frontend: React
-- Backend: Python
-- Version Control: GitHub
-- Database: supabase
-- Deployment: Vercel, Render
-- AI agents: V0, Claude
+
+| Component               | Technology     |
+| ----------------------- | -------------- |
+| Frontend                | React          |
+| Backend                 | Python         |
+| Database                | Supabase       |
+| Version Control         | GitHub         |
+| Deployment              | Vercel, Render |
+| AI-Assisted Development | v0, Claude     |
+
+---
+
+## Project Structure
+
+The repository contains work developed across two academic project phases:
+
+* **Junior Project** — Administrative course registration and timetable optimization
+* **Senior Project** — Student and instructor preferences, personalized scheduling, and algorithm comparison
 
 ---
 
 ## Project Status
-This project is in its **early development stage** and is subject to ongoing refinement as part of an academic course.
+
+**Senior Project — In Development**
+
+The project is currently under active development as part of the Senior Project course at the University of Sharjah. Features, algorithms, and system components are subject to ongoing development and refinement.
 
 ---
 
-## Credits
-Senior Project Team  
-University of Sharjah  
-Supervisor: Dr. Saber Elsayed
+## Academic Information
+
+**Senior Project Team**
+University of Sharjah
+
+**Supervisor:** Dr. Saber Elsayed
+
+---
+
+## Disclaimer
+
+This project is developed for academic and research purposes as part of the University of Sharjah's Junior and Senior Project courses.
