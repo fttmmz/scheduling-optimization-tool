@@ -16,6 +16,7 @@ from backend.Optimization.evaluation import (
     calculate_fitness,
     build_timeslot_guideline_cache,
 )
+from backend.Optimization.benchmark_seeds import seed_all, seed_for_run
 
 
 def _free_timeslot(section, timeslots, occupied_instructors):
@@ -341,17 +342,20 @@ def genetic_schedule(sections, timeslots, rooms, valid_timeslot_cache=None):
                              rooms=rooms)
 
 
-def genetic_runs(sections, timeslots, rooms, num_runs=30):
+def genetic_runs(sections, timeslots, rooms, num_runs=30, seeds=None):
     fitness_scores = []
     best_overall_schedule = None
     best_overall_fitness = -1
-    
+
     print(f"\n=== Genetic Algorithm: {num_runs} runs ===")
     print(f"Total sections: {len(sections)}, rooms: {len(rooms)}, timeslots: {len(timeslots)}")
-    
+
     valid_timeslot_cache = build_timeslot_guideline_cache(sections, timeslots)
 
     for run in range(num_runs):
+        # Shared benchmark seeds: run i uses the same seed for every algorithm.
+        run_seed = seed_all(seed_for_run(run, seeds))
+
         best_schedule = genetic_schedule(
             sections,
             timeslots,
@@ -366,11 +370,12 @@ def genetic_runs(sections, timeslots, rooms, num_runs=30):
             valid_timeslot_cache=valid_timeslot_cache,
         )
         fitness_scores.append(score)
-        
+
         # Count how many sections are actually scheduled
         scheduled = sum(1 for item in best_schedule if item.room_id is not None and item.timeslot_id is not None)
-        
-        
+
+        print(f"Run {run + 1:2d} (seed {run_seed}): Fitness = {score:.4f} | Scheduled = {scheduled}")
+
         if score > best_overall_fitness:
             best_overall_fitness = score
             best_overall_schedule = best_schedule

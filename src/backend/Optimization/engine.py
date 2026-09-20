@@ -15,7 +15,7 @@ ALGORITHM_REGISTRY = {
 
 
 class SchedulingEngine:
-    def __init__(self, algorithm_name: str, num_runs: int = 1):
+    def __init__(self, algorithm_name: str, num_runs: int = 1, seeds=None):
         if algorithm_name not in ALGORITHM_REGISTRY:
             raise ValueError(
                 f"Unknown algorithm '{algorithm_name}'. "
@@ -24,6 +24,9 @@ class SchedulingEngine:
         self.algorithm_name = algorithm_name
         self.algorithm = ALGORITHM_REGISTRY[algorithm_name]
         self.num_runs = num_runs
+        # Benchmarking only. Left None by the API, which does not need reproducible output;
+        # pass benchmark_seeds.SEEDS when producing numbers for the paper (ALGORITHM_GUIDE 9).
+        self.seeds = seeds
 
     def run(self, data: dict) -> list:
         if data is None:
@@ -44,7 +47,10 @@ class SchedulingEngine:
         )
 
         if self.algorithm_name in ("genetic", "hybrid", "grasp", "pso"):
-            result = self.algorithm(sections, timeslots, rooms, num_runs=self.num_runs)
+            kwargs = {"num_runs": self.num_runs}
+            if self.seeds is not None:
+                kwargs["seeds"] = self.seeds
+            result = self.algorithm(sections, timeslots, rooms, **kwargs)
         else:
             result = self.algorithm(sections, timeslots, rooms)
 
