@@ -112,6 +112,7 @@ from backend.Optimization.evaluation import (
     build_timeslot_guideline_cache,
 )
 from backend.Optimization.Algorithims.grasp import scan_candidates
+from backend.Optimization.benchmark_seeds import seed_all, seed_for_run
 
 # ============================================================
 # PSO Parameters
@@ -551,7 +552,7 @@ def pso_schedule(sections, timeslots, rooms, valid_timeslot_cache=None, section_
     ), gbest_score
 
 
-def pso_runs(sections, timeslots, rooms, num_runs=30):
+def pso_runs(sections, timeslots, rooms, num_runs=30, seeds=None):
     fitness_scores = []
     best_overall_schedule = None
     best_overall_fitness = -1
@@ -563,10 +564,17 @@ def pso_runs(sections, timeslots, rooms, num_runs=30):
     section_candidates = build_section_candidates(sections, rooms, timeslots)
 
     for run in range(num_runs):
+        # This module draws from TWO generators: the global `random` (candidate sampling in
+        # scan_candidates) and its own np.random.default_rng (the particles). A local
+        # generator ignores the global seed, so the seed has to be threaded in as well --
+        # seeding only one of the two leaves half the run unreproducible.
+        run_seed = seed_all(seed_for_run(run, seeds))
+
         best_schedule, score = pso_schedule(
             sections, timeslots, rooms,
             valid_timeslot_cache=valid_timeslot_cache,
             section_candidates=section_candidates,
+            seed=run_seed,
         )
 
         fitness_scores.append(score)
@@ -580,7 +588,7 @@ def pso_runs(sections, timeslots, rooms, num_runs=30):
             if item.room_id is not None and item.timeslot_id is not None
         )
 
-        print(f"Run {run + 1:2d}: Fitness = {score:.4f} | Scheduled = {scheduled}")
+        print(f"Run {run + 1:2d} (seed {run_seed}): Fitness = {score:.4f} | Scheduled = {scheduled}")
 
     best_score = max(fitness_scores)
     worst_score = min(fitness_scores)

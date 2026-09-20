@@ -18,6 +18,7 @@ from backend.Optimization.constraints import (
     room_soft_penalty,
     section_needs,
 )
+from backend.Optimization.benchmark_seeds import seed_all, seed_for_run
 from backend.Optimization.evaluation import (
     calculate_fitness,
     total_time_penalty,
@@ -616,7 +617,7 @@ def grasp_schedule(
 # ============================================================
 # Multiple GRASP Runs
 # ============================================================
-def grasp_runs(sections, timeslots, rooms, num_runs=30):
+def grasp_runs(sections, timeslots, rooms, num_runs=30, seeds=None):
 
     fitness_scores = []
     best_overall_schedule = None
@@ -641,6 +642,9 @@ def grasp_runs(sections, timeslots, rooms, num_runs=30):
 
     for run in range(num_runs):
 
+        # Shared benchmark seeds: run i uses the same seed for every algorithm.
+        run_seed = seed_all(seed_for_run(run, seeds))
+
         best_schedule, score = grasp_schedule(  # score already computed
             sections,
             timeslots,
@@ -661,7 +665,7 @@ def grasp_runs(sections, timeslots, rooms, num_runs=30):
         )
 
         print(
-            f"Run {run + 1:2d}: "
+            f"Run {run + 1:2d} (seed {run_seed}): "
             f"Fitness = {score:.4f} | "
             f"Scheduled = {scheduled}"
         )

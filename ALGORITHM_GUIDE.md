@@ -202,12 +202,16 @@ were judged by charged for every one.
 def yourname_schedule(sections, timeslots, rooms, valid_timeslot_cache=None):
     """One run. Returns a list[ScheduleItem]."""
 
-def yourname_runs(sections, timeslots, rooms, num_runs=30):
+def yourname_runs(sections, timeslots, rooms, num_runs=30, seeds=None):
     """N independent restarts. Returns the single best schedule by fitness."""
 ```
 
 The engine calls the `_runs` form as `fn(sections, timeslots, rooms, num_runs=N)`. A deterministic
 algorithm (like `greedy`) may expose only the single-run form.
+
+**`seeds=` is required on the `_runs` form** and is how the shared seed list reaches your
+algorithm — §9. Default it to `None` (meaning "use the shared list") so the API keeps working
+unchanged; all five existing algorithms already accept it.
 
 ### Registration — both places required
 
@@ -385,6 +389,16 @@ build_timeslot_guideline_cache(sections, timeslots) -> dict   # build ONCE, pass
 > the runnable schedule gets the worse number. Never use it as a feasibility test and never put it
 > in a report.
 
+### Seeding — `backend.Optimization.benchmark_seeds`
+
+```python
+SEEDS                              # the shared list, 30 seeds. Do not edit.
+seed_all(seed) -> seed              # seeds random + numpy globals; returns the seed
+seed_for_run(run_index, seeds=None) # seed for run i, from `seeds` or SEEDS
+```
+
+Call `seed_all(seed_for_run(run, seeds))` once at the top of each run in your `_runs`. See §9.
+
 ### Models — `backend.models.models`
 
 `Section`: `.course` (`.id .name .type .dept .level .course_class`), `.no`, `.capacity`,
@@ -410,6 +424,7 @@ from backend.Optimization.constraints import (
 from backend.Optimization.evaluation import (
     calculate_fitness, build_timeslot_guideline_cache,
 )
+from backend.Optimization.benchmark_seeds import seed_all, seed_for_run
 from backend.models.models import ScheduleItem
 
 
@@ -470,13 +485,20 @@ def yourname_schedule(sections, timeslots, rooms, valid_timeslot_cache=None):
                              valid_timeslot_cache, rooms=rooms)
 
 
-def yourname_runs(sections, timeslots, rooms, num_runs=30):
+def yourname_runs(sections, timeslots, rooms, num_runs=30, seeds=None):
     cache = build_timeslot_guideline_cache(sections, timeslots)
     best, best_fit = None, -1.0
-    for _ in range(num_runs):
+    for run in range(num_runs):
+        # The shared benchmark seeds (§9). Once per run, before any randomness
+        # is consumed. If you build your own generator instead of using the
+        # `random` module, thread run_seed into it -- seed_all cannot reach it.
+        run_seed = seed_all(seed_for_run(run, seeds))
+
         sched = yourname_schedule(sections, timeslots, rooms, valid_timeslot_cache=cache)
         fit = calculate_fitness(sched, rooms, sections=sections,
                                 timeslots=timeslots, valid_timeslot_cache=cache)
+        # Per-run line for the benchmark table -- the seed belongs in it.
+        print(f"Run {run + 1:2d} (seed {run_seed}): fitness = {fit:.4f}")
         if fit > best_fit:
             best, best_fit = sched, fit
     return best
@@ -506,6 +528,10 @@ def yourname_runs(sections, timeslots, rooms, num_runs=30):
     penalty so they never look like a perfect fit.
 12. **A synthetic test dataset small enough to read is usually small enough to pass by accident.**
     Three of our guards first passed with the bug reintroduced. See §8.
+13. **Seeding one generator when your module draws from two.** `seed_all()` reaches the `random`
+    module and numpy's global state, and nothing else. A `np.random.default_rng(...)` or
+    `random.Random(...)` you built yourself ignores it, so the run half-repeats and the benchmark
+    is not reproducible. PSO draws from both — see how `pso_runs` handles it, and §9.
 
 ---
 
@@ -548,14 +574,67 @@ without telling the team, because a deviation invalidates the comparison for eve
 
 - **30 independent runs** per algorithm on the full dataset. Greedy is deterministic; one run is its
   whole distribution.
+- **Everyone uses the shared seed list** — see below. This is not optional.
 - **Report per run:** fitness, hard conflicts, unscheduled, room soft penalty, time penalty,
   wall-clock, and the seed.
 - **Report across runs:** mean ± sample standard deviation, and the median for time.
-- **Seeds recorded and reproducible.**
 - **Identical stopping criterion** across algorithms — agree wall-clock or evaluation count, not
   "whatever each one happens to do".
 - **A standard deviation of exactly zero is a red flag, not a strength.** It means your search is not
   searching. See §7.1.
+
+### The shared seed list
+
+`src/backend/Optimization/benchmark_seeds.py` holds one list, `SEEDS`, and every algorithm's
+benchmark uses it in the same order. Run 1 of the GA and run 1 of your algorithm use the same seed.
+
+```python
+from backend.Optimization.benchmark_seeds import SEEDS, seed_all, seed_for_run
+
+def yourname_runs(sections, timeslots, rooms, num_runs=30, seeds=None):
+    cache = build_timeslot_guideline_cache(sections, timeslots)
+    best, best_fit = None, -1.0
+
+    for run in range(num_runs):
+        # ONCE per run, before any randomness is consumed.
+        run_seed = seed_all(seed_for_run(run, seeds))
+
+        sched = yourname_schedule(sections, timeslots, rooms, valid_timeslot_cache=cache)
+        fit = calculate_fitness(sched, rooms, sections=sections,
+                                timeslots=timeslots, valid_timeslot_cache=cache)
+        print(f"Run {run + 1:2d} (seed {run_seed}): fitness = {fit:.4f}")
+        ...
+```
+
+**`seed_all()` covers the global generators only** — `random` and `numpy.random`. If your module
+builds its own generator (`np.random.default_rng(...)`, `random.Random(...)`), that generator does
+not see the global seed and you must thread the value in yourself. `pso.py` is the worked example:
+it draws from *both*, so `pso_runs` calls `seed_all(...)` **and** passes `seed=run_seed` down into
+`pso_schedule`. Seeding only one of two generators leaves half the run unreproducible, and the
+symptom — runs that almost repeat — is easy to miss.
+
+**Verify it, don't assume it.** Run your `_runs` twice with the same `seeds=` and compare the
+schedules item by item; they must be identical. Then run it with a different list and confirm the
+output changes. The second half matters as much as the first: a run that is identical under *every*
+seed list is not seeded, it is deterministic, which is §7.1 all over again.
+
+**Do not edit `SEEDS`.** It was fixed before anyone had results, which is the whole point — it
+removes seed choice as something an author can tune in their own favour, after the fact, without
+anyone being able to tell. If you need more than 30 runs, extend the list at the end and say so in
+the methodology.
+
+### What the shared list does and does not prove
+
+Be precise about this in the paper, because it is an easy thing to overclaim and a cheap thing for a
+reviewer to attack.
+
+- It **does** give reproducibility — anyone can re-run run 7 and get run 7 — and it removes seed
+  cherry-picking.
+- It **does not** give the algorithms the same random draws. A GA and a PSO consume randomness in
+  different amounts and in a different order, so "seed 7" is not a shared condition. Do **not**
+  claim common-random-numbers variance reduction, and do **not** pair run *i* of A against run *i*
+  of B in a statistical test — the pairing would be arbitrary. For one instance and 30 runs each,
+  compare the distributions with an unpaired rank test (Mann–Whitney U).
 
 ---
 
@@ -611,6 +690,10 @@ Before opening a pull request:
 - [ ] nothing forced into a conflicting placement to avoid leaving it unscheduled
 - [ ] if candidates are sampled: both `room_soft_penalty` and `time_soft_penalty` in the scorer
 - [ ] randomness verified — repeated runs actually differ
+- [ ] `_runs` accepts `seeds=None` and calls `seed_all(seed_for_run(run, seeds))` once per run
+- [ ] every generator seeded, including any `default_rng` / `random.Random` you built yourself
+- [ ] reproducibility verified — same `seeds=` twice gives identical schedules, a different list
+      gives a different one
 - [ ] registered in `ALGORITHM_REGISTRY` and in `SchedulingEngine.run()`'s `num_runs` tuple
 - [ ] added to `ALGORITHMS` and `_run()` in `tests/test_algorithms.py`
 - [ ] full suite passes

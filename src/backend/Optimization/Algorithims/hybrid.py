@@ -55,6 +55,7 @@ from backend.Optimization.constraints import (
     sibling_key,
     time_soft_penalty,
 )
+from backend.Optimization.benchmark_seeds import seed_all, seed_for_run
 from backend.Optimization.evaluation import (
     build_timeslot_guideline_cache,
     calculate_fitness,
@@ -851,7 +852,7 @@ def hybrid_schedule(sections, timeslots, rooms, cache=None):
     return finalize_schedule(best, sections, timeslots, cache, rooms=rooms)
 
 
-def genetic_runs(sections, timeslots, rooms, num_runs=1):
+def genetic_runs(sections, timeslots, rooms, num_runs=1, seeds=None):
     try:
         run_count = max(1, int(num_runs or 1))
     except (TypeError, ValueError):
@@ -865,7 +866,10 @@ def genetic_runs(sections, timeslots, rooms, num_runs=1):
     runtimes = []
 
     for run in range(run_count):
-        print(f"\n[GA+TS] Run {run + 1}/{run_count}")
+        # Shared benchmark seeds: run i uses the same seed for every algorithm.
+        run_seed = seed_all(seed_for_run(run, seeds))
+
+        print(f"\n[GA+TS] Run {run + 1}/{run_count} (seed {run_seed})")
         start = time.perf_counter()
 
         schedule = hybrid_schedule(sections, timeslots, rooms, cache)
@@ -898,7 +902,7 @@ def genetic_runs(sections, timeslots, rooms, num_runs=1):
         key = (unscheduled, hard, soft, -fitness)
 
         print(
-            f"[GA+TS] run={run + 1} runtime={runtime:.2f}s "
+            f"[GA+TS] run={run + 1} seed={run_seed} runtime={runtime:.2f}s "
             f"unscheduled={unscheduled} hard={hard} "
             f"soft={soft:.1f} fitness={fitness:.4f}"
         )
