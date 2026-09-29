@@ -85,7 +85,7 @@ git push -u origin add-simulated-annealing
 Then open a pull request on GitHub and request a review.
 
 **Before you open it:** pull the latest `main` into your branch and run the full suite again. If
-someone else changed a shared file — `constraints.py`, `evaluation.py`, `models.py`, or another
+someone else changed a shared file — the `constraints/` package, `evaluation.py`, `models.py`, or another
 algorithm — your branch can pass alone and still break once merged. That is exactly how the hybrid
 collision above happened.
 
