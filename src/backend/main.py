@@ -216,7 +216,7 @@ def run_optimization(algorithm: str, num_runs: int = 1) -> Dict[str, Any]:
 
     ts_cache = build_timeslot_guideline_cache(sections, timeslots)
 
-    # Reported in TIERS, mirroring constraints.py section 6 and evaluation.py.
+    # Reported in TIERS, mirroring the tier note in constraints/rooms.py and evaluation.py.
     # This used to be one flat dict in which `instructor` and `room` sat as
     # equals beside `campus` and `capacity`, and `conflicts` was the flat
     # flat total -- so the UI presented a double-booking as no

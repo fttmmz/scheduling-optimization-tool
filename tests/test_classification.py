@@ -1,4 +1,4 @@
-"""Pins the section-classification table and its helpers (constraints.py).
+"""Pins the section-classification table and its helpers (constraints/classification.py).
 
 The classification fix (commit 21ba364) is level-aware: the SAME course_type
 needs different things at different levels. That is easy to undo by accident --
