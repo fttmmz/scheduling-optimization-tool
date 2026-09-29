@@ -4,7 +4,7 @@ services:
     runtime: python
     plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: cd src && uvicorn backend.main:app --host 0.0.0.0 --port $PORT
+    startCommand: cp /etc/secrets/institution_data.py src/backend/Optimization/constraints/institution_data.py && cd src && uvicorn backend.main:app --host 0.0.0.0 --port $PORT
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.9
