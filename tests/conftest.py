@@ -2,8 +2,10 @@
 
 Two rules for this suite:
 
-  * Tests are OFFLINE. They read the committed snapshot in fixtures/, never
-    Supabase. Refresh it deliberately with snapshot_refresh.py.
+  * Tests are OFFLINE. They read a LOCAL snapshot in fixtures/, never
+    Supabase. It is real university data, so it is gitignored and never
+    committed; create or refresh it with snapshot_refresh.py. Tests that need
+    it skip when it is absent.
   * Nothing here imports backend.database.db -- that module opens a Supabase
     client at import time, so importing it would make the whole suite require
     network and credentials.

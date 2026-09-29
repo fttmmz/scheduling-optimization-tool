@@ -17,10 +17,7 @@ from backend.Optimization.constraints import (
 )
 
 # ── Scoring tiers ────────────────────────────────────────────────────────────
-# Mirrors the hard/soft split in constraints.py. The old scorer summed all six
-# constraint types into one flat conflict count, so a campus mismatch cost
-# exactly as much as putting two classes in one room -- which both hid real
-# double-bookings and made the manual schedule look far worse than it is.
+
 HARD_CONFLICT_WEIGHT = 3.0    # room/instructor double-booking: never acceptable
 UNSCHEDULED_WEIGHT = 2.0      # a missing class is worse than a compromised one
 SOFT_PENALTY_WEIGHT = 0.5     # bent soft rules: real, but recoverable
