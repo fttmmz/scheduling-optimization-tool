@@ -1,4 +1,4 @@
-"""Supervision vs teaching (constraints.py section 1c).
+"""Supervision vs teaching (constraints/classification.py).
 
 The instructor column mixes two relationships. TEACHING is physical -- one body,
 one room, one hour. SUPERVISION is an attachment between a staff member and a

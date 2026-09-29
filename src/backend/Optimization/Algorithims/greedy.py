@@ -10,9 +10,93 @@ from backend.Optimization.constraints import (
     get_section_campus,
     instructor_occupancy_ids,
     finalize_schedule,
-    _build_room_lookup,
-    _viable_rooms
+    DEFAULT_ROOM_CANDIDATES,
+    SOFT_WEIGHT_CAMPUS,
+    SOFT_WEIGHT_DEPARTMENT,
+    SOFT_WEIGHT_ROOM_TYPE,
+    get_building_campus,
 )
+
+
+# Room lookup
+
+def _build_room_lookup(rooms):
+    """
+    Returns (dept_typed, open_typed, all_rooms).
+
+    dept_typed: (room_type, dept_id, campus) → rooms
+    open_typed: (room_type, campus)          → rooms
+    all_rooms:  the full list, used for the soft fallback tail in _viable_rooms.
+
+    Type, department, and campus are static properties, so bucketing them once
+    here means the inner scheduling loop only checks availability (O(1)).
+    """
+    dept_typed = defaultdict(list)
+    open_typed = defaultdict(list)
+
+    for room in rooms:
+        campus = get_building_campus(room.building)
+        if room.dept_id:
+            dept_typed[(room.type, room.dept_id, campus)].append(room)
+        else:
+            open_typed[(room.type, campus)].append(room)
+
+    return dept_typed, open_typed, list(rooms)
+
+
+def _greedy_room_penalty(room, room_type, course_dept, section_campus) -> float:
+    """Soft penalty for greedy's lookup path, which knows only the
+    (type, dept, campus) triple rather than the Section object. Capacity is
+    scored separately by the caller, which knows the section's enrolment."""
+    penalty = 0.0
+    if room_type is not None and room.type != room_type:
+        penalty += SOFT_WEIGHT_ROOM_TYPE
+    if room.dept_id and room.dept_id != course_dept:
+        penalty += SOFT_WEIGHT_DEPARTMENT
+    if get_building_campus(room.building) != section_campus:
+        penalty += SOFT_WEIGHT_CAMPUS
+    return penalty
+
+
+def _viable_rooms(
+    dept_typed,
+    open_typed,
+    room_type,
+    course_dept,
+    section_campus,
+    all_rooms=None,
+    limit=DEFAULT_ROOM_CANDIDATES,
+):
+    """Yield rooms best-fit first for a given (type, dept, campus) triple.
+
+    Tiers 1 and 2 are the exact matches this function used to return, in the
+    same order. Tier 3 is new: the least-bad remaining rooms, ranked. Without
+    it a section whose triple had no exact match simply went unscheduled, which
+    is the greedy-side half of the unscheduled ceiling.
+    """
+    exact_dept = dept_typed.get((room_type, course_dept, section_campus), [])
+    exact_open = open_typed.get((room_type, section_campus), [])
+
+    # 1. dept-assigned rooms matching this course's department
+    yield from exact_dept
+    # 2. open rooms (no dept restriction)
+    yield from exact_open
+
+    if not all_rooms:
+        return
+
+    # 3. soft fallback — everything else, cheapest first, so an imperfect room
+    #    beats no room at all.
+    already = {id(room) for room in exact_dept}
+    already.update(id(room) for room in exact_open)
+
+    rest = [room for room in all_rooms if id(room) not in already]
+    rest.sort(
+        key=lambda room: _greedy_room_penalty(
+            room, room_type, course_dept, section_campus
+        )
+    )
+    yield from rest[:limit] if limit is not None else rest
 
 
 # Conflict graph
