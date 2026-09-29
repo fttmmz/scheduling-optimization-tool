@@ -18,9 +18,17 @@ venv/
 .venv311/
 .pytest_cache/
 
+# learning-to-rank datasets (~60 MB) -- rebuild with ml/build_ranking_dataset.py
+ml/data/
+
+#  local only, never commit. Regenerate with tests/snapshot_refresh.py
+tests/fixtures/
+institution_data.py
+
 #docs 
 CLAUDE.md
 HANDOVER.md
 CONSTRAINT_INVESTIGATION.md
 CONSTRAINT_MODEL_PROGRESS.md
 pso_timetabling.py
+
