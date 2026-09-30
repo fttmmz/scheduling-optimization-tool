@@ -3,12 +3,15 @@ import networkx as nx
 from collections import defaultdict
 
 from backend.models.models import ScheduleItem
+from backend.Optimization.constraints.rooms import PRACTICAL_LECTURE_COURSE_IDS
 from backend.Optimization.constraints import (
     classify_section,
     get_required_room_type,
     get_valid_timeslots,
-    get_section_campus,
     instructor_occupancy_ids,
+    is_room_allowed,
+    seats_needed,
+    section_campus,
     finalize_schedule,
     DEFAULT_ROOM_CANDIDATES,
     SOFT_WEIGHT_CAMPUS,
@@ -44,7 +47,7 @@ def _build_room_lookup(rooms):
     return dept_typed, open_typed, list(rooms)
 
 
-def _greedy_room_penalty(room, room_type, course_dept, section_campus) -> float:
+def _greedy_room_penalty(room, room_type, course_dept, campus) -> float:
     """Soft penalty for greedy's lookup path, which knows only the
     (type, dept, campus) triple rather than the Section object. Capacity is
     scored separately by the caller, which knows the section's enrolment."""
@@ -53,7 +56,7 @@ def _greedy_room_penalty(room, room_type, course_dept, section_campus) -> float:
         penalty += SOFT_WEIGHT_ROOM_TYPE
     if room.dept_id and room.dept_id != course_dept:
         penalty += SOFT_WEIGHT_DEPARTMENT
-    if get_building_campus(room.building) != section_campus:
+    if get_building_campus(room.building) != campus:
         penalty += SOFT_WEIGHT_CAMPUS
     return penalty
 
@@ -63,7 +66,7 @@ def _viable_rooms(
     open_typed,
     room_type,
     course_dept,
-    section_campus,
+    campus,
     all_rooms=None,
     limit=DEFAULT_ROOM_CANDIDATES,
 ):
@@ -74,8 +77,8 @@ def _viable_rooms(
     it a section whose triple had no exact match simply went unscheduled, which
     is the greedy-side half of the unscheduled ceiling.
     """
-    exact_dept = dept_typed.get((room_type, course_dept, section_campus), [])
-    exact_open = open_typed.get((room_type, section_campus), [])
+    exact_dept = dept_typed.get((room_type, course_dept, campus), [])
+    exact_open = open_typed.get((room_type, campus), [])
 
     # 1. dept-assigned rooms matching this course's department
     yield from exact_dept
@@ -93,7 +96,7 @@ def _viable_rooms(
     rest = [room for room in all_rooms if id(room) not in already]
     rest.sort(
         key=lambda room: _greedy_room_penalty(
-            room, room_type, course_dept, section_campus
+            room, room_type, course_dept, campus
         )
     )
     yield from rest[:limit] if limit is not None else rest
@@ -116,7 +119,7 @@ def build_conflict_graph(sections):
             instructor_id=section.instructor_id,
             instructor_ids=section.instructor_ids,
             section_no=section.no,
-            capacity=section.capacity,
+            capacity=seats_needed(section),
             classification=classify_section(section),
         )
 
@@ -139,7 +142,6 @@ def build_conflict_graph(sections):
 def greedy_schedule(sections, timeslots, rooms):
     
     G = build_conflict_graph(sections)
-    dept_typed, open_typed, all_rooms = _build_room_lookup(rooms)
 
     
     occupied_rooms = set() 
@@ -147,17 +149,26 @@ def greedy_schedule(sections, timeslots, rooms):
     assigned_timeslots = {} 
 
     room_list_cache: dict = {}
-    def cached_viable_rooms(room_type, course_dept, section_campus):
-            key = (room_type, course_dept, section_campus)
+    def cached_viable_rooms(section, room_type, course_dept, campus):
+            # Everything the hard room rules read: course type, department,
+            # campus identity, whether a registrar campus code is known, and
+            # whether the course is a practical one allowed into its labs.
+            key = (room_type, section.course.type, course_dept, campus,
+                   getattr(section, "campus", None) is not None,
+                   section.course.id in PRACTICAL_LECTURE_COURSE_IDS)
             if key not in room_list_cache:
+                # Forbidden rooms are removed BEFORE the lookup is built, so no
+                # tier -- not even the soft fallback -- can hand one out.
+                allowed = [room for room in rooms if is_room_allowed(section, room)]
+                dept_typed, open_typed, allowed = _build_room_lookup(allowed)
                 room_list_cache[key] = list(
                     _viable_rooms(
                         dept_typed,
                         open_typed,
                         room_type,
                         course_dept,
-                        section_campus,
-                        all_rooms=all_rooms,
+                        campus,
+                        all_rooms=allowed,
                     )
                 )
             return room_list_cache[key]
@@ -189,8 +200,7 @@ def greedy_schedule(sections, timeslots, rooms):
         course_type = node["course_type"]
         course_dept = node["course_dept"]
         capacity_needed = node["capacity"]
-        section_no = node["section_no"]
-        section_campus = get_section_campus(section_no)
+        campus = section_campus(section)
 
         # The instructor identity that occupies a timeslot: None for supervision
         # and for sections with no instructor. `instructor_id` above stays the
@@ -198,25 +208,7 @@ def greedy_schedule(sections, timeslots, rooms):
         occupying_instructors = instructor_occupancy_ids(section)
 
         def make_item(room_id, timeslot_id):
-            return ScheduleItem(
-                course_id=node["course_id"],
-                course_name=node["course_name"],
-                course_type=course_type,
-                course_dept=course_dept,
-                capacity=capacity_needed,
-                instructor_id=instructor_id,
-                room_id=room_id,
-                timeslot_id=timeslot_id,
-                section=section_no,
-                instructor_ids=section.instructor_ids,
-                pattern_index=section.pattern_index,
-                # Classification is keyed on level -- without it a detached item
-                # re-classifies as an ordinary room+time lecture and the
-                # level-aware fix silently undoes itself. greedy was the one
-                # algorithm still missing this.
-                level=getattr(section.course, "level", None),
-                course_class=getattr(section.course, "course_class", None),
-            )
+            return ScheduleItem.from_section(section, room_id, timeslot_id)
 
         # NEEDS_NOTHING
         if classification == "NEEDS_NOTHING":
@@ -250,7 +242,7 @@ def greedy_schedule(sections, timeslots, rooms):
 
         room_type = get_required_room_type(course_type) or "classroom"
         viable = order_by_capacity(
-            cached_viable_rooms(room_type, course_dept, section_campus),
+            cached_viable_rooms(section, room_type, course_dept, campus),
             capacity_needed,
         )
 

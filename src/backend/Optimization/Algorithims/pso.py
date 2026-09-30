@@ -163,22 +163,10 @@ def decode(position, section_candidates, valid_timeslot_cache):
                 valid_timeslot_cache=valid_timeslot_cache,
             )
 
-        item = ScheduleItem(
-            course_id=section.course.id,
-            course_name=section.course.name,
-            course_type=section.course.type,
-            course_dept=section.course.dept,
-            capacity=section.capacity,
-            instructor_id=section.instructor_id,
+        item = ScheduleItem.from_section(
+            section,
             room_id=room.id if room else None,
             timeslot_id=timeslot.id if timeslot else None,
-            section=str(section.no),
-            instructor_ids=section.instructor_ids,
-            pattern_index=section.pattern_index,
-            # Classification is keyed on level -- without it a detached item
-            # looks like an ordinary room+time lecture.
-            level=getattr(section.course, "level", None),
-            course_class=getattr(section.course, "course_class", None),
         )
         schedule[idx] = item
 

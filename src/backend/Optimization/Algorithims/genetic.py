@@ -8,7 +8,7 @@ from backend.Optimization.constraints import (
     get_viable_rooms_for_schedule_item,
     instructor_occupancy_ids,
     finalize_schedule,
-    needs_for,
+    item_needs,
     section_needs,
 )
 from backend.models.models import ScheduleItem
@@ -120,22 +120,10 @@ def create_population(size, sections, rooms, timeslots):
                 occupied_rooms,
                 needs=needs,
             )
-            item = ScheduleItem(
-                course_id=section.course.id,
-                course_name=section.course.name,
-                course_type=section.course.type,
-                course_dept=section.course.dept,
-                capacity=section.capacity,
-                instructor_id=section.instructor_id,
+            item = ScheduleItem.from_section(
+                section,
                 room_id=room.id if room else None,
                 timeslot_id=timeslot.id if timeslot else None,
-                section=str(section.no),
-                instructor_ids=section.instructor_ids,
-                pattern_index=section.pattern_index,
-                # level drives classification -- without it every item looks
-                # like a plain room+time lecture once detached from its Section.
-                level=getattr(section.course, "level", None),
-                course_class=getattr(section.course, "course_class", None),
             )
 
             schedule.append(item)
@@ -213,10 +201,8 @@ def mutation(schedule, rooms, timeslots, sections=None):
     # Mutating along an axis the section does not use would re-introduce the
     # very assignments classification exists to prevent (a room for a thesis, a
     # timeslot for a supervision placement), so skip those.
-    item_needs = needs_for(
-        selected_item.course_type, getattr(selected_item, "level", None)
-    )
-    if not item_needs.room and not item_needs.time:
+    selected_needs = item_needs(selected_item)
+    if not selected_needs.room and not selected_needs.time:
         return schedule
 
     # check for conflicts before
@@ -234,9 +220,9 @@ def mutation(schedule, rooms, timeslots, sections=None):
     # 50% chance to change room or timeslot -- but only along an axis this
     # section actually uses; if it uses just one, always mutate that one.
     mutate_room = random.random() < 0.5
-    if not item_needs.room:
+    if not selected_needs.room:
         mutate_room = False
-    elif not item_needs.time:
+    elif not selected_needs.time:
         mutate_room = True
 
     if mutate_room:

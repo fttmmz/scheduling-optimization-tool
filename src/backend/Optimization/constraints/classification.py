@@ -4,7 +4,18 @@ supervision, and which meeting blocks are siblings. No room or time logic."""
 from collections import defaultdict
 from typing import NamedTuple
 
+from . import institution_data as _institution
 from .institution_data import COMBINED_COURSE_GROUPS, SUPERVISION_COURSE_IDS
+
+# Registrar CAMP codes of branch campuses in other towns. None of their rooms
+# are in the room table, so their sections are scheduled for a time only.
+# getattr() so an older institution_data.py still imports (rule then off).
+BRANCH_CAMPUS_CODES = getattr(_institution, "BRANCH_CAMPUS_CODES", frozenset())
+
+
+def is_branch_campus(obj) -> bool:
+    """A Section or ScheduleItem taught at a branch campus."""
+    return getattr(obj, "campus", None) in BRANCH_CAMPUS_CODES
 
 
 # COURSE-TYPE / LEVEL CLASSIFICATION
@@ -65,20 +76,33 @@ MINED_NEEDS: dict[tuple, Needs] = {
 DEFAULT_NEEDS = Needs(True, True)
 
 
-def needs_for(course_type, level) -> Needs:
+def needs_for(course_type, level, campus=None) -> Needs:
     """Core classifier: what does a (course_type, level) section need?
 
     Looks up the mined (level, course_type) table; falls back to the safe
     room+time default. This is the single place both the section path
-    (section_needs) and the item path (hybrid._item_requirement) share.
+    (section_needs) and the item path (item_needs) share.
+
+    *campus* is the registrar's CAMP code. A branch-campus section keeps its
+    time but never needs a room: we hold none of that campus's rooms, and
+    placing it in one of ours would put the class in the wrong town.
     """
-    return MINED_NEEDS.get((level, course_type), DEFAULT_NEEDS)
+    needs = MINED_NEEDS.get((level, course_type), DEFAULT_NEEDS)
+    if campus in BRANCH_CAMPUS_CODES and needs.room:
+        needs = Needs(room=False, time=needs.time)
+    return needs
 
 
 def section_needs(section) -> Needs:
     """Canonical classifier for a Section object -> Needs(room, time)."""
     level = getattr(section.course, "level", None)
-    return needs_for(section.course.type, level)
+    return needs_for(section.course.type, level, getattr(section, "campus", None))
+
+
+def item_needs(item) -> Needs:
+    """Same as section_needs(), for a ScheduleItem."""
+    return needs_for(item.course_type, getattr(item, "level", None),
+                     getattr(item, "campus", None))
 
 
 # ── Legacy string-enum compatibility ──────────────────────────────────────────

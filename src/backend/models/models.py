@@ -35,10 +35,33 @@ def instructors_in(rows):
     ))
 
 
-def build_sections(rows):
-    """Raw schedule rows -> one Section per (course, section, meeting pattern)."""
+def section_info_index(rows):
+    """section_info rows -> {(course_id, section): {"campus", "enrolment"}}.
+
+    Keyed exactly as group_rows_by_pattern() keys schedule rows, so the two
+    join without any normalisation. Lives here, not in loader.py, so tests can
+    build it offline from a fixture.
+    """
+    return {
+        (row["course_id"], row["section"]): {
+            "campus": row.get("campus"),
+            "enrolment": row.get("enrolment"),
+        }
+        for row in rows
+    }
+
+
+def build_sections(rows, section_info=None):
+    """Raw schedule rows -> one Section per (course, section, meeting pattern).
+
+    *section_info* maps (course_id, section) to the registrar's section-level
+    facts (the section_info table: campus code, enrolment). Optional, so a
+    database without that table still loads -- the rules then fall back to the
+    section-number campus and the planned capacity.
+    """
+    section_info = section_info or {}
     sections = []
-    for patterns in group_rows_by_pattern(rows).values():
+    for key, patterns in group_rows_by_pattern(rows).items():
         pattern_count = len(patterns)
         for pattern_index, pattern_rows in enumerate(patterns.values()):
             sections.append(Section(
@@ -46,6 +69,7 @@ def build_sections(rows):
                 instructor_ids=instructors_in(pattern_rows),
                 pattern_index=pattern_index,
                 pattern_count=pattern_count,
+                info=section_info.get(key),
             ))
     return sections
 
@@ -100,7 +124,8 @@ class Section:
                         meetings.
     """
 
-    def __init__(self, data, instructor_ids=None, pattern_index=0, pattern_count=1):
+    def __init__(self, data, instructor_ids=None, pattern_index=0, pattern_count=1,
+                 info=None):
         self.course = Course(
             id=data["courses"]["course_id"],
             name=data["courses"]["name"],
@@ -111,6 +136,14 @@ class Section:
         )
         self.no = data["section"]
         self.capacity = data["sec_capacity"]
+
+        # Registrar facts from section_info, None when unknown. `campus` is the
+        # raw CAMP code (MAM, MAW, UOS, MDM, ...); `enrolment` is ENROL, the
+        # students actually registered -- which exceeds `capacity` (the
+        # planned maximum) on 691 sections.
+        info = info or {}
+        self.campus = info.get("campus")
+        self.enrolment = info.get("enrolment")
 
         # Callers that still build a Section from one raw row (tests, older
         # code) get the single-instructor behaviour for free.
@@ -166,6 +199,8 @@ class ScheduleItem:
         course_class=None,
         instructor_ids=None,
         pattern_index=0,
+        campus=None,
+        enrolment=None,
     ):
         self.course_id = course_id
         self.course_name = course_name
@@ -188,6 +223,38 @@ class ScheduleItem:
         # existing ScheduleItem(...) call sites in the algorithms still work.
         self.level = level
         self.course_class = course_class
+        # Registrar facts, as on Section. The hard room rules read them, so an
+        # item that loses them is judged by the fallback rules instead.
+        self.campus = campus
+        self.enrolment = enrolment
+
+    @classmethod
+    def from_section(cls, section, room_id=None, timeslot_id=None):
+        """The one way an algorithm turns a Section into a ScheduleItem.
+
+        Every field the constraint rules read is copied here, in one place.
+        Five algorithms used to spell this constructor out by hand, and a field
+        added to one copy but not the others (`level`, three separate times)
+        silently changed how the item was classified.
+        """
+        course = section.course
+        return cls(
+            course_id=course.id,
+            course_name=course.name,
+            course_type=course.type,
+            course_dept=course.dept,
+            capacity=section.capacity,
+            instructor_id=section.instructor_id,
+            room_id=room_id,
+            timeslot_id=timeslot_id,
+            section=str(section.no),
+            level=getattr(course, "level", None),
+            course_class=getattr(course, "course_class", None),
+            instructor_ids=getattr(section, "instructor_ids", ()),
+            pattern_index=getattr(section, "pattern_index", 0),
+            campus=getattr(section, "campus", None),
+            enrolment=getattr(section, "enrolment", None),
+        )
 
     @property
     def sibling_key(self):

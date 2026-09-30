@@ -29,7 +29,10 @@ PAGE = 1000
 DETAIL_COLS = ("course_id", "section", "room_id", "timeslot_id",
                "instructor_id", "sec_capacity")
 COURSE_COLS = ("course_id", "name", "course_type", "dept_id", "level", "course_class")
-ROOM_COLS = ("room_id", "capacity", "room_type", "building", "dept_id", "room_num")
+ROOM_COLS = ("room_id", "capacity", "room_type", "building", "dept_id", "room_num",
+             "room_desc")
+SECTION_INFO_COLS = ("course_id", "section", "campus", "enrolment", "capacity",
+                     "type_code", "section_type")
 TIMESLOT_COLS = ("timeslot_id", "day", "start_time", "end_time")
 
 
@@ -69,6 +72,10 @@ def main():
         "schedule_1.json": snapshot,
         "rooms.json": [_pick(r, ROOM_COLS) for r in _page("room", "*")],
         "timeslots.json": [_pick(t, TIMESLOT_COLS) for t in _page("timeslot", "*")],
+        "section_info.json": sorted(
+            (_pick(r, SECTION_INFO_COLS) for r in _page("section_info", "*")),
+            key=lambda r: (r["course_id"], r["section"]),
+        ),
     }
 
     for name, payload in payloads.items():

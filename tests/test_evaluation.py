@@ -16,6 +16,7 @@ from backend.Optimization.evaluation import (
     count_hard_conflicts,
     count_instructor_conflicts,
     count_room_conflicts,
+    count_room_rule_violations,
     soft_violation_counts,
     total_soft_penalty,
 )
@@ -141,19 +142,31 @@ def test_uncombined_courses_sharing_a_room_still_conflict():
 
 # ── The tiers must not collapse into each other ──────────────────────────────
 
-def test_hard_tier_is_only_room_and_instructor():
-    """A wrong-campus, wrong-type, over-capacity placement is NOT hard.
+def test_soft_rules_are_not_hard():
+    """A wrong-campus, wrong-department, over-capacity placement is NOT hard.
 
     It is exactly the case the old flat scorer treated as equivalent to a
     double-booking, which is what produced the unscheduled ceiling.
     """
-    rooms = [room(room_id=7, capacity=10, room_type="lab", building="W3", dept_id=99)]
+    rooms = [room(room_id=7, capacity=10, room_type="classroom", building="W3",
+                  dept_id=99)]
     schedule = [item(course_id=1, section="05", room_id=7, capacity=200,
                      course_type="Lecture Undergraduate", course_dept=1)]
 
-    assert count_hard_conflicts(schedule) == 0
+    assert count_hard_conflicts(schedule, rooms) == 0
     assert sum(soft_violation_counts(schedule, rooms).values()) >= 3
     assert total_soft_penalty(schedule, rooms) > 0
+
+
+def test_lecture_in_a_lab_is_hard():
+    """Since 2026-09-30 a lecture may not be taught in a lab room at all."""
+    rooms = [room(room_id=7, capacity=50, room_type="lab", building="M8", dept_id=1)]
+    schedule = [item(course_id=1, section="61", room_id=7)]
+
+    assert count_room_rule_violations(schedule, rooms) == 1
+    assert count_hard_conflicts(schedule, rooms) == 1
+    # Without rooms the room rules cannot be checked -- callers must pass them.
+    assert count_hard_conflicts(schedule) == 0
 
 
 def test_soft_violations_are_counted_per_rule():
@@ -183,7 +196,7 @@ def test_count_all_violations_flat_flattens_the_tiers_and_is_display_only():
     """
     rooms = [
         room(room_id=7, capacity=50, room_type="classroom", building="M8", dept_id=1),
-        room(room_id=8, capacity=10, room_type="lab", building="W3", dept_id=99),
+        room(room_id=8, capacity=10, room_type="classroom", building="W3", dept_id=99),
     ]
     # One section in a thoroughly wrong room: runnable, just bad.
     imperfect = [item(course_id=1, section="05", room_id=8, capacity=200)]
@@ -197,7 +210,7 @@ def test_count_all_violations_flat_flattens_the_tiers_and_is_display_only():
     assert count_hard_conflicts(impossible) == 1
     assert total_soft_penalty(impossible, rooms) == 0.0
 
-    # ...yet the flat count rates the runnable schedule as four times worse.
+    # ...yet the flat count rates the runnable schedule as three times worse.
     assert count_all_violations_flat(imperfect, rooms) > count_all_violations_flat(impossible, rooms)
 
     # The tiered fitness gets the ordering right, which is the whole point.
@@ -215,7 +228,7 @@ def test_a_double_booking_costs_more_than_an_imperfect_room():
     """The core of the rework: never break a room to satisfy a soft rule."""
     rooms = [
         room(room_id=7, capacity=50, room_type="classroom", building="M8", dept_id=1),
-        room(room_id=8, capacity=10, room_type="lab", building="W3", dept_id=99),
+        room(room_id=8, capacity=10, room_type="classroom", building="W3", dept_id=99),
     ]
     clash = [
         item(course_id=1, section="61", room_id=7, timeslot_id=TS),
@@ -234,7 +247,7 @@ def test_an_unscheduled_section_costs_more_than_an_imperfect_room():
     """A missing class is worse than a compromised one, but better than a clash."""
     rooms = [
         room(room_id=7, capacity=50, room_type="classroom", building="M8", dept_id=1),
-        room(room_id=8, capacity=10, room_type="lab", building="W3", dept_id=99),
+        room(room_id=8, capacity=10, room_type="classroom", building="W3", dept_id=99),
     ]
     placed = [
         item(course_id=1, section="61", room_id=7, timeslot_id=TS),
