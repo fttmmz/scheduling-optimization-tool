@@ -1,4 +1,6 @@
-from backend.models.models import Timeslot, Room, build_sections, group_rows_by_pattern
+from backend.models.models import (
+    Room, Timeslot, build_sections, group_rows_by_pattern, section_info_index,
+)
 from backend.database.db import supabase
 from backend.Optimization.constraints import is_placeholder_timeslot
 
@@ -39,7 +41,33 @@ def load_section_details():
     genuinely meet five times a week into one entity and deletes four meetings.
     """
     rows = _fetch_schedule_rows(1)
-    return build_sections(rows)
+    return build_sections(rows, load_section_info())
+
+
+def load_section_info():
+    """(course_id, section) -> registrar facts {campus, enrolment}.
+
+    From the section_info table (scripts/data_import/section_info_import.py).
+    The campus code drives the medical and branch-campus rules and enrolment
+    the room size, so an empty table silently turns those off -- hence the
+    warning rather than a quiet {}.
+    """
+    rows, offset, page = [], 0, 1000
+    while True:
+        res = (
+            supabase.table("section_info")
+            .select("course_id,section,campus,enrolment")
+            .range(offset, offset + page - 1)
+            .execute()
+        )
+        rows.extend(res.data)
+        if len(res.data) < page:
+            break
+        offset += page
+    if not rows:
+        print("[loader] WARNING: section_info is empty -- campus codes and "
+              "enrolment unknown; medical/branch rules and ENROL sizing are off")
+    return section_info_index(rows)
 
 
 def _fetch_schedule_rows(schedule_id):
@@ -145,8 +173,13 @@ def load_schedule(schedule_id):
 
     from backend.models.models import instructors_in
 
+    # Same registrar facts as the sections get, so a saved (or the manual)
+    # schedule is judged by the same room rules as a freshly generated one.
+    section_info = load_section_info()
+
     schedule_items = []
-    for patterns in group_rows_by_pattern(_fetch_schedule_rows(schedule_id)).values():
+    for key, patterns in group_rows_by_pattern(_fetch_schedule_rows(schedule_id)).items():
+        info = section_info.get(key, {})
         for pattern_index, pattern_rows in enumerate(patterns.values()):
             row = pattern_rows[0]
             course = row["courses"]
@@ -165,6 +198,8 @@ def load_schedule(schedule_id):
                 course_class=course.get("course_class"),
                 instructor_ids=instructor_ids,
                 pattern_index=pattern_index,
+                campus=info.get("campus"),
+                enrolment=info.get("enrolment"),
             ))
 
     return schedule_items

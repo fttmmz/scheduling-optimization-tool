@@ -158,7 +158,7 @@ wrongly:
 
 | tier | weight | what |
 | --- | --- | --- |
-| **HARD** | 3.0 | a room, an instructor, or one section's own two blocks in two places at one hour |
+| **HARD** | 3.0 | a room, an instructor, or one section's own two blocks in two places at one hour; a class in a forbidden room (below) |
 | **UNSCHEDULED** | 2.0 | a section left with no placement |
 | **SOFT** | 0.5 | room type, campus, department, capacity overflow, and the time axis |
 
@@ -180,6 +180,30 @@ unscheduled sections and 0.82 fitness. After the split, every algorithm places e
 
 **The lesson generalises: if your algorithm hits a wall, check whether the constraint model is
 refusing something legal before you blame the search.**
+
+### The hard room rules (2026-09-30)
+
+Three placements are forbidden outright, on the university's instruction. `room_rule_violations(obj,
+room)` names the ones a room breaks; `is_room_allowed(obj, room)` is the yes/no:
+
+- **room_type** — a lab in a classroom, unless its department's labs need no equipment. A lecture
+  in a lab, unless it is a *practical* course (one the registrar teaches in a lab) in a lab its
+  department may use — then the lab is only the soft room-type cost.
+- **lab_department** — a lab in another department's lab (no Physics in a Chemistry lab). Allowed:
+  its own, open labs (no department), labs of a department it shares with, and a few explicit
+  grants (Pharmacy in the medical campus's computer labs).
+- **medical_campus** — a non-medical section in a medical building, or a medical section outside
+  one. Medical *labs* may also use the main-campus lab buildings.
+
+The department ids and campus codes behind these live in `institution_data.py`. The campus rule
+needs the registrar's campus code (`section.campus`, from the `section_info` table) and is off when
+it is unknown.
+
+`get_viable_rooms()` already drops forbidden rooms, so **take rooms only from that list** and you
+cannot break these rules. The one way to break them anyway is a move that hands one section a room
+taken from another section's list — a room swap, a crossover that mixes rooms between items. Check
+`is_room_allowed()` on any such move. `count_hard_conflicts(schedule, rooms)` counts a forbidden
+room as a hard conflict, so a leak shows up in the fitness and fails the test suite.
 
 ### The soft rules live on two axes
 
@@ -268,30 +292,22 @@ If you track occupancy incrementally (build → decrement on move → increment 
 paths must agree**. If they disagree about supervision or multi-instructor classes, the counter
 drifts negative and your conflict delta silently stops meaning anything.
 
-### 4.3 Carry every field into every `ScheduleItem`
+### 4.3 Build every `ScheduleItem` with `from_section()`
 
 ```python
-item = ScheduleItem(
-    course_id=section.course.id,
-    course_name=section.course.name,
-    course_type=section.course.type,
-    course_dept=section.course.dept,
-    capacity=section.capacity,
-    instructor_id=section.instructor_id,     # scalar, for reporting/DB only
+item = ScheduleItem.from_section(
+    section,
     room_id=room.id if room else None,
     timeslot_id=timeslot.id if timeslot else None,
-    section=str(section.no),
-    instructor_ids=section.instructor_ids,   # REQUIRED
-    pattern_index=section.pattern_index,     # REQUIRED
-    level=getattr(section.course, "level", None),          # REQUIRED
-    course_class=getattr(section.course, "course_class", None),  # REQUIRED
 )
 ```
 
-**`level` and `course_class` drive classification.** An item that loses them re-classifies
-downstream as an ordinary room+time lecture, and the whole four-category model silently undoes
-itself. This bug has been introduced **three separate times**. It is pinned by
-`test_greedy_carries_level_into_every_item`.
+Never spell the constructor out by hand. The rules read many fields off an item — `level` and
+`course_class` drive classification, `campus` and `enrolment` drive the room rules and room size —
+and an item that loses one is silently judged by different rules. Dropping `level` alone happened
+**three separate times** when every algorithm had its own copy of the constructor; `from_section()`
+is the one place those fields are copied. Pinned by `test_greedy_carries_level_into_every_item` and
+`test_items_are_judged_like_sections`.
 
 ### 4.4 Pass the shared test suite
 
@@ -308,21 +324,23 @@ Everything you need. You should not have to read the implementation of any of th
 ```python
 section_needs(section) -> Needs        # .room and .time booleans. Ask before placing.
 classify_section(section) -> str       # "NEEDS_ROOM_AND_TIME" | "NEEDS_TIME_ONLY" | ...
-needs_for(course_type, level) -> Needs # same, from a ScheduleItem's fields
+item_needs(item) -> Needs             # same, for a ScheduleItem
 is_supervision(obj) -> bool            # does this person hold a room at this hour (no)
 ```
 
-### Candidates — these **RANK**, they do not filter
+### Candidates — these **RANK**; the room lists also drop forbidden rooms
 
 ```python
-get_viable_rooms(section, rooms, limit=25) -> list        # best-first, nothing dropped
+get_viable_rooms(section, rooms, limit=25) -> list        # allowed rooms, best-first
 get_viable_rooms_for_schedule_item(item, rooms, limit=25) -> list
+is_room_allowed(obj, room) -> bool                        # the hard room rules, see §2
 get_valid_timeslots_for_section(section, timeslots) -> list
 rank_timeslots(obj, timeslots) -> list                    # preferred hours first
 ```
 
 **This is the most misunderstood contract in the codebase.** These return candidates ordered
-best-first with **nothing removed for a soft reason**. Consequences:
+best-first with **nothing removed for a soft reason** (the room lists do remove forbidden rooms, and
+are empty for a section no room allows). Consequences:
 
 - If you **walk** the list and take the first free entry, you get the soft preferences for free.
 - If you **sample** the list and score candidates yourself, you must price the soft rules in your own
@@ -377,7 +395,8 @@ The objective. **Always pass `sections=` and `timeslots=`** — without `section
 unscheduled correctly, and without `timeslots` it cannot price the time axis.
 
 ```python
-count_hard_conflicts(schedule) -> int     # "can this be run?" — the only feasibility test
+count_hard_conflicts(schedule, rooms) -> int  # "can this be run?" — the only feasibility test.
+                                              # Pass rooms, or the room rules go unchecked.
 total_soft_penalty(schedule, rooms) -> float
 total_time_penalty(schedule, timeslots) -> float
 soft_violation_counts(schedule, rooms, timeslots=None) -> dict
@@ -403,7 +422,9 @@ Call `seed_all(seed_for_run(run, seeds))` once at the top of each run in your `_
 
 `Section`: `.course` (`.id .name .type .dept .level .course_class`), `.no`, `.capacity`,
 `.instructor_ids` (tuple), `.instructor_id` (first, reporting only), `.pattern_index`,
-`.pattern_count`, `.sibling_key`, `.id` = `(course_id, section_no, pattern_index)`.
+`.pattern_count`, `.sibling_key`, `.id` = `(course_id, section_no, pattern_index)`,
+`.campus` (registrar code, or None) and `.enrolment` (or None). A room must seat
+`seats_needed(section)` — the larger of `.capacity` and `.enrolment`.
 
 `Room`: `.id .capacity .type .building .dept_id .no`
 `Timeslot`: `.id .day .start .end` — `.start`/`.end` are `"HH:MM:SS"` **strings**, not `time`
@@ -452,26 +473,17 @@ def yourname_schedule(sections, timeslots, rooms, valid_timeslot_cache=None):
 
         # ---- your search goes here. The contract, whatever the method: ----
         #  * only place what section_needs() says is needed
+        #  * take rooms only from viable_rooms (forbidden rooms are already out)
         #  * check passes_hard_constraints() before committing
         #  * if you SAMPLE rather than walk the ranked lists, score candidates
         #    with room_soft_penalty() AND time_soft_penalty()
         #  * if nothing fits, leave room/timeslot as None. Do NOT force a
         #    conflicting placement -- unscheduled (2.0) < hard conflict (3.0).
 
-        schedule.append(ScheduleItem(
-            course_id=section.course.id,
-            course_name=section.course.name,
-            course_type=section.course.type,
-            course_dept=section.course.dept,
-            capacity=section.capacity,
-            instructor_id=section.instructor_id,
+        schedule.append(ScheduleItem.from_section(
+            section,
             room_id=room.id if room else None,
             timeslot_id=timeslot.id if timeslot else None,
-            section=str(section.no),
-            instructor_ids=section.instructor_ids,
-            pattern_index=section.pattern_index,
-            level=getattr(section.course, "level", None),
-            course_class=getattr(section.course, "course_class", None),
         ))
 
         if room is not None and timeslot is not None:

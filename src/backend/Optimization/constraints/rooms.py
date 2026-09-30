@@ -1,8 +1,23 @@
-"""Which rooms suit a section, and how badly each one bends the soft rules.
+"""Which rooms a section may use, and how badly each one bends the soft rules.
 
-Nothing here refuses a room: get_viable_rooms() ranks, it does not filter."""
+get_viable_rooms() drops the rooms a HARD room rule forbids (room_rule_
+violations) and ranks the rest by soft penalty. Nothing is dropped for a soft
+reason."""
 
 import re
+
+from . import institution_data as _institution
+from .classification import BRANCH_CAMPUS_CODES
+
+# Institution facts for the hard room rules. getattr() so an older copy of
+# institution_data.py (the Render secret file) still imports; the rules those
+# facts drive are then simply off.
+CAMPUS_CODE_TO_CAMPUS = getattr(_institution, "CAMPUS_CODE_TO_CAMPUS", {})
+MEDICAL_LAB_BUILDINGS = getattr(_institution, "MEDICAL_LAB_BUILDINGS", frozenset())
+LAB_SHARING_DEPT_GROUPS = getattr(_institution, "LAB_SHARING_DEPT_GROUPS", [])
+LAB_IN_CLASSROOM_DEPTS = getattr(_institution, "LAB_IN_CLASSROOM_DEPTS", frozenset())
+LAB_ROOM_GRANTS = getattr(_institution, "LAB_ROOM_GRANTS", [])
+PRACTICAL_LECTURE_COURSE_IDS = getattr(_institution, "PRACTICAL_LECTURE_COURSE_IDS", frozenset())
 
 
 # CONSTRAINT TIERS
@@ -24,9 +39,36 @@ import re
 #           priced into the objective, but NEVER a reason to leave a section
 #           unscheduled. An unscheduled class is worse than an imperfect room.
 #
-# Consequence for callers: get_viable_rooms() no longer filters, it RANKS. It
-# returns the cheapest rooms first and only drops candidates to bound the list
-# size, never because a soft rule was broken.
+# Consequence for callers: get_viable_rooms() RANKS by soft cost. It returns
+# the cheapest rooms first and never drops a room because a soft rule was
+# broken -- only to bound the list size, or for a hard room rule (below).
+#
+# HARD ROOM RULES (2026-09-30). Three placements are now forbidden outright,
+# on the university's instruction -- they are not preferences it trades off,
+# they are rooms the class cannot be taught in:
+#
+#   room_type       a lab in a classroom, unless its department's labs need no
+#                   equipment (LAB_IN_CLASSROOM_DEPTS). A lecture in a lab,
+#                   unless it is a PRACTICAL course (PRACTICAL_LECTURE_COURSE_
+#                   IDS: the registrar teaches it in a lab) in a lab its
+#                   department may use -- then it is only the soft room_type
+#                   cost, so a classroom is still preferred.
+#   lab_department  a lab in a lab its department may not use (no Physics in a
+#                   Chemistry lab). Allowed: its own, an open lab (no
+#                   department), a lab of its LAB_SHARING_DEPT_GROUPS family,
+#                   and the LAB_ROOM_GRANTS (Pharmacy in the medical campus's
+#                   computer labs).
+#   medical_campus  a non-medical section in a medical building, or a medical
+#                   section outside one. Medical sections may also use the labs
+#                   of MEDICAL_LAB_BUILDINGS, when the room-type rule lets them
+#                   use a lab at all.
+#
+# The registrar's own schedule never puts a non-MDM section in a medical
+# building. It does break the other two: judged by these rules it has 38 labs
+# in classrooms, 21 labs in a lab their department may not use, and 92
+# lectures in labs that are not a practical course's own -- "stricter than
+# manual". A rule only engages when its input is known (no campus code, no
+# medical rule), so a database without section_info behaves as before.
 
 
 # COURSE-TYPE → ROOM-TYPE MAPPING
@@ -53,6 +95,22 @@ def get_required_room_type(course_type: str) -> str | None:
     return COURSE_TYPE_TO_ROOM_TYPE.get(course_type)
 
 
+def seats_needed(obj):
+    """Seats a room must hold for *obj* (Section or ScheduleItem).
+
+    The larger of the planned capacity and the actual enrolment: 691 sections
+    are enrolled beyond their planned maximum, and those students still need a
+    seat. Falls back to capacity when enrolment is unknown.
+    """
+    capacity = obj.capacity
+    enrolment = getattr(obj, "enrolment", None)
+    if enrolment is None:
+        return capacity
+    if capacity is None:
+        return enrolment
+    return max(capacity, enrolment)
+
+
 # CAMPUS HELPERS
 def get_section_campus(section_no) -> str:
     """
@@ -73,6 +131,23 @@ def get_section_campus(section_no) -> str:
     if 30 <= n <= 59:
         return "WOMEN"
     return "MAIN"
+
+
+def section_campus(obj) -> str:
+    """Campus identity of a Section or ScheduleItem.
+
+    From the registrar's CAMP code when it is known, else from the section
+    number. The number rule agrees with CAMP on ~99% of MAM/MAW/UOS sections
+    but cannot see the medical campus at all -- every MDM section is numbered
+    60+ and so looked like MAIN.
+    """
+    code = getattr(obj, "campus", None)
+    if code in CAMPUS_CODE_TO_CAMPUS:
+        return CAMPUS_CODE_TO_CAMPUS[code]
+    if code in BRANCH_CAMPUS_CODES:
+        return "BRANCH"
+    number = obj.no if getattr(obj, "course", None) is not None else obj.section
+    return get_section_campus(number)
 
 
 def get_building_campus(building) -> str:
@@ -151,8 +226,8 @@ DEFAULT_ROOM_CANDIDATES = 25
 
 
 def _soft_profile(obj):
-    """Extract (course_type, dept, capacity, section_no) from either a Section
-    or a ScheduleItem, so one set of soft-penalty rules serves both paths.
+    """Extract (course_type, dept, seats, campus) from either a Section or a
+    ScheduleItem, so one set of room rules serves both paths.
 
     The two used to drift: get_viable_rooms() scored campus and department while
     get_viable_rooms_for_schedule_item() silently ignored both, so a section
@@ -160,8 +235,72 @@ def _soft_profile(obj):
     """
     course = getattr(obj, "course", None)
     if course is not None:                      # Section
-        return course.type, course.dept, obj.capacity, obj.no
-    return obj.course_type, obj.course_dept, obj.capacity, obj.section  # ScheduleItem
+        course_type, dept, course_id = course.type, course.dept, course.id
+    else:                                       # ScheduleItem
+        course_type, dept, course_id = obj.course_type, obj.course_dept, obj.course_id
+    return course_type, dept, seats_needed(obj), section_campus(obj), course_id
+
+
+def _shares_labs(dept, room_dept) -> bool:
+    if dept == room_dept:
+        return True
+    return any(dept in group and room_dept in group for group in LAB_SHARING_DEPT_GROUPS)
+
+
+def _may_use_lab(dept, room) -> bool:
+    """Is lab *room* one department *dept* may teach in?"""
+    if not room.dept_id or _shares_labs(dept, room.dept_id):
+        return True
+    return any(
+        dept in depts and room.dept_id in owners
+        and get_building_campus(room.building) == campus
+        for depts, owners, campus in LAB_ROOM_GRANTS
+    )
+
+
+def room_rule_violations(obj, room, profile=None) -> tuple:
+    """HARD: the room rules *room* breaks for *obj* (Section or ScheduleItem).
+
+    Empty means the room is allowed. See the HARD ROOM RULES note at the top.
+    *profile* is _soft_profile(obj), for callers scoring many rooms for one
+    section -- it depends only on the section, so compute it once.
+    """
+    course_type, dept, _seats, campus, course_id = profile or _soft_profile(obj)
+    required = get_required_room_type(course_type)
+    broken = []
+
+    if required == "classroom" and room.type == "lab" and not (
+        course_id in PRACTICAL_LECTURE_COURSE_IDS and _may_use_lab(dept, room)
+    ):
+        broken.append("room_type")
+    elif (required == "lab" and room.type != "lab"
+          and dept not in LAB_IN_CLASSROOM_DEPTS):
+        broken.append("room_type")
+
+    if required == "lab" and room.type == "lab" and not _may_use_lab(dept, room):
+        broken.append("lab_department")
+
+    # Only when the registrar's campus code is known. Without it the section
+    # number decides the campus, and that never says MEDICAL -- so enforcing
+    # this would lock every section out of the medical buildings.
+    if getattr(obj, "campus", None) is not None:
+        building_campus = get_building_campus(room.building)
+        if building_campus == "MEDICAL" and campus != "MEDICAL":
+            broken.append("medical_campus")
+        elif campus == "MEDICAL" and building_campus != "MEDICAL" and not (
+            str(room.building).upper() in MEDICAL_LAB_BUILDINGS
+            and (required == "lab" or room.type == "lab")
+        ):
+            # A lecture reaching a lab here was already judged by the
+            # room-type rule above: allowed only for a practical course.
+            broken.append("medical_campus")
+
+    return tuple(broken)
+
+
+def is_room_allowed(obj, room, profile=None) -> bool:
+    """HARD: may *obj* be taught in *room* at all?"""
+    return not room_rule_violations(obj, room, profile)
 
 
 def capacity_penalty(needed, available) -> float:
@@ -182,10 +321,11 @@ def capacity_penalty(needed, available) -> float:
     return SOFT_WEIGHT_CAPACITY + SOFT_WEIGHT_CAPACITY_OVERFLOW * overflow_ratio
 
 
-def room_soft_penalty_parts(obj, room) -> dict:
+def room_soft_penalty_parts(obj, room, profile=None) -> dict:
     """Per-rule soft cost of putting *obj* (Section or ScheduleItem) in *room*.
-    Returned split out so the evaluator can report which rule was bent."""
-    course_type, course_dept, capacity, section_no = _soft_profile(obj)
+    Returned split out so the evaluator can report which rule was bent.
+    *profile*: see room_rule_violations()."""
+    course_type, course_dept, seats, campus, _course_id = profile or _soft_profile(obj)
 
     required_type = get_required_room_type(course_type)
     type_cost = (
@@ -203,7 +343,7 @@ def room_soft_penalty_parts(obj, room) -> dict:
 
     campus_cost = (
         SOFT_WEIGHT_CAMPUS
-        if get_section_campus(section_no) != get_building_campus(room.building)
+        if campus != get_building_campus(room.building)
         else 0.0
     )
 
@@ -211,13 +351,13 @@ def room_soft_penalty_parts(obj, room) -> dict:
         "room_type": type_cost,
         "department": dept_cost,
         "campus": campus_cost,
-        "capacity": capacity_penalty(capacity, room.capacity),
+        "capacity": capacity_penalty(seats, room.capacity),
     }
 
 
-def room_soft_penalty(obj, room) -> float:
+def room_soft_penalty(obj, room, profile=None) -> float:
     """Total soft cost of this room for this section/item. 0.0 == perfect fit."""
-    return sum(room_soft_penalty_parts(obj, room).values())
+    return sum(room_soft_penalty_parts(obj, room, profile).values())
 
 
 # ── SOFT predicates ───────────────────────────────────────────────────────────
@@ -257,14 +397,13 @@ def is_capacity_ok(section, room) -> bool:
     enrolment, and the manual schedule overflows the room 11% of the time), so
     the graded capacity_penalty() is the better signal — this stays for counting.
     """
-    return room.capacity >= section.capacity
+    return room.capacity >= seats_needed(section)
 
 
 def is_campus_match(section, room) -> bool:
-    """SOFT: does the room's campus match the one implied by the section number?"""
-    section_campus = get_section_campus(section.no)
-    building_campus = get_building_campus(room.building)
-    return section_campus == building_campus
+    """SOFT: does the room's campus match the section's (CAMP code if known,
+    else section number)?"""
+    return section_campus(section) == get_building_campus(room.building)
 
 
 def rank_rooms(obj, rooms, limit=DEFAULT_ROOM_CANDIDATES):
@@ -290,7 +429,12 @@ def rank_rooms(obj, rooms, limit=DEFAULT_ROOM_CANDIDATES):
     if not rooms:
         return []
 
-    scored = [(room_soft_penalty(obj, room), room) for room in rooms]
+    # The hard room rules FILTER; everything after this only ranks. A section
+    # that no room allows gets an empty list and goes unscheduled -- see
+    # sections_without_allowed_room() -- rather than a forbidden room.
+    profile = _soft_profile(obj)
+    scored = [(room_soft_penalty(obj, room, profile), room)
+              for room in rooms if is_room_allowed(obj, room, profile)]
     scored.sort(key=lambda pair: pair[0])  # stable: ties keep input order
 
     if limit is None:
@@ -302,8 +446,21 @@ def rank_rooms(obj, rooms, limit=DEFAULT_ROOM_CANDIDATES):
 
 
 def get_viable_rooms(section, rooms, limit=DEFAULT_ROOM_CANDIDATES):
-    """Rooms for a Section, best-fit first. Never empty unless *rooms* is."""
+    """Allowed rooms for a Section, best-fit first. Empty only when no room
+    passes the hard room rules."""
     return rank_rooms(section, rooms, limit=limit)
+
+
+def sections_without_allowed_room(sections, rooms, needs_room):
+    """Sections that need a room but that no room in *rooms* allows.
+
+    These cannot be scheduled by any algorithm -- a data or policy problem,
+    not a search one. *needs_room(section)* says whether a section needs one.
+    """
+    return [
+        section for section in sections
+        if needs_room(section) and not any(is_room_allowed(section, r) for r in rooms)
+    ]
 
 
 def get_viable_rooms_for_schedule_item(item, rooms, limit=DEFAULT_ROOM_CANDIDATES):

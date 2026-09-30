@@ -4,14 +4,16 @@ from collections import Counter, defaultdict
 from backend.Optimization.constraints import (
     classify_section,
     get_required_room_type,
-    get_section_campus,
     get_building_campus,
     get_valid_timeslots_for_section,
     group_siblings,
     instructor_occupancy_ids,
     occupancy_key,
+    room_rule_violations,
     room_soft_penalty,
     room_soft_penalty_parts,
+    seats_needed,
+    section_campus,
     time_soft_penalty,
     time_soft_penalty_parts,
 )
@@ -133,7 +135,7 @@ def count_campus_conflicts(schedule: list, rooms: list) -> int:
         room = room_map.get(item.room_id)
         if not room:
             continue
-        if get_section_campus(item.section) != get_building_campus(room.building):
+        if section_campus(item) != get_building_campus(room.building):
             conflicts += 1
     return conflicts
 
@@ -170,23 +172,57 @@ def count_capacity_conflicts(schedule: list, rooms: list) -> int:
         room = room_map.get(item.room_id)
         if not room:
             continue
-        if item.capacity > room.capacity:
+        if seats_needed(item) > room.capacity:
             conflicts += 1
     return conflicts
 
 
-def count_hard_conflicts(schedule: list) -> int:
-    """HARD tier: physically impossible placements only. A usable schedule has 0.
+def room_rule_violation_counts(schedule: list, rooms: list) -> dict:
+    """HARD, per rule: placements in a room the hard room rules forbid.
 
-    This is the number that decides whether a schedule can actually be run, and
-    the one the manual schedule scores ~0 on -- which is the whole point of
-    separating it from the soft counts below.
+    A placement breaking two rules (a lecture in a medical lab) counts once
+    under each, so the values can sum to more than count_room_rule_violations.
     """
-    return (
+    room_map = {room.id: room for room in rooms}
+    counts = {"room_type": 0, "lab_department": 0, "medical_campus": 0}
+    for item in schedule:
+        room = room_map.get(item.room_id)
+        if room:
+            for rule in room_rule_violations(item, room):
+                counts[rule] += 1
+    return counts
+
+
+def count_room_rule_violations(schedule: list, rooms: list) -> int:
+    """HARD: placements in a forbidden room, one per placement.
+
+    The algorithms only ever draw rooms from get_viable_rooms(), which already
+    drops these, so a generated schedule should score 0. The manual schedule
+    does not: it was never held to these rules.
+    """
+    room_map = {room.id: room for room in rooms}
+    return sum(
+        1 for item in schedule
+        if item.room_id in room_map and room_rule_violations(item, room_map[item.room_id])
+    )
+
+
+def count_hard_conflicts(schedule: list, rooms: list = None) -> int:
+    """HARD tier: placements that cannot happen. A usable schedule has 0.
+
+    Something in two places at once (room, instructor, a section's own blocks),
+    plus -- when *rooms* is given -- a class in a room the hard room rules
+    forbid. Pass *rooms* whenever you have them; without it the room rules are
+    not checked.
+    """
+    total = (
         count_instructor_conflicts(schedule)
         + count_room_conflicts(schedule)
         + count_sibling_conflicts(schedule)
     )
+    if rooms is not None:
+        total += count_room_rule_violations(schedule, rooms)
+    return total
 
 
 def soft_violation_counts(schedule: list, rooms: list, timeslots: list = None) -> dict:
@@ -414,7 +450,7 @@ def calculate_fitness(
     if total_sections == 0:
         return 0.0
 
-    hard_conflicts = count_hard_conflicts(schedule)
+    hard_conflicts = count_hard_conflicts(schedule, rooms)
     unscheduled    = max(0, total_sections - scheduled_count)
     soft_penalty   = total_soft_penalty(schedule, rooms)
 

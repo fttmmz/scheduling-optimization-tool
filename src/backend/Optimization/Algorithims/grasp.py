@@ -16,6 +16,7 @@ from backend.Optimization.constraints import (
     get_building_campus,
     get_required_room_type,
     room_soft_penalty,
+    seats_needed,
     section_needs,
 )
 from backend.Optimization.benchmark_seeds import seed_all, seed_for_run
@@ -84,7 +85,7 @@ def score_candidate(section, room, timeslot, valid_timeslot_cache=None):
     # Tie-breaker: among rooms that fit, prefer the least wasteful. Ignored
     # when the room is too small, since room_soft_penalty already charged for
     # the overflow.
-    remaining_capacity = room.capacity - section.capacity
+    remaining_capacity = room.capacity - seats_needed(section)
     if remaining_capacity >= 0:
         score += CAPACITY_FIT_BONUS - min(remaining_capacity, CAPACITY_FIT_BONUS)
 
@@ -285,22 +286,10 @@ def construct_grasp_solution(
                 valid_timeslot_cache=valid_timeslot_cache,
             )
 
-        item = ScheduleItem(
-            course_id=section.course.id,
-            course_name=section.course.name,
-            course_type=section.course.type,
-            course_dept=section.course.dept,
-            capacity=section.capacity,
-            instructor_id=section.instructor_id,
+        item = ScheduleItem.from_section(
+            section,
             room_id=room.id if room else None,
             timeslot_id=timeslot.id if timeslot else None,
-            section=str(section.no),
-            instructor_ids=section.instructor_ids,
-            pattern_index=section.pattern_index,
-            # Classification is keyed on level; without it a detached item
-            # looks like an ordinary room+time lecture.
-            level=getattr(section.course, "level", None),
-            course_class=getattr(section.course, "course_class", None),
         )
 
         schedule.append(item)

@@ -49,6 +49,7 @@ from backend.Optimization.constraints import (
     finalize_schedule,
     get_valid_timeslots,
     get_viable_rooms,
+    is_room_allowed,
     instructor_occupancy_ids,
     occupancy_key,
     room_soft_penalty,
@@ -112,21 +113,7 @@ def is_scheduled(item, requirement):
 
 def make_item(section):
     """Create one empty ScheduleItem from a Section."""
-    return ScheduleItem(
-        course_id=section.course.id,
-        course_name=section.course.name,
-        course_type=section.course.type,
-        course_dept=section.course.dept,
-        capacity=section.capacity,
-        instructor_id=section.instructor_id,
-        room_id=None,
-        timeslot_id=None,
-        section=str(section.no),
-        instructor_ids=getattr(section, "instructor_ids", ()),
-        pattern_index=getattr(section, "pattern_index", 0),
-        level=getattr(section.course, "level", None),
-        course_class=getattr(section.course, "course_class", None),
-    )
+    return ScheduleItem.from_section(section)
 
 
 def build_cache(sections, rooms, timeslots):
@@ -760,6 +747,11 @@ def tabu_search(schedule, sections, rooms, timeslots, requirements, candidates):
 
                     room_j = room_by_id.get(item_j.room_id)
                     if room_j is None:
+                        continue
+                    # Each room came from its own section's allowed list, not
+                    # the other's: a lecture must not swap into a lab.
+                    if not (is_room_allowed(sections[i], room_j)
+                            and is_room_allowed(sections[j], room_i)):
                         continue
 
                     old_j = room_soft_penalty(sections[j], room_j)

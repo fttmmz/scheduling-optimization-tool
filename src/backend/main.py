@@ -15,6 +15,7 @@ from backend.Optimization.evaluation import (
     calculate_fitness,
     count_all_violations_flat,
     count_hard_conflicts,
+    count_room_rule_violations,
     count_instructor_conflicts,
     count_room_conflicts,
     count_sibling_conflicts,
@@ -234,13 +235,16 @@ def run_optimization(algorithm: str, num_runs: int = 1) -> Dict[str, Any]:
         "instructor": count_instructor_conflicts(schedule_items),
         "room": count_room_conflicts(schedule_items),
         "sibling": count_sibling_conflicts(schedule_items),
+        # Classes in a forbidden room (lecture in a lab, lab in another
+        # department's lab, wrong side of the medical campus line).
+        "room_rules": count_room_rule_violations(schedule_items, rooms),
     }
     soft_detail = soft_violation_counts(schedule_items, rooms, timeslots)
     soft_detail["timeslot_guidelines"] = count_timeslot_guideline_conflicts(
         schedule_items, sections, timeslots, ts_cache
     )
 
-    hard_total = count_hard_conflicts(schedule_items)
+    hard_total = count_hard_conflicts(schedule_items, rooms)
     room_penalty = total_soft_penalty(schedule_items, rooms)
     time_penalty = total_time_penalty(schedule_items, timeslots)
 
