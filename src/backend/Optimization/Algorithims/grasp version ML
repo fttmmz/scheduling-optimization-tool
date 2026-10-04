@@ -1,8 +1,9 @@
+import os
+import csv
 import random
 import copy
 import statistics
-from collections import Counter
-import csv
+from collections import Counter, defaultdict
 from pathlib import Path
 
 from backend.models.models import ScheduleItem
@@ -68,6 +69,72 @@ CONSTRUCTION_TIMESLOT_SAMPLE = 15
 
 
 # ============================================================
+# XGBoost room scores (offline lookup table)
+#
+# ml/export_room_scores.py scores every (section, room) pair once and writes
+# ml/data/hybrid/room_scores.csv. Here we only READ that file: no xgboost or
+# pandas is needed in the backend.
+#
+# A ranker's score is only meaningful relative to the OTHER rooms of the same
+# section, so each section's scores are rescaled to 0..1 (best room = 1.0).
+# That makes XGB_WEIGHT mean the same thing for every section.
+#
+# Set XGB_WEIGHT = 0 to switch the model off (baseline GRASP). It can also be
+# set from the environment for experiments:  XGB_WEIGHT=5 python your_script.py
+# ============================================================
+XGB_WEIGHT = float(os.environ.get("XGB_WEIGHT", 0.5))
+
+
+def _find_room_scores_path():
+    """Walk up from this file until a folder containing ml/data/hybrid is found,
+    so the path does not depend on where the program is launched from."""
+    for parent in Path(__file__).resolve().parents:
+        candidate = parent / "ml" / "data" / "hybrid" / "room_scores.csv"
+        if candidate.exists():
+            return candidate
+    return Path(__file__).resolve().parents[4] / "ml" / "data" / "hybrid" / "room_scores.csv"
+
+
+ROOM_SCORES_PATH = _find_room_scores_path()
+
+
+def load_room_xgb_scores():
+    """Return {(section_key, room_id): score in 0..1}.
+
+    section_key is "<course id>|<section no>|<pattern index>", exactly the
+    m_section_id column that build_ranking_dataset.py writes.
+    """
+    if not ROOM_SCORES_PATH.exists():
+        print(f"Warning: XGBoost room scores not found: {ROOM_SCORES_PATH}")
+        return {}
+
+    raw = defaultdict(dict)
+    with ROOM_SCORES_PATH.open("r", newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            raw[row["m_section_id"]][str(row["m_room_id"])] = float(row["score"])
+
+    scores = {}
+    for section_key, by_room in raw.items():
+        lo, hi = min(by_room.values()), max(by_room.values())
+        span = hi - lo
+        for room_id, s in by_room.items():
+            scores[(section_key, room_id)] = (s - lo) / span if span > 0 else 0.0
+    return scores
+
+
+ROOM_XGB_SCORES = load_room_xgb_scores()
+
+
+def section_key(section):
+    return f"{section.course.id}|{section.no}|{section.pattern_index}"
+
+
+def room_xgb_bonus(section, room):
+    """0..1 (1 = the room XGBoost likes best for this section); 0 if unknown."""
+    return ROOM_XGB_SCORES.get((section_key(section), str(room.id)), 0.0)
+
+
+# ============================================================
 # Candidate Evaluation
 # Ranks a (room, timeslot) for the RCL. Higher is better; O(1) per candidate.
 #
@@ -76,42 +143,14 @@ CONSTRUCTION_TIMESLOT_SAMPLE = 15
 # about how the soft rules trade off against each other. It now derives the
 # ranking from constraints.room_soft_penalty(), so every part of the system
 # ranks rooms by the same weights and retuning them is a one-line change.
+#
+# NOTE: score_candidate is deliberately left WITHOUT the XGBoost term.
+# ml/build_ranking_dataset.py asserts that score_candidate equals the sum of
+# its room part and time part, and PSO reuses this function; adding the model
+# here would break both. The XGBoost bonus is added in scan_candidates instead.
 # ============================================================
 SOFT_SCORE_SCALE = 50          # penalty units -> score points
 CAPACITY_FIT_BONUS = 50        # prefer a snug room among equally-penalised ones
-
-def load_room_xgb_scores():
-    """
-    Load precomputed XGBoost room scores.
-
-    Key:
-        (section_id, room_id)
-
-    Value:
-        XGBoost score
-    """
-    scores = {}
-
-    path = Path("ml/data/hybrid/room_scores.csv")
-
-    if not path.exists():
-        print(f"Warning: XGBoost room scores not found: {path}")
-        return scores
-
-    with path.open("r", newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-
-        for row in reader:
-            key = (
-                str(row["m_section_id"]),
-                str(row["m_room_id"]),
-            )
-            scores[key] = float(row["score"])
-
-    return scores
-
-
-ROOM_XGB_SCORES = load_room_xgb_scores()
 
 
 def score_candidate(section, room, timeslot, valid_timeslot_cache=None):
@@ -222,6 +261,13 @@ def scan_candidates(
                 section, room, timeslot,
                 valid_timeslot_cache=valid_timeslot_cache,
             )
+
+            # XGBoost: nudges the ranking so that, among candidates the hand
+            # formula rates alike, the room the model prefers is more likely to
+            # land in the RCL. Weight 0 = plain GRASP.
+            if XGB_WEIGHT:
+                score += XGB_WEIGHT * room_xgb_bonus(section, room)
+
             candidates.append((score, room, timeslot))
 
     return candidates
@@ -263,14 +309,9 @@ def choose_grasp_assignment(
     if not candidates:
         return None, None
 
-  candidates.sort(key=lambda x: x[0], reverse=True)
-
-# Keep only the best-scoring candidates
-best_score = candidates[0][0]
-best_candidates = [x for x in candidates if x[0] == best_score]
-
-# Randomly choose among candidates tied for the best score
-selected = random.choice(best_candidates)
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    rcl = candidates[: min(RCL_SIZE, len(candidates))]
+    selected = random.choice(rcl)
 
     return selected[1], selected[2]
 
@@ -657,6 +698,15 @@ def grasp_runs(sections, timeslots, rooms, num_runs=30, seeds=None):
         f"Total sections: {len(sections)}, "
         f"rooms: {len(rooms)}, "
         f"timeslots: {len(timeslots)}"
+    )
+
+    # Sanity check: does the XGBoost lookup table actually match these sections?
+    # If this prints 0 the keys do not line up and the model has no effect.
+    xgb_sections = {k[0] for k in ROOM_XGB_SCORES}
+    xgb_hits = sum(1 for s in sections if section_key(s) in xgb_sections)
+    print(
+        f"XGBoost weight = {XGB_WEIGHT} | scores loaded for "
+        f"{xgb_hits}/{len(sections)} sections"
     )
 
     # Build cache ONCE for all runs
