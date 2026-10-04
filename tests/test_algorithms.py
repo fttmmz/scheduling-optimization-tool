@@ -107,9 +107,13 @@ def _run(name, sections, timeslots, rooms):
         from backend.Optimization.Algorithims.pso import pso_schedule
         return pso_schedule(sections, timeslots, rooms, seed=1)[0]
     raise AssertionError(name)
+    if name == "simulated_annealing":
+    from backend.Optimization.Algorithims.simulated_annealing import simulated_annealing_schedule
+    return simulated_annealing_schedule(sections, timeslots, rooms)
+    raise AssertionError(name)
 
 
-ALGORITHMS = ["greedy", "hybrid", "genetic", "grasp", "pso"]
+ALGORITHMS = ["greedy", "hybrid", "genetic", "grasp", "pso", "simulated_annealing"]
 
 
 @pytest.fixture(scope="module", params=ALGORITHMS)
