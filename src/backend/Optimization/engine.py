@@ -4,6 +4,7 @@ from backend.Optimization.Algorithims.hybrid import genetic_runs as hybrid_runs
 from backend.Optimization.Algorithims.grasp import grasp_runs
 from backend.Optimization.Algorithims.pso import pso_runs
 from backend.Optimization.Algorithims.alns import alns_runs
+from backend.Optimization.Algorithims.simulated_annealing import simulated_annealing_runs
 from backend.Optimization.evaluation import count_scheduled_sections
 
 ALGORITHM_REGISTRY = {
@@ -13,6 +14,7 @@ ALGORITHM_REGISTRY = {
     "grasp": grasp_runs,
     "pso": pso_runs,
     "alns": alns_runs,
+    "simulated_annealing": simulated_annealing_runs,
 }
 
 
@@ -48,7 +50,7 @@ class SchedulingEngine:
             f"{len(timeslots)} timeslots, {len(rooms)} rooms"
         )
 
-        if self.algorithm_name in ("genetic", "hybrid", "grasp", "pso", "alns"):
+        if self.algorithm_name in ("genetic", "hybrid", "grasp", "pso", "alns", "simulated_annealing"):
             kwargs = {"num_runs": self.num_runs}
             if self.seeds is not None:
                 kwargs["seeds"] = self.seeds
