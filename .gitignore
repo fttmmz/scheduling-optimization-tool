@@ -20,6 +20,8 @@ venv/
 
 # learning-to-rank datasets (~60 MB) -- rebuild with ml/build_ranking_dataset.py
 ml/data/
+ml/models/
+
 
 #  local only, never commit. Regenerate with tests/snapshot_refresh.py
 tests/fixtures/
