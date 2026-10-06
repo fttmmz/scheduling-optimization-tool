@@ -135,29 +135,17 @@ def _build_initial_schedule(sections, timeslots, rooms):
     return schedule
 
 
-def _make_neighbor(schedule, rooms, timeslots):
+def _make_neighbor(schedule, rooms, timeslots, movable):
     """Create a nearby schedule by changing one assignment."""
 
-    neighbor = copy.deepcopy(schedule)
+    neighbor = list(schedule)
 
     if not neighbor:
         return neighbor
 
-    movable = []
-
-    for index, item in enumerate(neighbor):
-        needs = needs_for(
-            item.course_type,
-            getattr(item, "level", None),
-        )
-
-        if needs.room or needs.time:
-            movable.append(index)
-
-    if not movable:
-        return neighbor
-
     selected_index = random.choice(movable)
+
+    neighbor[selected_index] = copy.copy(schedule[selected_index])
     selected_item = neighbor[selected_index]
 
     item_needs = needs_for(
@@ -269,6 +257,21 @@ def simulated_annealing_schedule(
         timeslots,
         rooms,
     )
+    
+    movable = [
+    index
+    for index, item in enumerate(current)
+    if (
+        needs_for(
+            item.course_type,
+            getattr(item, "level", None),
+        ).room
+        or needs_for(
+            item.course_type,
+            getattr(item, "level", None),
+        ).time
+    )
+]
 
     current_fitness = calculate_fitness(
         current,
@@ -291,6 +294,7 @@ def simulated_annealing_schedule(
                 current,
                 rooms,
                 timeslots,
+                movable,
             )
 
             neighbor_fitness = calculate_fitness(
