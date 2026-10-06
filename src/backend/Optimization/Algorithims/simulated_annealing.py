@@ -135,7 +135,7 @@ def _build_initial_schedule(sections, timeslots, rooms):
     return schedule
 
 
-def _make_neighbor(schedule, rooms, timeslots, movable):
+def _make_neighbor(schedule, rooms, timeslots, movable, occupied_rooms, occupied_instructors):
     """Create a nearby schedule by changing one assignment."""
 
     neighbor = list(schedule)
@@ -235,7 +235,7 @@ def _make_neighbor(schedule, rooms, timeslots, movable):
                 selected_item.timeslot_id = ts.id
                 break
 
-    return neighbor
+    return neighbor, selected_index
 
 
 def simulated_annealing_schedule(
@@ -257,7 +257,30 @@ def simulated_annealing_schedule(
         timeslots,
         rooms,
     )
-    
+
+    current = _build_initial_schedule(
+    sections,
+    timeslots,
+    rooms,
+)
+
+occupied_rooms = set()
+occupied_instructors = set()
+
+for item in current:
+    if item.room_id is not None and item.timeslot_id is not None:
+        occupied_rooms.add(
+            (item.room_id, item.timeslot_id)
+        )
+
+    if item.timeslot_id is not None:
+        for instructor_id in instructor_occupancy_ids(item):
+            occupied_instructors.add(
+                (instructor_id, item.timeslot_id)
+            )
+
+movable = [
+            
     movable = [
     index
     for index, item in enumerate(current)
@@ -290,11 +313,13 @@ def simulated_annealing_schedule(
 
         for _ in range(ITERATIONS_PER_TEMPERATURE):
 
-            neighbor = _make_neighbor(
+            neighbor, selected_index = _make_neighbor(
                 current,
                 rooms,
                 timeslots,
                 movable,
+                occupied_rooms,
+                occupied_instructors,
             )
 
             neighbor_fitness = calculate_fitness(
