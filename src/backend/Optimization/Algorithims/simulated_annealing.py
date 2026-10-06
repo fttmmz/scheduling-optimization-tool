@@ -8,7 +8,9 @@ Journal of Scheduling, 26, 497-517.
 https://doi.org/10.1007/s10951-022-00747-5
 
 This implementation uses the project's existing constraint and fitness
-functions and applies a standard simulated annealing search.
+functions and applies a simplified standard simulated annealing search
+inspired by the cited work. It does not implement the paper's full
+penalization mechanism.
 """
 
 import copy
@@ -43,7 +45,10 @@ from backend.models.models import ScheduleItem
 INITIAL_TEMPERATURE = 1.0
 MIN_TEMPERATURE = 0.001
 COOLING_RATE = 0.995
-ITERATIONS_PER_TEMPERATURE = 5
+
+# Reduced from 5 to 2 to lower the number of expensive full-fitness
+# evaluations while preserving the same SA cooling process.
+ITERATIONS_PER_TEMPERATURE = 2
 
 
 def _build_initial_schedule(sections, timeslots, rooms):
@@ -58,12 +63,14 @@ def _build_initial_schedule(sections, timeslots, rooms):
 
         viable_rooms = (
             get_viable_rooms(section, rooms)
-            if needs.room else [None]
+            if needs.room
+            else [None]
         )
 
         valid_timeslots = (
             get_valid_timeslots_for_section(section, timeslots)
-            if needs.time else [None]
+            if needs.time
+            else [None]
         )
 
         room = None
@@ -75,7 +82,8 @@ def _build_initial_schedule(sections, timeslots, rooms):
             found = True
 
         else:
-            # Randomise equally valid possibilities so SA runs are not identical.
+            # Randomise possibilities so different seeded runs can explore
+            # different valid starting schedules.
             room_candidates = list(viable_rooms)
             time_candidates = list(valid_timeslots)
 
@@ -124,7 +132,9 @@ def _build_initial_schedule(sections, timeslots, rooms):
         schedule.append(item)
 
         if room is not None and timeslot is not None:
-            occupied_rooms.add((room.id, timeslot.id))
+            occupied_rooms.add(
+                (room.id, timeslot.id)
+            )
 
         if timeslot is not None:
             for instructor_id in instructor_occupancy_ids(section):
@@ -135,34 +145,18 @@ def _build_initial_schedule(sections, timeslots, rooms):
     return schedule
 
 
-def _make_neighbor(schedule, rooms, timeslots, movable, occupied_rooms, occupied_instructors):
-    """Create a nearby schedule by changing one assignment."""
-
-    neighbor = list(schedule)
-
-    if not neighbor:
-        return neighbor
-
-    selected_index = random.choice(movable)
-
-    neighbor[selected_index] = copy.copy(schedule[selected_index])
-    selected_item = neighbor[selected_index]
-
-    item_needs = needs_for(
-        selected_item.course_type,
-        getattr(selected_item, "level", None),
-    )
+def _build_occupancy(schedule):
+    """Build room and instructor occupancy once."""
 
     occupied_rooms = set()
     occupied_instructors = set()
 
-    # Build occupancy without the item that is being moved.
-    for index, item in enumerate(neighbor):
+    for item in schedule:
 
-        if index == selected_index:
-            continue
-
-        if item.room_id is not None and item.timeslot_id is not None:
+        if (
+            item.room_id is not None
+            and item.timeslot_id is not None
+        ):
             occupied_rooms.add(
                 (item.room_id, item.timeslot_id)
             )
@@ -172,6 +166,64 @@ def _make_neighbor(schedule, rooms, timeslots, movable, occupied_rooms, occupied
                 occupied_instructors.add(
                     (instructor_id, item.timeslot_id)
                 )
+
+    return occupied_rooms, occupied_instructors
+
+
+def _make_neighbor(
+    schedule,
+    rooms,
+    timeslots,
+    movable,
+    occupied_rooms,
+    occupied_instructors,
+):
+    """
+    Create a nearby schedule by changing one assignment.
+
+    Only the selected ScheduleItem is copied. The complete schedule and
+    occupancy structures are not rebuilt for every SA move.
+    """
+
+    if not schedule or not movable:
+        return list(schedule), None
+
+    selected_index = random.choice(movable)
+
+    # Copy the list of references, then copy only the item being modified.
+    neighbor = list(schedule)
+    neighbor[selected_index] = copy.copy(
+        schedule[selected_index]
+    )
+
+    old_item = schedule[selected_index]
+    selected_item = neighbor[selected_index]
+
+    item_needs = needs_for(
+        selected_item.course_type,
+        getattr(selected_item, "level", None),
+    )
+
+    # Occupancy belonging to the selected item must not block the item
+    # from moving away from (or remaining in) its current assignment.
+    old_room_key = None
+
+    if (
+        old_item.room_id is not None
+        and old_item.timeslot_id is not None
+    ):
+        old_room_key = (
+            old_item.room_id,
+            old_item.timeslot_id,
+        )
+
+    old_instructor_keys = set()
+
+    if old_item.timeslot_id is not None:
+        for instructor_id in instructor_occupancy_ids(old_item):
+            old_instructor_keys.add(
+                (instructor_id, old_item.timeslot_id)
+            )
 
     # Decide whether to change room or time.
     if item_needs.room and item_needs.time:
@@ -197,11 +249,16 @@ def _make_neighbor(schedule, rooms, timeslots, movable, occupied_rooms, occupied
                     selected_item.room_id = room.id
                     break
 
-                if (
+                candidate_key = (
                     room.id,
                     selected_item.timeslot_id,
-                ) not in occupied_rooms:
+                )
 
+                # The selected item's own old position is allowed.
+                if (
+                    candidate_key not in occupied_rooms
+                    or candidate_key == old_room_key
+                ):
                     selected_item.room_id = room.id
                     break
 
@@ -218,24 +275,77 @@ def _make_neighbor(schedule, rooms, timeslots, movable, occupied_rooms, occupied
         for ts in candidates:
 
             instructor_free = all(
-                (instructor_id, ts.id)
-                not in occupied_instructors
+                (
+                    (instructor_id, ts.id)
+                    not in occupied_instructors
+                )
+                or (
+                    (instructor_id, ts.id)
+                    in old_instructor_keys
+                )
                 for instructor_id in selected_instructors
             )
 
-            room_free = (
-                selected_item.room_id is None
-                or (
+            if selected_item.room_id is None:
+                room_free = True
+
+            else:
+                candidate_room_key = (
                     selected_item.room_id,
                     ts.id,
-                ) not in occupied_rooms
-            )
+                )
+
+                room_free = (
+                    candidate_room_key not in occupied_rooms
+                    or candidate_room_key == old_room_key
+                )
 
             if instructor_free and room_free:
                 selected_item.timeslot_id = ts.id
                 break
 
     return neighbor, selected_index
+
+
+def _update_occupancy_after_accept(
+    old_item,
+    new_item,
+    occupied_rooms,
+    occupied_instructors,
+):
+    """Update occupancy after SA accepts a neighbor."""
+
+    # Remove the old room occupancy.
+    if (
+        old_item.room_id is not None
+        and old_item.timeslot_id is not None
+    ):
+        occupied_rooms.discard(
+            (old_item.room_id, old_item.timeslot_id)
+        )
+
+    # Remove the old instructor occupancy.
+    if old_item.timeslot_id is not None:
+        for instructor_id in instructor_occupancy_ids(old_item):
+            occupied_instructors.discard(
+                (instructor_id, old_item.timeslot_id)
+            )
+
+    # Add the new room occupancy.
+    if (
+        new_item.room_id is not None
+        and new_item.timeslot_id is not None
+    ):
+        occupied_rooms.add(
+            (new_item.room_id, new_item.timeslot_id)
+        )
+
+    # Add the new instructor occupancy.
+    if new_item.timeslot_id is not None:
+        for instructor_id in instructor_occupancy_ids(new_item):
+            occupied_instructors.add(
+                (instructor_id, new_item.timeslot_id)
+            )
 
 
 def simulated_annealing_schedule(
@@ -252,49 +362,30 @@ def simulated_annealing_schedule(
             timeslots,
         )
 
+    # Build the starting schedule once.
     current = _build_initial_schedule(
         sections,
         timeslots,
         rooms,
     )
 
-    current = _build_initial_schedule(
-    sections,
-    timeslots,
-    rooms,
-)
+    # Build occupancy once instead of rebuilding it for every neighbor.
+    occupied_rooms, occupied_instructors = _build_occupancy(
+        current
+    )
 
-occupied_rooms = set()
-occupied_instructors = set()
+    # Work out which items SA is allowed to move once.
+    movable = []
 
-for item in current:
-    if item.room_id is not None and item.timeslot_id is not None:
-        occupied_rooms.add(
-            (item.room_id, item.timeslot_id)
+    for index, item in enumerate(current):
+
+        needs = needs_for(
+            item.course_type,
+            getattr(item, "level", None),
         )
 
-    if item.timeslot_id is not None:
-        for instructor_id in instructor_occupancy_ids(item):
-            occupied_instructors.add(
-                (instructor_id, item.timeslot_id)
-            )
-
-movable = [
-            
-    movable = [
-    index
-    for index, item in enumerate(current)
-    if (
-        needs_for(
-            item.course_type,
-            getattr(item, "level", None),
-        ).room
-        or needs_for(
-            item.course_type,
-            getattr(item, "level", None),
-        ).time
-    )
-]
+        if needs.room or needs.time:
+            movable.append(index)
 
     current_fitness = calculate_fitness(
         current,
@@ -322,6 +413,11 @@ movable = [
                 occupied_instructors,
             )
 
+            # Nothing can be moved.
+            if selected_index is None:
+                temperature = MIN_TEMPERATURE
+                break
+
             neighbor_fitness = calculate_fitness(
                 neighbor,
                 rooms,
@@ -330,9 +426,12 @@ movable = [
                 valid_timeslot_cache=valid_timeslot_cache,
             )
 
-            difference = neighbor_fitness - current_fitness
+            difference = (
+                neighbor_fitness
+                - current_fitness
+            )
 
-            # Always accept an improvement.
+            # Always accept an improvement or equal solution.
             if difference >= 0:
                 accept = True
 
@@ -341,16 +440,32 @@ movable = [
                 probability = math.exp(
                     difference / temperature
                 )
-                accept = random.random() < probability
+
+                accept = (
+                    random.random()
+                    < probability
+                )
 
             if accept:
+
+                old_item = current[selected_index]
+                new_item = neighbor[selected_index]
+
+                # Keep occupancy synchronized with the accepted schedule.
+                _update_occupancy_after_accept(
+                    old_item,
+                    new_item,
+                    occupied_rooms,
+                    occupied_instructors,
+                )
+
                 current = neighbor
                 current_fitness = neighbor_fitness
 
-            # Keep the best solution found during the whole search.
-            if current_fitness > best_fitness:
-                best = copy.deepcopy(current)
-                best_fitness = current_fitness
+                # Keep the best solution found during the whole search.
+                if current_fitness > best_fitness:
+                    best = copy.deepcopy(current)
+                    best_fitness = current_fitness
 
         # Cool the temperature.
         temperature *= COOLING_RATE
