@@ -464,9 +464,7 @@ def calculate_fitness(
             valid_timeslot_cache=valid_timeslot_cache,
         )
 
-    # The evening preference (HANDOVER 4.7). Needs only the timeslot list, so it
-    # applies on the `sections is None` path too -- unlike the guideline check
-    # above, which needs sections to know what shape each one may take.
+    
     if timeslots is not None:
         soft_penalty += total_time_penalty(schedule, timeslots)
 
