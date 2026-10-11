@@ -106,6 +106,19 @@ def _run(name, sections, timeslots, rooms):
     if name == "pso":
         from backend.Optimization.Algorithims.pso import pso_schedule
         return pso_schedule(sections, timeslots, rooms, seed=1)[0]
+    if name == "ml_greedy":
+        from backend.Optimization.Algorithims.ml_greedy import ml_greedy_schedule
+        return ml_greedy_schedule(sections, timeslots, rooms, seed=1)
+    if name == "rl":
+        # The trained Q model where ml/models/rl/ has one, else the static
+        # ranker it falls back to -- "rl-static" pins that fallback path.
+        from backend.Optimization.Algorithims.rl_scheduler import rl_schedule
+        return rl_schedule(sections, timeslots, rooms, seed=1)[0]
+    if name == "rl-static":
+        from backend.Optimization.Algorithims.rl_scheduler import rl_schedule
+        return rl_schedule(sections, timeslots, rooms, seed=1, model="static")[0]
+    raise AssertionError(name)
+
     if name == "simulated_annealing":
         from backend.Optimization.Algorithims.simulated_annealing import simulated_annealing_schedule
         return simulated_annealing_schedule(sections, timeslots, rooms)
@@ -115,7 +128,7 @@ def _run(name, sections, timeslots, rooms):
     raise AssertionError(name)
 
 
-ALGORITHMS = ["greedy", "hybrid", "genetic", "grasp", "pso", "simulated_annealing", "alns"]
+ALGORITHMS = ["greedy", "hybrid", "genetic", "grasp", "pso", "simulated_annealing", "alns","ml_greedy", "rl", "rl-static"]
 
 
 @pytest.fixture(scope="module", params=ALGORITHMS)
