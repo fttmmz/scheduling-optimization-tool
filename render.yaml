@@ -4,10 +4,16 @@ services:
     runtime: python
     plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: cp /etc/secrets/institution_data.py src/backend/Optimization/constraints/institution_data.py && cd src && uvicorn backend.main:app --host 0.0.0.0 --port $PORT
+    startCommand: cp /etc/secrets/institution_data.py src/backend/Optimization/constraints/institution_data.py && mkdir -p /tmp/mldata/hybrid && base64 -d /etc/secrets/room_scores.b64 | gunzip >/tmp/mldata/hybrid/room_scores.csv && cd src && uvicorn backend.main:app --host 0.0.0.0 --port $PORT
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.9
+      # ml_greedy / rl: the trained Q model is read straight from the secret
+      # files; the room score table is unzipped into ML_DATA_DIR by startCommand.
+      - key: RL_MODEL_DIR
+        value: /etc/secrets
+      - key: ML_DATA_DIR
+        value: /tmp/mldata
       - key: NEXT_PUBLIC_SUPABASE_URL
         sync: false
       - key: NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY
