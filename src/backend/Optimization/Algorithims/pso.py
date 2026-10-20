@@ -41,8 +41,8 @@ from backend.Optimization.Algorithims.grasp import scan_candidates
 from backend.Optimization.benchmark_seeds import seed_all, seed_for_run
 
 #parameters
-N_PARTICLES = 10
-ITERATIONS = 14
+N_PARTICLES = 10  # Chen & Shih (2013) used 30 (best of 5..35, 6000 generations); 30 here ran 362s vs ~162s
+ITERATIONS = 14  # NOT theirs: 30 x 6000 decodes would take days per run at 3,270 sections
 NO_IMPROVE_LIMIT = 5
 
 
@@ -53,12 +53,15 @@ CONSTRUCTION_TIMESLOT_SAMPLE = 8
 RESCUE_ROOM_SAMPLE = 10
 RESCUE_TIMESLOT_SAMPLE = 10
 
-C1 = 2.05
-C2 = 2.05
-_PHI = C1 + C2
-assert _PHI > 4, "c1 + c2 must exceed 4 for the constriction factor to be defined"
-CHI = 2.0 / abs(2 - _PHI - (_PHI * _PHI - 4 * _PHI) ** 0.5)  # ~0.7298 (Clerc & Kennedy 2002)
-V_CLAMP = 4.0
+# Swarm parameters from Chen & Shih (2013), SPSOLS (Algorithms 6(2), 227-244, section 4):
+# c1 = c2 = 2, chi = 0.72984, V in [-3, 3], 30 particles. The paper fixes chi at the
+# Clerc & Kennedy value for c1 = c2 = 2.05 and does not recompute it for c = 2 (phi = 4 would
+# make the closed form 1.0), so chi is a constant here. Previous values: C1 = C2 = 2.05
+# with chi derived from phi, V_CLAMP = 4.0. N_PARTICLES stays at 10 for runtime.
+C1 = 2.0
+C2 = 2.0
+CHI = 0.72984
+V_CLAMP = 3.0
 
 
 POSITION_RANGE = 9.0
