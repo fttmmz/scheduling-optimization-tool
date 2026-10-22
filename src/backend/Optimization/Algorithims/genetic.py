@@ -2,6 +2,7 @@ import random
 import copy
 import statistics
 from backend.Optimization.constraints import (
+    OverlapSet,
     get_valid_timeslots,
     passes_hard_constraints,
     get_viable_rooms,
@@ -26,7 +27,8 @@ def _free_timeslot(section, timeslots, occupied_instructors):
         if all((instructor_id, ts.id) not in occupied_instructors
                for instructor_id in instructor_ids):
             return ts
-    return random.choice(timeslots) if timeslots else None
+    # Every slot clashes for a teacher: leave it unscheduled (2.0) rather than force a clash (3.0).
+    return None
 
 
 def choose_random_assignment(
@@ -82,9 +84,9 @@ def choose_random_assignment(
             ):
                 return room, ts
 
-    # Fallback: no clash-free pair exists, so take a random one from the
-    # (already soft-ranked) candidates rather than leaving the section out.
-    return random.choice(rooms), random.choice(timeslots)
+    # No clash-free pair exists: leave the section unscheduled (2.0) rather than force a clash (3.0),
+    # as the other algorithms do. Forcing one put ~5 real clashes into every genetic timetable.
+    return None, None
 
 
 # Create Population
@@ -107,8 +109,8 @@ def create_population(size, sections, rooms, timeslots):
     # repeat to create many schedules
     for i in range(size):
         schedule = []
-        occupied_instructors = set()
-        occupied_rooms = set()
+        occupied_instructors = OverlapSet()
+        occupied_rooms = OverlapSet()
 
         # go through each section and assign what it needs
         for section, needs, viable_rooms, valid_timeslots in section_candidates:
@@ -206,8 +208,8 @@ def mutation(schedule, rooms, timeslots, sections=None):
         return schedule
 
     # check for conflicts before
-    occupied_instructors = set()
-    occupied_rooms = set()
+    occupied_instructors = OverlapSet()
+    occupied_rooms = OverlapSet()
     
     for item in schedule:
         if item != selected_item:  # Don't include the item we're about to mutate

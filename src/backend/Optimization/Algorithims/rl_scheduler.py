@@ -62,6 +62,7 @@ import numpy as np
 
 from backend.models.models import ScheduleItem
 from backend.Optimization.constraints import (
+    OverlapSet,
     finalize_schedule,
     instructor_occupancy_ids,
     room_soft_penalty,
@@ -255,8 +256,8 @@ class SchedulingEnv:
         tie_rng = np.random.default_rng([seed, 0])
         policy_rng = np.random.default_rng([seed, 1])
 
-        occupied_rooms = set()
-        occupied_instructors = set()
+        occupied_rooms = OverlapSet()
+        occupied_instructors = OverlapSet()
         room_used = Counter()
         room_demand = Counter(self.room_demand0)
         ts_demand = Counter(self.ts_demand0)
