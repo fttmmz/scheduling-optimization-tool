@@ -5,13 +5,23 @@ They fix sibling meeting blocks, which no algorithm couples while placing."""
 from collections import Counter
 
 from .classification import group_siblings, instructor_occupancy_ids, sibling_key
+from .overlap import OverlapSet, slots_clash
 from .rooms import get_viable_rooms_for_schedule_item
 from .timeslots import get_valid_timeslots_for_section
 
+# Both passes judge "free" in real time (overlap.py): a room or teacher is busy at every slot that overlaps
+# one it holds, and two blocks of a section clash when their slots overlap, not only when the IDs match.
+# Judged by slot ID, these passes moved blocks into rooms busy at overlapping hours and left a section's
+# blocks on R 08:00-11:59 and R 08:00-12:00 -- every clash left in the overlap-aware runs came from here.
+
+
+def _clashes_taken(slot, taken):
+    return any(slots_clash(slot, other) for other in taken)
+
 
 def _occupancy_of(schedule):
-    rooms = set()
-    instructors = set()
+    rooms = OverlapSet()
+    instructors = OverlapSet()
     for item in schedule:
         if item.timeslot_id is None:
             continue
@@ -63,15 +73,20 @@ def resolve_sibling_time_conflicts(schedule, sections, timeslots,
             current = item.timeslot_id
             if current is None:
                 continue
-            if current not in taken:
+            if not _clashes_taken(current, taken):
                 taken.add(current)
                 continue
 
             instructors = instructor_occupancy_ids(item)
+            # The block's own booking must not make an overlapping candidate look busy.
+            if item.room_id is not None:
+                occupied_rooms.discard((item.room_id, current))
+            for instructor_id in instructors:
+                occupied_instructors.discard((instructor_id, current))
             replacement = next(
                 (
                     slot for slot in candidates
-                    if slot not in taken
+                    if not _clashes_taken(slot, taken)
                     and (item.room_id is None
                          or (item.room_id, slot) not in occupied_rooms)
                     and all((instructor_id, slot) not in occupied_instructors
@@ -79,18 +94,15 @@ def resolve_sibling_time_conflicts(schedule, sections, timeslots,
                 ),
                 None,
             )
-            if replacement is None:
-                continue
+            new = current if replacement is None else replacement
 
             if item.room_id is not None:
-                occupied_rooms.discard((item.room_id, current))
-                occupied_rooms.add((item.room_id, replacement))
+                occupied_rooms.add((item.room_id, new))
             for instructor_id in instructors:
-                occupied_instructors.discard((instructor_id, current))
-                occupied_instructors.add((instructor_id, replacement))
+                occupied_instructors.add((instructor_id, new))
 
-            item.timeslot_id = replacement
-            taken.add(replacement)
+            item.timeslot_id = new
+            taken.add(new)
 
     return schedule
 
@@ -135,11 +147,11 @@ def unify_sibling_rooms(schedule, rooms=None):
     are, so this can improve the schedule but never break it. Mutates in place
     and returns the schedule.
     """
-    occupied = {
+    occupied = OverlapSet(
         (item.room_id, item.timeslot_id)
         for item in schedule
         if item.room_id is not None and item.timeslot_id is not None
-    }
+    )
 
     for group in group_siblings(schedule).values():
         roomed = [item for item in group

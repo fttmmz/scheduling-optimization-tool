@@ -5,6 +5,8 @@ from collections import Counter
 
 from backend.models.models import ScheduleItem
 from backend.Optimization.constraints import (
+    OverlapCounter,
+    OverlapSet,
     get_valid_timeslots,
     time_soft_penalty,
     get_viable_rooms,
@@ -247,8 +249,8 @@ def construct_grasp_solution(
     valid_timeslot_cache=None,
 ):
     schedule = []
-    occupied_rooms = set()
-    occupied_instructors = set()
+    occupied_rooms = OverlapSet()
+    occupied_instructors = OverlapSet()
 
     for section, needs, viable_rooms, valid_ts in section_candidates:
 
@@ -407,8 +409,10 @@ def local_search(
 
     best_fitness = fitness_from(total_hard, total_soft)
 
-    room_occupancy = Counter()
-    instructor_occupancy = Counter()
+    # Overlap-aware (constraints/overlap.py): a move is judged against every booking on a slot that
+    # overlaps it in real time, not only the same slot id.
+    room_occupancy = OverlapCounter()
+    instructor_occupancy = OverlapCounter()
     for it in best_schedule:
         if it.timeslot_id is None:
             continue
@@ -481,24 +485,24 @@ def local_search(
                     soft_delta = new_local - old_local
                     hard_delta = 0
 
-                    old_room_count = room_occupancy[(original_room_id, original_timeslot_id)]
+                    old_room_count = room_occupancy.overlapping((original_room_id, original_timeslot_id))
                     if old_room_count >= 2:
                         hard_delta -= 1
 
                     for instructor_id in occupying_instructors:
-                        if instructor_occupancy[
+                        if instructor_occupancy.overlapping(
                             (instructor_id, original_timeslot_id)
-                        ] >= 2:
+                        ) >= 2:
                             hard_delta -= 1
 
-                    new_room_count = room_occupancy[(room.id, timeslot.id)]
+                    new_room_count = room_occupancy.overlapping((room.id, timeslot.id))
                     if new_room_count >= 1:
                         hard_delta += 1
 
                     for instructor_id in occupying_instructors:
-                        if instructor_occupancy[
+                        if instructor_occupancy.overlapping(
                             (instructor_id, timeslot.id)
-                        ] >= 1:
+                        ) >= 1:
                             hard_delta += 1
 
                     # Compare moves on the same weighting the fitness uses; the

@@ -5,6 +5,10 @@ from collections import defaultdict
 from backend.models.models import ScheduleItem
 from backend.Optimization.constraints.rooms import PRACTICAL_LECTURE_COURSE_IDS
 from backend.Optimization.constraints import (
+    OverlapSet,
+    course_type_for_rooms,
+    is_team_roster,
+    registrar_room_cache_key,
     classify_section,
     get_required_room_type,
     get_valid_timeslots,
@@ -125,6 +129,9 @@ def build_conflict_graph(sections):
 
     by_instructor = defaultdict(list)
     for node_id in G.nodes:
+        # A team-taught course's teacher list is a roster, not people in the room (institution_data).
+        if is_team_roster(G.nodes[node_id]["section_obj"]):
+            continue
         for instr in G.nodes[node_id]["instructor_ids"]:
             by_instructor[instr].append(node_id)
 
@@ -144,8 +151,8 @@ def greedy_schedule(sections, timeslots, rooms):
     G = build_conflict_graph(sections)
 
     
-    occupied_rooms = set() 
-    occupied_instructors = set() 
+    occupied_rooms = OverlapSet() 
+    occupied_instructors = OverlapSet() 
     assigned_timeslots = {} 
 
     room_list_cache: dict = {}
@@ -153,7 +160,7 @@ def greedy_schedule(sections, timeslots, rooms):
             # Everything the hard room rules read: course type, department,
             # campus identity, whether a registrar campus code is known, and
             # whether the course is a practical one allowed into its labs.
-            key = (room_type, section.course.type, course_dept, campus,
+            key = (room_type, section.course.type, course_dept, campus, registrar_room_cache_key(section),
                    getattr(section, "campus", None) is not None,
                    section.course.id in PRACTICAL_LECTURE_COURSE_IDS)
             if key not in room_list_cache:
@@ -240,7 +247,7 @@ def greedy_schedule(sections, timeslots, rooms):
             schedule.append(make_item(None, chosen_ts))
             continue
 
-        room_type = get_required_room_type(course_type) or "classroom"
+        room_type = get_required_room_type(course_type_for_rooms(section, course_type)) or "classroom"
         viable = order_by_capacity(
             cached_viable_rooms(section, room_type, course_dept, campus),
             capacity_needed,
