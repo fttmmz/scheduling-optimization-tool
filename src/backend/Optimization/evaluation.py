@@ -2,7 +2,10 @@
 from collections import Counter, defaultdict
 
 from backend.Optimization.constraints import (
+    registrar_guideline_ids,
     classify_section,
+    cross_slot_pairs,
+    same_class,
     get_required_room_type,
     get_building_campus,
     get_valid_timeslots_for_section,
@@ -71,6 +74,10 @@ def _count_slot_conflicts(schedule: list, slot_of) -> int:
     )
 
 
+# Real-time clashes. The counts below are by slot ID (two classes on the same slot); each also adds the
+# pairs on DIFFERENT slots that overlap in real time (constraints/overlap.py), which the slot-ID count
+# cannot see: a room at M 09:30-10:45 and MW 09:30-10:45 is double-booked on Monday.
+
 def count_instructor_conflicts(schedule: list) -> int:
     """HARD: one instructor expected in two places at once.
 
@@ -85,17 +92,19 @@ def count_instructor_conflicts(schedule: list) -> int:
     feasible by definition -- appear to contain hundreds of impossible bookings.
     """
     slots = defaultdict(list)
+    by_instructor = defaultdict(list)
     for item in schedule:
         if item.timeslot_id is None:
             continue
         for instructor_id in instructor_occupancy_ids(item):
             slots[(instructor_id, item.timeslot_id)].append(item)
+            by_instructor[instructor_id].append(item)
 
     return sum(
         max(0, _count_occupants(items) - 1)
         for items in slots.values()
         if len(items) > 1
-    )
+    ) + cross_slot_pairs(by_instructor.values(), same_class)
 
 
 def count_sibling_conflicts(schedule: list) -> int:
@@ -108,16 +117,23 @@ def count_sibling_conflicts(schedule: list) -> int:
     carry no room and no instructor at all.
     """
     conflicts = 0
-    for group in group_siblings(schedule).values():
+    groups = group_siblings(schedule).values()
+    for group in groups:
         counts = Counter(
             item.timeslot_id for item in group if item.timeslot_id is not None
         )
         conflicts += sum(max(0, n - 1) for n in counts.values())
-    return conflicts
+    return conflicts + cross_slot_pairs(
+        [item for item in group if item.timeslot_id is not None] for group in groups
+    )
 
 
 def count_room_conflicts(schedule: list) -> int:
     """HARD: one room hosting two classes at once."""
+    by_room = defaultdict(list)
+    for item in schedule:
+        if item.room_id is not None and item.timeslot_id is not None:
+            by_room[item.room_id].append(item)
     return _count_slot_conflicts(
         schedule,
         lambda item: (
@@ -125,7 +141,7 @@ def count_room_conflicts(schedule: list) -> int:
             if item.room_id is None or item.timeslot_id is None
             else (item.room_id, item.timeslot_id)
         ),
-    )
+    ) + cross_slot_pairs(by_room.values(), same_class)
 
 
 def count_campus_conflicts(schedule: list, rooms: list) -> int:
@@ -292,12 +308,16 @@ def total_time_penalty(schedule: list, timeslots: list) -> float:
 
 
 def build_timeslot_guideline_cache(sections: list, timeslots: list) -> dict:
-    """Build a cache of valid timeslot IDs for each section."""
+    """Build a cache of valid timeslot IDs for each section.
+
+    With a registrar practice loaded, a near-duplicate of a valid slot (08:00-10:40 for 08:00-10:50) is
+    valid too: it is the same period, and the registrar uses both.
+    """
     cache = {}
     for sec in sections:
         key = (sec.course.id, str(sec.no))
         valid = get_valid_timeslots_for_section(sec, timeslots)
-        cache[key] = {ts.id for ts in valid}
+        cache[key] = registrar_guideline_ids({ts.id for ts in valid})
     return cache
 
 

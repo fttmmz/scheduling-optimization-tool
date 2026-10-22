@@ -97,12 +97,24 @@ class Room:
         self.dept_id = data["dept_id"]
         self.no=data["room_num"]
 
+# Real day and hours of every time slot, by id. Occupancy everywhere is keyed by slot ID, and two different
+# IDs can still overlap in real time (M 09:30-10:45 and MW 09:30-10:45); constraints/overlap.py answers
+# "do these two slots clash?" from this table. Filled by every Timeslot created; an id that is not here
+# clashes only with itself, which is the old slot-ID behaviour.
+SLOT_TIMES = {}
+SLOT_TIMES_VERSION = [0]        # bumped when an entry changes, so cached clash sets are rebuilt
+
+
 class Timeslot:
     def __init__(self, data):
         self.id = data["timeslot_id"]
         self.day = data["day"]
         self.start = data["start_time"]
         self.end = data["end_time"]
+        times = (self.day, self.start, self.end)
+        if SLOT_TIMES.get(self.id) != times:
+            SLOT_TIMES[self.id] = times
+            SLOT_TIMES_VERSION[0] += 1
 
 
 class Section:

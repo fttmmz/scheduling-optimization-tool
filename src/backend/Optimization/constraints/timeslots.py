@@ -5,6 +5,7 @@ part (the evening preference) is time_soft_penalty() and rank_timeslots()."""
 
 import re
 
+from . import registrar as _registrar
 from .classification import _course_identity, is_supervision
 
 
@@ -289,7 +290,7 @@ def time_soft_penalty_parts(obj, ts) -> dict:
     elif prefers_daytime(obj):
         if evening:
             parts["teaching_evening"] = SOFT_WEIGHT_TEACHING_EVENING
-    return parts
+    return _registrar.time_parts(obj, ts, parts)   # tutorials prefer the evening when a practice is loaded
 
 
 def time_soft_penalty(obj, ts) -> float:
@@ -481,5 +482,8 @@ def get_valid_timeslots_for_section(section, timeslots: list) -> list:
     through this one function, and greedy, GRASP and hybrid take the first free
     slot they are handed. Genetic and PSO sample rather than scan, so for those
     two it is the penalty in the objective that does the work.
+
+    With a registrar practice loaded (registrar.py) the candidates are the course's own meeting formats,
+    narrowed after ranking to the registrar's standard slots; without one this is unchanged.
     """
-    return rank_timeslots(section, _candidate_timeslots(section, timeslots))
+    return _registrar.timeslots_for(section, timeslots, _candidate_timeslots, rank_timeslots)

@@ -38,6 +38,7 @@ from pathlib import Path
 
 from backend.models.models import ScheduleItem
 from backend.Optimization.constraints import (
+    OverlapSet,
     finalize_schedule,
     instructor_occupancy_ids,
     room_soft_penalty,
@@ -187,8 +188,8 @@ def _best_pair(section, viable_rooms, valid_ts, room_scores, guideline_ids,
 
 def construct_ml_greedy(section_candidates, room_scores, valid_timeslot_cache, rng):
     schedule = []
-    occupied_rooms = set()
-    occupied_instructors = set()
+    occupied_rooms = OverlapSet()
+    occupied_instructors = OverlapSet()
 
     for section, needs, viable_rooms, valid_ts in section_candidates:
         if not needs.room and not needs.time:

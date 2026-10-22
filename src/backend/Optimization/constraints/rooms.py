@@ -7,6 +7,7 @@ reason."""
 import re
 
 from . import institution_data as _institution
+from . import registrar as _registrar
 from .classification import BRANCH_CAMPUS_CODES
 
 # Institution facts for the hard room rules. getattr() so an older copy of
@@ -238,6 +239,7 @@ def _soft_profile(obj):
         course_type, dept, course_id = course.type, course.dept, course.id
     else:                                       # ScheduleItem
         course_type, dept, course_id = obj.course_type, obj.course_dept, obj.course_id
+    course_type = _registrar.course_type_for_rooms(obj, course_type)
     return course_type, dept, seats_needed(obj), section_campus(obj), course_id
 
 
@@ -295,7 +297,9 @@ def room_rule_violations(obj, room, profile=None) -> tuple:
             # room-type rule above: allowed only for a practical course.
             broken.append("medical_campus")
 
-    return tuple(broken)
+    # With a registrar practice loaded, a room type or lab department the course's own sections use
+    # repeatedly is its practice, not a violation.
+    return _registrar.room_rules(obj, room, tuple(broken))
 
 
 def is_room_allowed(obj, room, profile=None) -> bool:
@@ -347,12 +351,14 @@ def room_soft_penalty_parts(obj, room, profile=None) -> dict:
         else 0.0
     )
 
-    return {
+    parts = {
         "room_type": type_cost,
         "department": dept_cost,
         "campus": campus_cost,
         "capacity": capacity_penalty(seats, room.capacity),
     }
+    # With a registrar practice loaded, the placements it makes correctly are not charged (registrar.py).
+    return _registrar.room_parts(obj, room, parts, (course_type, course_dept, seats, campus, _course_id))
 
 
 def room_soft_penalty(obj, room, profile=None) -> float:
@@ -438,11 +444,11 @@ def rank_rooms(obj, rooms, limit=DEFAULT_ROOM_CANDIDATES):
     scored.sort(key=lambda pair: pair[0])  # stable: ties keep input order
 
     if limit is None:
-        return [room for _, room in scored]
+        return _registrar.pinned_rooms(obj, rooms, [room for _, room in scored])
 
     perfect = sum(1 for penalty, _ in scored if penalty == 0.0)
     keep = max(perfect, limit)
-    return [room for _, room in scored[:keep]]
+    return _registrar.pinned_rooms(obj, rooms, [room for _, room in scored[:keep]])
 
 
 def get_viable_rooms(section, rooms, limit=DEFAULT_ROOM_CANDIDATES):

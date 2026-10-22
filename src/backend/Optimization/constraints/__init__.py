@@ -10,6 +10,8 @@ without touching callers:
     timeslots.py         which timeslots fit a section, preferred first
     rooms.py             which rooms suit a section, cheapest soft penalty first
     hard.py              the hard tier: double-booked room or instructor
+    overlap.py           when two different slots clash in real time; overlap-aware occupancy containers
+    registrar.py         the registrar's practice learned from the base schedule (slots, formats, rooms)
     repair.py            finalize_schedule(), run by every algorithm on its result
     preprocessing.py     section tagging done once by main.py
     institution_data.py  the real course ids the rules above depend on
@@ -36,6 +38,7 @@ from .classification import (
     instructor_occupancy_ids,
     is_branch_campus,
     is_supervision,
+    is_team_roster,
     item_needs,
     needs_for,
     needs_to_label,
@@ -51,7 +54,28 @@ from .hard import (
     passes_hard_constraints,
 )
 from .institution_data import COMBINED_COURSE_GROUPS, SUPERVISION_COURSE_IDS
+from .overlap import (
+    MULTIPLE_OWNERS,
+    OverlapCounter,
+    OverlapSet,
+    OwnerMap,
+    clashing_slots,
+    cross_slot_pairs,
+    overlap_minutes,
+    same_class,
+    single_owner,
+    slots_clash,
+)
 from .preprocessing import intro_it_days_ok, tag_intro_it_pairs, tag_section_links
+from .registrar import (
+    RegistrarPractice,
+    activate as activate_registrar_practice,
+    active as active_registrar_practice,
+    course_type_for_rooms,
+    guideline_ids as registrar_guideline_ids,
+    learn as learn_registrar_practice,
+    room_cache_key as registrar_room_cache_key,
+)
 from .repair import finalize_schedule, resolve_sibling_time_conflicts, unify_sibling_rooms
 from .rooms import (
     COURSE_TYPE_TO_ROOM_TYPE,
