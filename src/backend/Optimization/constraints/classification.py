@@ -5,6 +5,7 @@ from collections import defaultdict
 from typing import NamedTuple
 
 from . import institution_data as _institution
+from . import registrar as _registrar
 from .institution_data import COMBINED_COURSE_GROUPS, SUPERVISION_COURSE_IDS
 
 # Registrar CAMP codes of branch campuses in other towns. None of their rooms
@@ -16,6 +17,19 @@ BRANCH_CAMPUS_CODES = getattr(_institution, "BRANCH_CAMPUS_CODES", frozenset())
 def is_branch_campus(obj) -> bool:
     """A Section or ScheduleItem taught at a branch campus."""
     return getattr(obj, "campus", None) in BRANCH_CAMPUS_CODES
+
+
+# Courses taught by a rotating team whose teacher lists are rosters (institution_data.py). Like
+# supervision, the list holds no teacher's time.
+TEAM_ROSTER_COURSE_IDS = frozenset(
+    str(c) for c in getattr(_institution, "TEAM_ROSTER_COURSE_IDS", frozenset()))
+
+
+def is_team_roster(obj) -> bool:
+    """A Section or ScheduleItem of a team-taught course whose teacher list is a roster."""
+    course = getattr(obj, "course", None)
+    course_id = course.id if course is not None else getattr(obj, "course_id", None)
+    return str(course_id) in TEAM_ROSTER_COURSE_IDS
 
 
 # COURSE-TYPE / LEVEL CLASSIFICATION
@@ -96,13 +110,15 @@ def needs_for(course_type, level, campus=None) -> Needs:
 def section_needs(section) -> Needs:
     """Canonical classifier for a Section object -> Needs(room, time)."""
     level = getattr(section.course, "level", None)
-    return needs_for(section.course.type, level, getattr(section, "campus", None))
+    needs = needs_for(section.course.type, level, getattr(section, "campus", None))
+    return _registrar.needs(section, needs)
 
 
 def item_needs(item) -> Needs:
     """Same as section_needs(), for a ScheduleItem."""
-    return needs_for(item.course_type, getattr(item, "level", None),
-                     getattr(item, "campus", None))
+    needs = needs_for(item.course_type, getattr(item, "level", None),
+                      getattr(item, "campus", None))
+    return _registrar.needs(item, needs)
 
 
 # ── Legacy string-enum compatibility ──────────────────────────────────────────
@@ -255,7 +271,7 @@ def instructor_occupancy_ids(obj):
     side to err on -- the false constraints removed vastly outnumber the genuine
     clashes lost, and the ROOM check still applies to them unchanged.
     """
-    if is_supervision(obj):
+    if is_supervision(obj) or is_team_roster(obj):
         return ()
     instructor_ids = getattr(obj, "instructor_ids", None)
     if instructor_ids:

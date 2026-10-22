@@ -25,6 +25,7 @@ from alns.stop import MaxIterations
 
 from backend.Optimization.benchmark_seeds import seed_for_run
 from backend.Optimization.constraints import (
+    OverlapSet,
     finalize_schedule,
     get_valid_timeslots_for_section,
     get_viable_rooms,
@@ -179,8 +180,8 @@ class TimetableState:
 def repair(state, rng, randomized=False):
     """Repair removed sections using the best or a random good position."""
     repaired = state.copy()
-    occupied_rooms = set()
-    occupied_instructors = set()
+    occupied_rooms = OverlapSet()
+    occupied_instructors = OverlapSet()
     sibling_times = {}
 
     # Rebuild occupancy from assignments that remain after destruction.

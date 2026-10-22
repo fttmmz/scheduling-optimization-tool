@@ -46,6 +46,7 @@ from backend.Optimization.constraints import (
     NEEDS_ROOM_ONLY,
     NEEDS_TIME_ONLY,
     classify_section,
+    clashing_slots,
     finalize_schedule,
     get_valid_timeslots,
     get_viable_rooms,
@@ -53,6 +54,7 @@ from backend.Optimization.constraints import (
     instructor_occupancy_ids,
     occupancy_key,
     room_soft_penalty,
+    same_class,
     sibling_key,
     time_soft_penalty,
 )
@@ -163,6 +165,12 @@ def sample_choices(requirement, rooms, timeslots, limit):
     if total <= limit:
         return [(room, ts) for room in rooms for ts in timeslots]
 
+    # The random draw below only uses rooms[:ROOM_LIMIT]. With more rooms than that and only one or two
+    # timeslots there are fewer distinct pairs to draw than `limit`, and the loop never ended.
+    drawable = min(len(rooms), ROOM_LIMIT) * len(timeslots)
+    if drawable <= limit:
+        return [(room, ts) for room in rooms[:ROOM_LIMIT] for ts in timeslots]
+
     choices = []
     seen = set()
 
@@ -199,6 +207,11 @@ class Occupancy:
         self.rooms = defaultdict(list)
         self.instructors = defaultdict(list)
         self.siblings = defaultdict(list)
+        # The slots each room / instructor / sibling group holds, so a placement is also checked against
+        # bookings on OTHER slots that overlap it in real time (constraints/overlap.py).
+        self.room_slots = defaultdict(set)
+        self.instructor_slots = defaultdict(set)
+        self.sibling_slots = defaultdict(set)
 
         for i in range(len(schedule)):
             self.add(i)
@@ -221,11 +234,14 @@ class Occupancy:
 
         if item.room_id is not None:
             self.rooms[(item.room_id, ts)].append(index)
+            self.room_slots[item.room_id].add(ts)
 
         for instructor_id in instructor_occupancy_ids(item):
             self.instructors[(instructor_id, ts)].append(index)
+            self.instructor_slots[instructor_id].add(ts)
 
         self.siblings[(sibling_key(item), ts)].append(index)
+        self.sibling_slots[sibling_key(item)].add(ts)
 
     def remove(self, index):
         item = self.schedule[index]
@@ -235,11 +251,43 @@ class Occupancy:
 
         if item.room_id is not None:
             self._remove(self.rooms, (item.room_id, ts), index)
+            if (item.room_id, ts) not in self.rooms:
+                self.room_slots[item.room_id].discard(ts)
 
         for instructor_id in instructor_occupancy_ids(item):
             self._remove(self.instructors, (instructor_id, ts), index)
+            if (instructor_id, ts) not in self.instructors:
+                self.instructor_slots[instructor_id].discard(ts)
 
         self._remove(self.siblings, (sibling_key(item), ts), index)
+        if (sibling_key(item), ts) not in self.siblings:
+            self.sibling_slots[sibling_key(item)].discard(ts)
+
+    def overlapping(self, index, room_id, timeslot_id, first_only=False):
+        """Occupants on OTHER slots that overlap timeslot_id in real time (the same slot is counted by
+        hard_cost / problem_indices as before): a count, or with first_only whether there is one."""
+        clash = clashing_slots(timeslot_id)
+        if len(clash) == 1:
+            return 0
+        item = self.schedule[index]
+        lookups = []
+        if room_id is not None:
+            lookups.append((self.room_slots.get(room_id, ()), self.rooms, room_id, False))
+        for instructor_id in instructor_occupancy_ids(item):
+            lookups.append((self.instructor_slots.get(instructor_id, ()), self.instructors, instructor_id, False))
+        key = sibling_key(item)
+        lookups.append((self.sibling_slots.get(key, ()), self.siblings, key, True))
+        count = 0
+        for held, mapping, resource, siblings in lookups:
+            for other_slot in held:
+                if other_slot == timeslot_id or other_slot not in clash:
+                    continue
+                for j in mapping.get((resource, other_slot), ()):
+                    if j != index and (siblings or not same_class(item, self.schedule[j])):
+                        count += 1
+                        if first_only:
+                            return count
+        return count
 
     def occupant_count(self, indices):
         """Count room/instructor occupants using the same combined-class idea as evaluation.py."""
@@ -283,7 +331,7 @@ class Occupancy:
         siblings = self.siblings.get((sibling_key(item), timeslot_id), [])
         cost += len(siblings)
 
-        return cost
+        return cost + self.overlapping(index, room_id, timeslot_id)
 
     def problem_indices(self, requirements):
         problems = []
@@ -312,6 +360,9 @@ class Occupancy:
                         break
 
             if not bad and len(self.siblings.get((sibling_key(item), ts), [])) > 1:
+                bad = True
+
+            if not bad and self.overlapping(i, item.room_id, ts, first_only=True):
                 bad = True
 
             if bad:

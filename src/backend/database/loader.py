@@ -2,7 +2,9 @@ from backend.models.models import (
     Room, Timeslot, build_sections, group_rows_by_pattern, section_info_index,
 )
 from backend.database.db import supabase
-from backend.Optimization.constraints import is_placeholder_timeslot
+from backend.Optimization.constraints import (
+    RegistrarPractice, activate_registrar_practice, is_placeholder_timeslot,
+)
 
 
 def load_rooms():
@@ -94,10 +96,37 @@ def _fetch_schedule_rows(schedule_id):
 
 
 
+def load_registrar_practice():
+    """The registrar's practice learned from the base schedule, or None.
+
+    From the registrar_practice table (scripts/data_import/build_registrar_practice.py), newest row. It
+    gives every section the registrar's slots, formats and rooms (constraints/registrar.py); without it
+    the algorithms fall back to the generic model and all 466 slots, which leaves far more sections
+    unscheduled now that clashes are judged in real time -- hence the warning.
+    """
+    try:
+        res = (
+            supabase.table("registrar_practice")
+            .select("practice")
+            .order("built_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+    except Exception as exc:
+        print(f"[loader] WARNING: registrar_practice could not be read ({type(exc).__name__}); "
+              "scheduling with the generic slot and room model")
+        return None
+    if not res.data:
+        print("[loader] WARNING: registrar_practice is empty; scheduling with the generic slot and room model")
+        return None
+    return RegistrarPractice(res.data[0]["practice"])
+
+
 def get_scheduling_data():
     rooms = load_rooms()
     timeslots = load_timeslots()
     sections = load_section_details()
+    activate_registrar_practice(load_registrar_practice())
 
     return {
         "rooms": rooms,

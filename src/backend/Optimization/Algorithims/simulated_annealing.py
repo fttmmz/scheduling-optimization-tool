@@ -16,6 +16,7 @@ import math
 import random
 
 from backend.Optimization.constraints import (
+    OverlapSet,
     section_needs,
     get_viable_rooms,
     get_viable_rooms_for_schedule_item,
@@ -50,8 +51,8 @@ def _build_initial_schedule(sections, timeslots, rooms):
     """Create one valid starting schedule."""
 
     schedule = []
-    occupied_rooms = set()
-    occupied_instructors = set()
+    occupied_rooms = OverlapSet()
+    occupied_instructors = OverlapSet()
 
     for section in sections:
         needs = section_needs(section)
@@ -165,8 +166,8 @@ def _make_neighbor(schedule, rooms, timeslots):
         getattr(selected_item, "level", None),
     )
 
-    occupied_rooms = set()
-    occupied_instructors = set()
+    occupied_rooms = OverlapSet()
+    occupied_instructors = OverlapSet()
 
     # Build occupancy without the item that is being moved.
     for index, item in enumerate(neighbor):

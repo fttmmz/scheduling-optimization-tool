@@ -8,6 +8,11 @@ import numpy as np
 
 from backend.models.models import ScheduleItem
 from backend.Optimization.constraints import (
+    MULTIPLE_OWNERS,
+    OwnerMap,
+    single_owner,
+    slots_clash,
+    OverlapSet,
     get_valid_timeslots,
     get_viable_rooms,
     instructor_occupancy_ids,
@@ -131,8 +136,8 @@ def decode(position, section_candidates, valid_timeslot_cache):
     order = np.argsort(-position)
     n = len(section_candidates)
     schedule = [None] * n
-    occupied_rooms = set()
-    occupied_instructors = set()
+    occupied_rooms = OverlapSet()
+    occupied_instructors = OverlapSet()
 
     for idx in order:
         section, needs, viable_rooms, valid_ts = section_candidates[idx]
@@ -187,20 +192,25 @@ def decode(position, section_candidates, valid_timeslot_cache):
 # Ejection-chain repair for sections decode() left unscheduled
 # ============================================================
 def _build_occupancy_maps(schedule):
-    room_owner = {}
-    instructor_owner = {}
-    occupied_rooms = set()
-    occupied_instructors = set()
+    # Overlap-aware (constraints/overlap.py): the owner of any booking that overlaps in real time.
+    room_owner = OwnerMap()
+    instructor_owner = OwnerMap()
+    occupied_rooms = OverlapSet()
+    occupied_instructors = OverlapSet()
 
     for idx, item in enumerate(schedule):
-        if item.room_id is not None and item.timeslot_id is not None:
+        if item.timeslot_id is None:
+            continue
+        if item.room_id is not None:
             key = (item.room_id, item.timeslot_id)
             room_owner[key] = idx
             occupied_rooms.add(key)
-            for instructor_id in instructor_occupancy_ids(item):
-                ikey = (instructor_id, item.timeslot_id)
-                instructor_owner[ikey] = idx
-                occupied_instructors.add(ikey)
+        # A time-only class holds no room but does hold its teachers' hours. Recording teachers only for
+        # roomed items let the rescue double-book the teacher of a time-only class.
+        for instructor_id in instructor_occupancy_ids(item):
+            ikey = (instructor_id, item.timeslot_id)
+            instructor_owner[ikey] = idx
+            occupied_instructors.add(ikey)
 
     return room_owner, instructor_owner, occupied_rooms, occupied_instructors
 
@@ -268,13 +278,9 @@ def rescue_unscheduled(schedule, section_candidates, valid_timeslot_cache):
 
         for _, room, timeslot in candidates:
             room_blocker = room_owner.get((room.id, timeslot.id))
-            instr_blocker = next(
-                (owner for owner in (
-                    instructor_owner.get((instructor_id, timeslot.id))
-                    for instructor_id in item_instructors
-                ) if owner is not None),
-                None,
-            )
+            instr_blocker = single_owner(instructor_owner, item_instructors, timeslot.id)
+            if room_blocker is MULTIPLE_OWNERS or instr_blocker is MULTIPLE_OWNERS:
+                continue  # more than one class overlaps the target -- outside depth-1 scope
 
             if room_blocker is None and instr_blocker is None:
                 # Genuinely free right now -- take it.
@@ -309,14 +315,16 @@ def rescue_unscheduled(schedule, section_candidates, valid_timeslot_cache):
                 # occupied for the blocker's OWN search, or a tie would let
                 # choose_best_assignment hand it right back (a no-op "move"
                 # that silently defeats the rescue).
-                b_ts_search = b_ts
+                # If the blocker also holds one of our teachers, it must leave that hour too.
+                b_ts_search = b_ts if instr_blocker is None else [
+                    t for t in b_ts if not slots_clash(t.id, timeslot.id)]
                 trial_rooms = trial_rooms | {(room.id, timeslot.id)}
             else:
                 # Instructor-block: the conflict is with `timeslot` itself,
                 # in any room -- excluding just (room, timeslot) wouldn't
                 # stop choose_best_assignment from placing the blocker in a
                 # DIFFERENT room at the same clashing timeslot.
-                b_ts_search = [t for t in b_ts if t.id != timeslot.id]
+                b_ts_search = [t for t in b_ts if not slots_clash(t.id, timeslot.id)]
 
             new_room, new_timeslot = choose_best_assignment(
                 b_section, b_rooms, b_ts_search, trial_instructors, trial_rooms,

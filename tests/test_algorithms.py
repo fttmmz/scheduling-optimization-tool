@@ -117,10 +117,12 @@ def _run(name, sections, timeslots, rooms):
     if name == "rl-static":
         from backend.Optimization.Algorithims.rl_scheduler import rl_schedule
         return rl_schedule(sections, timeslots, rooms, seed=1, model="static")[0]
-    raise AssertionError(name)
-
     if name == "simulated_annealing":
+        # It takes no seed and draws from the global `random`, so without this its result depended on
+        # whatever the tests before it left in that state.
+        import random
         from backend.Optimization.Algorithims.simulated_annealing import simulated_annealing_schedule
+        random.seed(1)
         return simulated_annealing_schedule(sections, timeslots, rooms)
     if name == "alns":
         from backend.Optimization.Algorithims.alns import alns_schedule
