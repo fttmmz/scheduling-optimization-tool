@@ -27,6 +27,13 @@ from backend.Optimization.evaluation import (
 )
 from backend.database.db import supabase
 from backend.database.loader import get_scheduling_data, load_schedule, save_schedule
+from backend.preferences import (
+    PreferenceIn,
+    find_instructor,
+    load_preference,
+    login_email,
+    save_preference,
+)
 
 app = FastAPI()
 
@@ -46,6 +53,10 @@ class TimetableRequest(BaseModel):
         ge=1,
         le=30,
         description="Number of independent runs for genetic/hybrid/grasp/pso/ml_greedy/rl algorithms (1–30). Higher values improve quality but take longer.",
+    )
+    use_preferences: bool = Field(
+        False,
+        description="Ask the optimizer to try to meet instructors' saved preferences. Not available for ml_greedy or rl.",
     )
 
 
@@ -78,7 +89,7 @@ class ScheduleSaveRequest(BaseModel):
 class CourseIn(BaseModel):
     course_id: int
     name: str
-    credits: Optional[int] = None
+    credits: Optional[float] = None     # some courses really carry 0.3, 0.5 or 0.9 credits
     course_type: Optional[str] = None
     course_class: Optional[str] = None
     level: Optional[str] = None
@@ -167,7 +178,14 @@ async def get_current_user_id(
     return profile_res.data["user_id"]
 
 
-def run_optimization(algorithm: str, num_runs: int = 1) -> Dict[str, Any]:
+async def get_current_instructor(user_id: int = Depends(get_current_user_id)) -> Dict[str, Any]:
+    instructor = find_instructor(supabase, user_id)
+    if not instructor:
+        raise HTTPException(status_code=403, detail="This account is not linked to an instructor")
+    return instructor
+
+
+def run_optimization(algorithm: str, num_runs: int = 1, use_preferences: bool = False) -> Dict[str, Any]:
     scheduling_data = get_scheduling_data()
     if scheduling_data is None:
         raise RuntimeError("Unable to load scheduling data from the database.")
@@ -282,15 +300,30 @@ def run_optimization(algorithm: str, num_runs: int = 1) -> Dict[str, Any]:
         "fitness": fitness_score,
         "exec_time": exec_time,
         "total_sections": len(sections),
+        "preferences_requested": use_preferences,
+        # The optimizer does not use preferences yet. Set this from the real outcome once the
+        # penalties are in; the frontend warns the user for as long as it stays False on a request.
+        "preferences_applied": False,
     }
 
 
 def crud_list(table: str, order_by: Optional[str] = None):
-    query = supabase.table(table).select("*")
-    if order_by:
-        query = query.order(order_by)
-    res = query.execute()
-    return res.data
+    """Every row of a table. One select returns at most 1,000 rows, so this reads page by page.
+
+    order_by is one column or several separated by commas. It must identify a row uniquely, or a row can
+    land on two pages or on none.
+    """
+    rows, offset, page_size = [], 0, 1000
+    while True:
+        query = supabase.table(table).select("*")
+        for column in (order_by or "").split(","):
+            if column:
+                query = query.order(column)
+        page = query.range(offset, offset + page_size - 1).execute().data
+        rows.extend(page)
+        if len(page) < page_size:
+            return rows
+        offset += page_size
 
 
 def crud_insert(table: str, data: Dict[str, Any]):
@@ -331,13 +364,13 @@ app.add_middleware(
 async def login(request: LoginRequest):
     try:
         auth_response = supabase.auth.sign_in_with_password(
-            {"email": request.email, "password": request.password}
+            {"email": login_email(request.email), "password": request.password}
         )
     except Exception:
-        raise HTTPException(status_code=401, detail="Invalid email or password")
+        raise HTTPException(status_code=401, detail="Invalid login or password")
 
     if not auth_response.user:
-        raise HTTPException(status_code=401, detail="Invalid email or password")
+        raise HTTPException(status_code=401, detail="Invalid login or password")
 
     auth_id = str(auth_response.user.id)
     profile_res = (
@@ -431,14 +464,16 @@ async def optimize(
     user_id: int = Depends(get_current_user_id),
 ):
     """Synchronous optimize — fine for greedy and quick single-run genetic/hybrid."""
-    result = run_optimization(request.algorithm, num_runs=request.num_runs)
+    result = run_optimization(
+        request.algorithm, num_runs=request.num_runs, use_preferences=request.use_preferences
+    )
     return {"status": "success", "timetable": result}
 
 
-def _run_job(job_id: str, algorithm: str, num_runs: int) -> None:
+def _run_job(job_id: str, algorithm: str, num_runs: int, use_preferences: bool = False) -> None:
     """Worker function executed in a thread pool for async optimization jobs."""
     try:
-        result = run_optimization(algorithm, num_runs=num_runs)
+        result = run_optimization(algorithm, num_runs=num_runs, use_preferences=use_preferences)
         _jobs[job_id] = {"status": "done", "result": result}
     except Exception as exc:
         _jobs[job_id] = {"status": "error", "error": str(exc)}
@@ -458,7 +493,9 @@ async def optimize_async(
     job_id = str(uuid.uuid4())
     _jobs[job_id] = {"status": "running"}
     loop = asyncio.get_event_loop()
-    loop.run_in_executor(_executor, _run_job, job_id, request.algorithm, request.num_runs)
+    loop.run_in_executor(
+        _executor, _run_job, job_id, request.algorithm, request.num_runs, request.use_preferences
+    )
     return {"job_id": job_id, "status": "running"}
 
 
@@ -614,6 +651,27 @@ async def delete_instructor(inst_id: int, user_id: int = Depends(get_current_use
     return crud_delete("instructor", "inst_id", inst_id)
 
 
+# --- An instructor's own preferences ---
+
+@app.get("/api/my/preferences")
+async def get_my_preferences(instructor: Dict[str, Any] = Depends(get_current_instructor)):
+    return {
+        "instructor": instructor,
+        "preferences": load_preference(supabase, instructor["inst_id"]),
+    }
+
+
+@app.put("/api/my/preferences")
+async def save_my_preferences(
+    preference: PreferenceIn,
+    instructor: Dict[str, Any] = Depends(get_current_instructor),
+):
+    return {
+        "instructor": instructor,
+        "preferences": save_preference(supabase, instructor["inst_id"], preference),
+    }
+
+
 # --- Rooms ---
 
 @app.get("/api/rooms")
@@ -662,7 +720,7 @@ async def delete_timeslot(timeslot_id: int, user_id: int = Depends(get_current_u
 
 @app.get("/api/prerequisites")
 async def list_prerequisites(user_id: int = Depends(get_current_user_id)):
-    return crud_list("course_req")
+    return crud_list("course_req", order_by="course_id,req_course_id")
 
 
 @app.post("/api/prerequisites")
