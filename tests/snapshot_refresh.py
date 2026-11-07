@@ -20,14 +20,14 @@ import sys
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
 
 from backend.database.db import supabase  # noqa: E402
+from backend.models.models import SCHEDULE_ROW_ORDER, schedule_row_sort_key  # noqa: E402
 
 FIXTURES = pathlib.Path(__file__).resolve().parent / "fixtures"
 PAGE = 1000
 
 # Only the columns the tests actually use -- keeps the snapshot small and makes
 # an unrelated schema addition a non-event.
-DETAIL_COLS = ("course_id", "section", "room_id", "timeslot_id",
-               "instructor_id", "sec_capacity")
+DETAIL_COLS = SCHEDULE_ROW_ORDER
 COURSE_COLS = ("course_id", "name", "course_type", "dept_id", "level", "course_class")
 ROOM_COLS = ("room_id", "capacity", "room_type", "building", "dept_id", "room_num",
              "room_desc")
@@ -63,10 +63,8 @@ def main():
         record["courses"] = _pick(row.get("courses") or {}, COURSE_COLS)
         snapshot.append(record)
 
-    # Stable ordering so the committed file diffs cleanly between refreshes.
-    snapshot.sort(key=lambda r: tuple(
-        (r[c] is None, str(r[c])) for c in DETAIL_COLS
-    ))
+    # The same order loader.py reads in, so snapshot and API runs see the same sections.
+    snapshot.sort(key=schedule_row_sort_key)
 
     payloads = {
         "schedule_1.json": snapshot,

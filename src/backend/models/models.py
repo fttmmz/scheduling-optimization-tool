@@ -6,6 +6,20 @@ def pattern_key(row):
     return (row["room_id"], row["timeslot_id"], row["sec_capacity"])
 
 
+SCHEDULE_ROW_ORDER = ("course_id", "section", "room_id", "timeslot_id", "instructor_id", "sec_capacity")
+
+
+def schedule_row_sort_key(row):
+    """The one order schedule rows are read in, so a run gives the same result on every device.
+
+    The database returns rows in no promised order, and several algorithms depend on the order they
+    are given: on the real data, greedy left 33 sections unscheduled in the order Supabase returned
+    and 7 in this one. Sorts as text, so course "10" comes before "9". That has no scheduling
+    meaning, but it must stay: it is the order of the snapshot every benchmark number was measured on.
+    """
+    return tuple((row[column] is None, str(row[column])) for column in SCHEDULE_ROW_ORDER)
+
+
 def group_rows_by_pattern(rows):
     """Raw schedule rows -> {(course_id, section): {pattern_key: [rows]}}.
 
