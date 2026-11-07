@@ -1,5 +1,5 @@
 from backend.models.models import (
-    Room, Timeslot, build_sections, group_rows_by_pattern, section_info_index,
+    Room, Timeslot, build_sections, group_rows_by_pattern, schedule_row_sort_key, section_info_index,
 )
 from backend.database.db import supabase
 from backend.Optimization.constraints import (
@@ -19,7 +19,7 @@ def load_timeslots():
     zero-duration slots -- so no algorithm can assign one. They are not
     schedulable times; they mean "this activity has no fixed meeting time".
     """
-    res = supabase.table("timeslot").select("*").execute()
+    res = supabase.table("timeslot").select("*").order("timeslot_id").execute()
     return [
         timeslot
         for timeslot in (Timeslot(row) for row in res.data)
@@ -59,6 +59,8 @@ def load_section_info():
         res = (
             supabase.table("section_info")
             .select("course_id,section,campus,enrolment")
+            .order("course_id")
+            .order("section")
             .range(offset, offset + page - 1)
             .execute()
         )
@@ -82,6 +84,7 @@ def _fetch_schedule_rows(schedule_id):
             supabase.table("schedule_detailes")
             .select("*, courses(*)")
             .eq("schedule_id", schedule_id)
+            .order("detail_id")  # without an order, a row can land on two pages or on none
             .range(offset, offset + page_size - 1)
             .execute()
         )
@@ -91,6 +94,7 @@ def _fetch_schedule_rows(schedule_id):
             break
         offset += page_size
 
+    rows.sort(key=schedule_row_sort_key)
     return rows
 
 
