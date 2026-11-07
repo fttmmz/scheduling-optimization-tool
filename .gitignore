@@ -21,11 +21,15 @@ venv/
 # learning-to-rank datasets (~60 MB) -- rebuild with ml/build_ranking_dataset.py
 ml/data/
 ml/models/
+ml/data_registrar/
+ml/data_registrar_xfit/
+ml/models_registrar/
 
 
 #  local only, never commit. Regenerate with tests/snapshot_refresh.py
 tests/fixtures/
 institution_data.py
+figures/
 
 #docs 
 CLAUDE.md
