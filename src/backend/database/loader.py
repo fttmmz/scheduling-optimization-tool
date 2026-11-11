@@ -168,19 +168,25 @@ def save_schedule(schedule_items, schedule_detailes):
     if schedule_id is None:
         raise RuntimeError("Saved schedule metadata did not return an ID.")
 
+    # One row per INSTRUCTOR, the same shape as the base schedule. load_schedule()
+    # collapses the rows of one meeting block back into a single item carrying every
+    # instructor, so a team-taught class keeps all its teachers through a save/load.
+    # Writing only item.instructor_id kept the first and lost the rest.
     detail_records = []
     for item in schedule_items:
-        detail_records.append(
-            {
-                "schedule_id": schedule_id,
-                "course_id": item.course_id,
-                "section": item.section,
-                "instructor_id": item.instructor_id,
-                "room_id": item.room_id,
-                "timeslot_id": item.timeslot_id,
-                "sec_capacity": item.capacity,
-            }
-        )
+        instructor_ids = list(getattr(item, "instructor_ids", None) or [item.instructor_id])
+        for instructor_id in instructor_ids:
+            detail_records.append(
+                {
+                    "schedule_id": schedule_id,
+                    "course_id": item.course_id,
+                    "section": item.section,
+                    "instructor_id": instructor_id,
+                    "room_id": item.room_id,
+                    "timeslot_id": item.timeslot_id,
+                    "sec_capacity": item.capacity,
+                }
+            )
 
     detail_res = supabase.table("schedule_detailes").insert(detail_records).execute()
     if not getattr(detail_res, "data", None):
