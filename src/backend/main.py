@@ -2,6 +2,7 @@
 import time
 import uuid
 import asyncio
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional
 
@@ -18,6 +19,7 @@ from backend.Optimization.evaluation import (
     count_room_rule_violations,
     count_instructor_conflicts,
     count_room_conflicts,
+    count_scheduled_sections,
     count_sibling_conflicts,
     count_timeslot_guideline_conflicts,
     build_timeslot_guideline_cache,
@@ -130,9 +132,15 @@ class DeptIn(BaseModel):
 
 
 def get_schedule_for_user(schedule_id: int, user_id: int):
+    """The schedule's full metadata row, after checking it belongs to this user.
+
+    The whole row, not just the ids: GET /api/schedules/{id} returns it as the
+    schedule's metadata, and the Schedules page reads the name, algorithm,
+    fitness and counts from it.
+    """
     res = (
         supabase.table("schedule")
-        .select("schedule_id, user_id")
+        .select("*")
         .eq("schedule_id", schedule_id)
         .maybe_single()
         .execute()
@@ -185,30 +193,14 @@ async def get_current_instructor(user_id: int = Depends(get_current_user_id)) ->
     return instructor
 
 
-def run_optimization(algorithm: str, num_runs: int = 1, use_preferences: bool = False) -> Dict[str, Any]:
-    scheduling_data = get_scheduling_data()
-    if scheduling_data is None:
-        raise RuntimeError("Unable to load scheduling data from the database.")
+def enrich_schedule_items(schedule_items, rooms, timeslots) -> List[Dict[str, Any]]:
+    """ScheduleItems -> the JSON rows the frontend draws, with room and time details filled in.
 
-    tag_section_links(scheduling_data["sections"])
-    tag_intro_it_pairs(scheduling_data["sections"])
-
-    try:
-        engine = SchedulingEngine(algorithm, num_runs=num_runs)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    t0 = time.perf_counter()
-    schedule_items, scheduled, unscheduled_count = engine.run(scheduling_data)
-    exec_time = time.perf_counter() - t0
-
-    rooms = scheduling_data["rooms"]
-    timeslots = scheduling_data["timeslots"]
-    sections = scheduling_data["sections"]
-
+    `instructor_ids` carries every instructor on the class. `instructor_id` is only the
+    first, kept for older clients; a save that sent only it would drop the co-teachers.
+    """
     room_map = {r.id: r for r in rooms}
     timeslot_map = {ts.id: ts for ts in timeslots}
-
     enriched = []
     for item in schedule_items:
         room = room_map.get(item.room_id)
@@ -221,6 +213,7 @@ def run_optimization(algorithm: str, num_runs: int = 1, use_preferences: bool = 
                 "course_dept": item.course_dept,
                 "section": item.section,
                 "instructor_id": item.instructor_id,
+                "instructor_ids": list(item.instructor_ids),
                 "capacity": item.capacity,
                 "room_id": item.room_id,
                 "room_no": room.no if room else None,
@@ -232,6 +225,60 @@ def run_optimization(algorithm: str, num_runs: int = 1, use_preferences: bool = 
                 "end": ts.end if ts else None,
             }
         )
+    return enriched
+
+
+def run_optimization(algorithm: str, num_runs: int = 1, use_preferences: bool = False) -> Dict[str, Any]:
+    scheduling_data = load_scoring_data()
+
+    try:
+        engine = SchedulingEngine(algorithm, num_runs=num_runs)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    t0 = time.perf_counter()
+    schedule_items, scheduled, unscheduled_count = engine.run(scheduling_data)
+    exec_time = time.perf_counter() - t0
+
+    evaluation = evaluate_schedule(schedule_items, scheduling_data)
+    # The engine counts with the same count_scheduled_sections(); its figures are kept
+    # so this response cannot drift from what the engine printed for the run.
+    evaluation["scheduled"] = scheduled
+    evaluation["unscheduled"] = unscheduled_count
+
+    return {
+        "schedule": enrich_schedule_items(schedule_items, scheduling_data["rooms"], scheduling_data["timeslots"]),
+        **evaluation,
+        "exec_time": exec_time,
+        "preferences_requested": use_preferences,
+        # The optimizer does not use preferences yet. Set this from the real outcome once the
+        # penalties are in; the frontend warns the user for as long as it stays False on a request.
+        "preferences_applied": False,
+    }
+
+
+def load_scoring_data() -> Dict[str, Any]:
+    """Rooms, timeslots and sections, prepared exactly as run_optimization() prepares them."""
+    scheduling_data = get_scheduling_data()
+    if scheduling_data is None:
+        raise RuntimeError("Unable to load scheduling data from the database.")
+    tag_section_links(scheduling_data["sections"])
+    tag_intro_it_pairs(scheduling_data["sections"])
+    return scheduling_data
+
+
+def evaluate_schedule(schedule_items, scheduling_data: Dict[str, Any]) -> Dict[str, Any]:
+    """Every number the frontend shows about a schedule, measured by the backend's evaluator.
+
+    The one place a schedule is scored, whether it was just generated, saved after
+    hand edits, or is the manual base schedule. *schedule_items* must be full
+    ScheduleItems (level, course_class, campus, enrolment, instructor_ids): items built
+    from what a browser posts lack those and would be judged by the fallback rules,
+    which is why a save is scored on the rows reloaded with load_schedule().
+    """
+    rooms = scheduling_data["rooms"]
+    timeslots = scheduling_data["timeslots"]
+    sections = scheduling_data["sections"]
 
     ts_cache = build_timeslot_guideline_cache(sections, timeslots)
 
@@ -279,10 +326,12 @@ def run_optimization(algorithm: str, num_runs: int = 1, use_preferences: bool = 
         schedule_items, rooms, sections=sections, timeslots=timeslots, valid_timeslot_cache=ts_cache,
     )
 
+    # Same formula as SchedulingEngine.run().
+    scheduled = count_scheduled_sections(schedule_items, sections)
+
     return {
-        "schedule": enriched,
         "scheduled": scheduled,
-        "unscheduled": unscheduled_count,
+        "unscheduled": len(schedule_items) - scheduled,
         # `conflicts` now means HARD conflicts -- the count that decides whether
         # the timetable can be run at all. It used to be the flat total, which
         # mixed in soft violations and so never reached zero, leaving the UI
@@ -298,12 +347,7 @@ def run_optimization(algorithm: str, num_runs: int = 1, use_preferences: bool = 
             "total": round(room_penalty + time_penalty, 3),
         },
         "fitness": fitness_score,
-        "exec_time": exec_time,
         "total_sections": len(sections),
-        "preferences_requested": use_preferences,
-        # The optimizer does not use preferences yet. Set this from the real outcome once the
-        # penalties are in; the frontend warns the user for as long as it stays False on a request.
-        "preferences_applied": False,
     }
 
 
@@ -406,9 +450,13 @@ async def signup(request: SignupRequest):
         raise HTTPException(status_code=400, detail="Could not create account")
 
     auth_id = str(auth_response.user.id)
+    # The app has two roles, admin and instructor. Signup used to give "student",
+    # which the app does not have, and the frontend sent such accounts to the admin
+    # pages. A new account is an instructor: it sees only the Preferences page, which
+    # works once an admin links the account to an instructor record (instructor.user_id).
     profile_res = (
         supabase.table("user")
-        .insert({"auth_id": auth_id, "email": request.email, "role": "student"})
+        .insert({"auth_id": auth_id, "email": request.email, "role": "instructor"})
         .execute()
     )
 
@@ -514,22 +562,53 @@ async def get_job(job_id: str, user_id: int = Depends(get_current_user_id)):
     return {"status": "done", "timetable": result}
 
 
+def schedule_metrics_row(evaluation: Dict[str, Any]) -> Dict[str, Any]:
+    """The evaluation's numbers under the `schedule` table's column names."""
+    return {
+        "fitness_score": evaluation["fitness"],
+        "conflicts_count": evaluation["conflicts"],
+        "Scheduled": evaluation["scheduled"],
+        "unscheduled": evaluation["unscheduled"],
+    }
+
+
+def evaluation_breakdown(evaluation: Dict[str, Any]) -> Dict[str, Any]:
+    """The per-rule detail Compare charts, stored in `schedule.evaluation` (jsonb).
+
+    Only the tiered counts: the flat copies in conflict_detail exist for old
+    clients of /api/optimize and would just duplicate them here.
+    """
+    detail = evaluation.get("conflict_detail") or {}
+    return {
+        "hard": detail.get("hard", {}),
+        "soft": detail.get("soft", {}),
+        "soft_penalty": evaluation.get("soft_penalty"),
+        "total_sections": evaluation.get("total_sections"),
+    }
+
+
+# A plain `def`, not `async def`: FastAPI runs it in a worker thread, so the few
+# seconds of reloading and scoring don't freeze every other request.
 @app.post("/api/schedules")
-async def create_schedule(
+def create_schedule(
     request: ScheduleSaveRequest,
     user_id: int = Depends(get_current_user_id),
 ):
+    # fitness / conflicts / scheduled / unscheduled from the request are ignored:
+    # after a hand edit they are the browser's guess, not a measurement. The
+    # backend scores the saved rows itself below. exec_time is kept; only the
+    # client saw how long the run took end to end.
     schedule_detailes = {
         "sch_name": request.name,
         "alg": request.algorithm,
         "semester": request.semester,
-        "fitness_score": request.fitness,
-        "conflicts": request.conflicts,
+        "fitness_score": None,
+        "conflicts": None,
         "exec_time": request.exec_time,
         "user_id": user_id,
         "rule_set": None,
-        "Scheduled": request.scheduled,
-        "unscheduled": request.unscheduled,
+        "Scheduled": None,
+        "unscheduled": None,
     }
 
     class _Item:
@@ -537,6 +616,11 @@ async def create_schedule(
             self.course_id = d.get("course_id")
             self.section = d.get("section")
             self.instructor_id = d.get("instructor_id")
+            # Every instructor on the class. An older client sends only instructor_id.
+            ids = d.get("instructor_ids")
+            if ids is None:
+                ids = [self.instructor_id] if self.instructor_id is not None else []
+            self.instructor_ids = list(ids)
             self.room_id = d.get("room_id")
             self.timeslot_id = d.get("timeslot_id")
             self.capacity = d.get("capacity")
@@ -548,7 +632,87 @@ async def create_schedule(
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
-    return {"status": "success", **result}
+    # Score what was actually stored: reload it the way any saved schedule is
+    # read, so each item regains level, course_class, campus and enrolment from
+    # the database. The numbers saved are then the numbers a later reload gives.
+    schedule_id = result["schedule"]["schedule_id"]
+    try:
+        evaluation = evaluate_schedule(load_schedule(schedule_id), load_scoring_data())
+        metrics = schedule_metrics_row(evaluation)
+    except Exception as exc:
+        # The rows are saved; only the measurement failed. Say so rather than
+        # store a guess. The schedule shows "—" until it is measured.
+        return {"status": "success", **result, "measured": False, "measure_error": str(exc)}
+
+    # The per-rule breakdown goes in the `evaluation` jsonb column, added by
+    # hand in Supabase (alter table public.schedule add column evaluation jsonb).
+    # Without the column the update is rejected; the headline numbers are then
+    # saved on their own, so a missing column never loses the measurement.
+    breakdown_saved = True
+    try:
+        supabase.table("schedule").update(
+            {**metrics, "evaluation": evaluation_breakdown(evaluation)}
+        ).eq("schedule_id", schedule_id).execute()
+    except Exception:
+        breakdown_saved = False
+        supabase.table("schedule").update(metrics).eq("schedule_id", schedule_id).execute()
+
+    result["schedule"].update(metrics)
+    if breakdown_saved:
+        result["schedule"]["evaluation"] = evaluation_breakdown(evaluation)
+    return {"status": "success", **result, "measured": True, "breakdown_saved": breakdown_saved,
+            "evaluation": evaluation}
+
+
+# The manual schedule the registrar actually ran: the feasibility reference and
+# the baseline every algorithm is compared with (see CLAUDE.md, "Project scope").
+BASE_SCHEDULE_ID = 10
+
+# Schedule 10 never changes, so it is loaded and scored once per server process.
+# Compare asks for its metrics and its rows at the same moment; the lock makes the
+# second request wait for the first instead of doing the same 20 seconds of work.
+_baseline_cache: Dict[str, Any] = {}
+_baseline_lock = threading.Lock()
+
+
+def baseline() -> Dict[str, Any]:
+    """{"row": schedule-row-shaped metrics, "items": enriched rows} for the manual schedule."""
+    with _baseline_lock:
+        if "row" not in _baseline_cache:
+            res = (
+                supabase.table("schedule")
+                .select("schedule_id, name, alg_name, created_at")
+                .eq("schedule_id", BASE_SCHEDULE_ID)
+                .maybe_single()
+                .execute()
+            )
+            if not res or not res.data:
+                raise HTTPException(status_code=404, detail="Base schedule not found")
+            items = load_schedule(BASE_SCHEDULE_ID)
+            data = load_scoring_data()
+            evaluation = evaluate_schedule(items, data)
+            _baseline_cache["items"] = enrich_schedule_items(items, data["rooms"], data["timeslots"])
+            _baseline_cache["row"] = {
+                **res.data,
+                **schedule_metrics_row(evaluation),
+                "evaluation": evaluation_breakdown(evaluation),
+                "exec_time": None,
+                "baseline": True,
+            }
+        return _baseline_cache
+
+
+# Declared before /api/schedules/{schedule_id}, which would otherwise try to read
+# "baseline" as an id. A plain `def` for the same reason as create_schedule().
+@app.get("/api/schedules/baseline")
+def get_baseline_schedule(user_id: int = Depends(get_current_user_id)):
+    """The manual base schedule's metrics, measured by the same evaluator as every saved schedule.
+
+    Shaped like a `schedule` row so the frontend reads it with the same code. It
+    belongs to another account, so it is read here without the owner check; it is
+    never modified. Its rows come from GET /api/schedules/{BASE_SCHEDULE_ID}.
+    """
+    return baseline()["row"]
 
 
 @app.get("/api/schedules")
@@ -564,37 +728,18 @@ async def list_schedules(user_id: int = Depends(get_current_user_id)):
 
 
 @app.get("/api/schedules/{schedule_id}")
-async def get_schedule(schedule_id: int, user_id: int = Depends(get_current_user_id)):
+def get_schedule(schedule_id: int, user_id: int = Depends(get_current_user_id)):
+    # The manual schedule is readable by every signed-in user (Compare's side A)
+    # though it belongs to another account; it is served from the cache, read-only.
+    if schedule_id == BASE_SCHEDULE_ID:
+        cached = baseline()
+        return {"metadata": cached["row"], "schedule": cached["items"]}
+
     metadata = get_schedule_for_user(schedule_id, user_id)
     schedule_items = load_schedule(schedule_id)
 
-    scheduling_data = get_scheduling_data()
-    room_map = {r.id: r for r in scheduling_data["rooms"]}
-    timeslot_map = {ts.id: ts for ts in scheduling_data["timeslots"]}
-
-    enriched = []
-    for item in schedule_items:
-        room = room_map.get(item.room_id)
-        ts = timeslot_map.get(item.timeslot_id)
-        enriched.append(
-            {
-                "course_id": item.course_id,
-                "course_name": item.course_name,
-                "course_type": item.course_type,
-                "course_dept": item.course_dept,
-                "section": item.section,
-                "instructor_id": item.instructor_id,
-                "capacity": item.capacity,
-                "room_id": item.room_id,
-                "room_no": room.no if room else None,
-                "room_type": room.type if room else None,
-                "room_building": room.building if room else None,
-                "timeslot_id": item.timeslot_id,
-                "day": ts.day if ts else None,
-                "start": ts.start if ts else None,
-                "end": ts.end if ts else None,
-            }
-        )
+    scheduling_data = load_scoring_data()
+    enriched = enrich_schedule_items(schedule_items, scheduling_data["rooms"], scheduling_data["timeslots"])
 
     return {"metadata": metadata, "schedule": enriched}
 
