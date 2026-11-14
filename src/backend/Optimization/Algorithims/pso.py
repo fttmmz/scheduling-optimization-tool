@@ -1,5 +1,4 @@
 
-
 import random
 import copy
 import statistics
@@ -44,8 +43,13 @@ from backend.Optimization.evaluation import (
 )
 from backend.Optimization.Algorithims.grasp import scan_candidates
 from backend.Optimization.benchmark_seeds import seed_all, seed_for_run
+from backend.Optimization.instructor_preferences import (
+    current_preference_config, preference_run_context, preference_penalty,
+    PreferenceRunConfig,
+)
+from backend.Optimization.evaluation import count_hard_conflicts, count_scheduled_sections
 
-#parameters
+# parameters
 N_PARTICLES = 10  # Chen & Shih (2013) used 30 (best of 5..35, 6000 generations); 30 here ran 362s vs ~162s
 ITERATIONS = 14  # NOT theirs: 30 x 6000 decodes would take days per run at 3,270 sections
 NO_IMPROVE_LIMIT = 5
@@ -77,10 +81,10 @@ VELOCITY_INIT_RANGE = 0.5
 # Decode: continuous priority vector -> discrete timetable
 
 def _bounded_candidates(
-    section, rooms, timeslots,
-    occupied_instructors, occupied_rooms,
-    room_sample_size, timeslot_sample_size,
-    valid_timeslot_cache=None,
+        section, rooms, timeslots,
+        occupied_instructors, occupied_rooms,
+        room_sample_size, timeslot_sample_size,
+        valid_timeslot_cache=None,
 ):
     """
     Scan a bounded random sample first, falling back to the full
@@ -113,11 +117,11 @@ def _bounded_candidates(
 
 
 def choose_best_assignment(
-    section, rooms, timeslots,
-    occupied_instructors, occupied_rooms,
-    valid_timeslot_cache=None,
+        section, rooms, timeslots,
+        occupied_instructors, occupied_rooms,
+        valid_timeslot_cache=None,
 ):
-    
+
     candidates = _bounded_candidates(
         section, rooms, timeslots,
         occupied_instructors, occupied_rooms,
@@ -132,7 +136,7 @@ def choose_best_assignment(
 
 
 def decode(position, section_candidates, valid_timeslot_cache):
-    
+
     order = np.argsort(-position)
     n = len(section_candidates)
     schedule = [None] * n
@@ -245,7 +249,7 @@ def rescue_unscheduled(schedule, section_candidates, valid_timeslot_cache):
         _build_occupancy_maps(schedule)
     )
 
-   
+
     unscheduled = []
     for idx, item in enumerate(schedule):
         needs = section_candidates[idx][1]
@@ -391,7 +395,7 @@ def pso_schedule(sections, timeslots, rooms, valid_timeslot_cache=None, section_
                 pbest_pos[i] = positions[i].copy()
 
             if score > gbest_score:
-               
+
                 refined_sched, refined_score = _refine(
                     sched, section_candidates, rooms, timeslots, sections, valid_timeslot_cache
                 )
@@ -421,6 +425,67 @@ def pso_schedule(sections, timeslots, rooms, valid_timeslot_cache=None, section_
     ), gbest_score
 
 
+def _preference_safe_local_search(schedule, section_candidates, timeslots, rooms, config,
+                                  max_trials=500, max_accepts=90):
+    """Improve preferences starting from a feasible OFF schedule.
+
+    Only move an already-scheduled meeting to one of its allowed timeslots.
+    Accept moves that strictly improve preference penalty without increasing
+    either hard conflicts or missing sections. Never mutate the baseline.
+    """
+    working = copy.deepcopy(schedule)
+    original_hard = count_hard_conflicts(working, rooms)
+    source_sections = [x[0] for x in section_candidates]
+    original_scheduled = count_scheduled_sections(working, source_sections)
+    current_penalty = preference_penalty(working, timeslots, config)
+    initial_penalty = current_penalty
+
+    # Match by stable meeting identity rather than assuming finalize_schedule
+    # kept the input section order.
+    candidate_by_key = {}
+    for section, needs, _, valid_ts in section_candidates:
+        key = (str(section.course.id), str(section.no), getattr(section, 'pattern_index', 0)) if hasattr(section, 'course') else None
+        if key is not None:
+            candidate_by_key[key] = (needs, valid_ts)
+
+    eligible = []
+    for idx, item in enumerate(working):
+        if item.timeslot_id is None:
+            continue
+        key = (str(item.course_id), str(item.section), getattr(item, 'pattern_index', 0))
+        entry = candidate_by_key.get(key)
+        if entry is None or not entry[0].time:
+            continue
+        alternatives = [ts.id for ts in entry[1] if ts.id != item.timeslot_id]
+        if alternatives:
+            eligible.append((idx, alternatives))
+
+    if not eligible:
+        print('PSO preference local search: no eligible moves; baseline retained.')
+        return working
+
+    rng = random.Random(7193)
+    accepted = 0
+    for _ in range(max_trials):
+        idx, alternatives = rng.choice(eligible)
+        old_slot = working[idx].timeslot_id
+        working[idx].timeslot_id = rng.choice(alternatives)
+        if (count_hard_conflicts(working, rooms) <= original_hard
+                and count_scheduled_sections(working, source_sections) >= original_scheduled):
+            new_penalty = preference_penalty(working, timeslots, config)
+            if new_penalty < current_penalty - 1e-9:
+                current_penalty = new_penalty
+                accepted += 1
+                if accepted >= max_accepts:
+                    break
+                continue
+        working[idx].timeslot_id = old_slot
+
+    print(f'PSO preference local search: accepted {accepted} moves; '
+          f'penalty {initial_penalty:.3f} -> {current_penalty:.3f}')
+    return working
+
+
 def pso_runs(sections, timeslots, rooms, num_runs=30, seeds=None):
     fitness_scores = []
     best_overall_schedule = None
@@ -439,12 +504,43 @@ def pso_runs(sections, timeslots, rooms, num_runs=30, seeds=None):
         # seeding only one of the two leaves half the run unreproducible.
         run_seed = seed_all(seed_for_run(run, seeds))
 
-        best_schedule, score = pso_schedule(
-            sections, timeslots, rooms,
-            valid_timeslot_cache=valid_timeslot_cache,
-            section_candidates=section_candidates,
-            seed=run_seed,
-        )
+        config = current_preference_config()
+        if config is not None and config.active:
+            # Run the original PSO with the SAME seed and no preference objective.
+            # This gives ON a strict feasibility reference for each seed.
+            off_config = PreferenceRunConfig(requested=False)
+            with preference_run_context(off_config):
+                seed_all(run_seed)
+                baseline, _ = pso_schedule(
+                    sections, timeslots, rooms,
+                    valid_timeslot_cache=valid_timeslot_cache,
+                    section_candidates=section_candidates,
+                    seed=run_seed,
+                )
+
+            # Optimize the feasible OFF schedule directly. Unlike a second PSO
+            # swarm, these local moves cannot sacrifice scheduled sections.
+            candidate = _preference_safe_local_search(
+                baseline, section_candidates, timeslots, rooms, config
+            )
+            base_penalty = preference_penalty(baseline, timeslots, config)
+            on_penalty = preference_penalty(candidate, timeslots, config)
+            best_schedule = candidate if on_penalty < base_penalty - 1e-9 else baseline
+            if best_schedule is baseline:
+                print('PSO preference safeguard: no feasible preference improvement found; '
+                      'retaining OFF baseline.')
+            score = calculate_fitness(
+                best_schedule, rooms, sections=sections, timeslots=timeslots,
+                valid_timeslot_cache=valid_timeslot_cache,
+            )
+        else:
+            # Original OFF path, unchanged.
+            best_schedule, score = pso_schedule(
+                sections, timeslots, rooms,
+                valid_timeslot_cache=valid_timeslot_cache,
+                section_candidates=section_candidates,
+                seed=run_seed,
+            )
 
         fitness_scores.append(score)
 

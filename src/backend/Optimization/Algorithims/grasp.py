@@ -3,6 +3,8 @@ import copy
 import statistics
 from collections import Counter
 
+from backend.Optimization.instructor_preferences import current_preference_config, preference_run_context
+from backend.Optimization.provisional_preference_penalty import InstructorPreferenceTracker
 from backend.models.models import ScheduleItem
 from backend.Optimization.constraints import (
     OverlapCounter,
@@ -163,11 +165,16 @@ def scan_candidates(
     section, rooms, timeslots,
     occupied_instructors, occupied_rooms,
     valid_timeslot_cache=None,
+    preference_tracker=None,
 ):
     candidates = []
     instructor_ids = instructor_occupancy_ids(section)
 
     for timeslot in timeslots:
+        preference_cost = (
+            preference_tracker.delta(section, timeslot)
+            if preference_tracker is not None else 0.0
+        )
         if any(
             (instructor_id, timeslot.id) in occupied_instructors
             for instructor_id in instructor_ids
@@ -189,6 +196,7 @@ def scan_candidates(
                 section, room, timeslot,
                 valid_timeslot_cache=valid_timeslot_cache,
             )
+            score -= preference_cost * SOFT_SCORE_SCALE
             candidates.append((score, room, timeslot))
 
     return candidates
@@ -201,6 +209,7 @@ def choose_grasp_assignment(
     section, rooms, timeslots,
     occupied_instructors, occupied_rooms,
     valid_timeslot_cache=None,
+    preference_tracker=None,
 ):
     room_sample = (
         rooms if len(rooms) <= CONSTRUCTION_ROOM_SAMPLE
@@ -215,6 +224,7 @@ def choose_grasp_assignment(
         section, room_sample, timeslot_sample,
         occupied_instructors, occupied_rooms,
         valid_timeslot_cache=valid_timeslot_cache,
+        preference_tracker=preference_tracker,
     )
 
     if not candidates:
@@ -225,6 +235,7 @@ def choose_grasp_assignment(
             section, rooms, timeslots,
             occupied_instructors, occupied_rooms,
             valid_timeslot_cache=valid_timeslot_cache,
+            preference_tracker=preference_tracker,
         )
 
     if not candidates:
@@ -251,6 +262,9 @@ def construct_grasp_solution(
     schedule = []
     occupied_rooms = OverlapSet()
     occupied_instructors = OverlapSet()
+    preference_tracker = InstructorPreferenceTracker.from_config(
+        timeslots, current_preference_config()
+    )
 
     for section, needs, viable_rooms, valid_ts in section_candidates:
 
@@ -263,9 +277,13 @@ def construct_grasp_solution(
             # other classes.
             room = None
             section_instructors = instructor_occupancy_ids(section)
+            time_options = (
+                sorted(valid_ts, key=lambda ts: preference_tracker.delta(section, ts))
+                if preference_tracker.weight else valid_ts
+            )
             timeslot = next(
                 (
-                    ts for ts in valid_ts
+                    ts for ts in time_options
                     if all((instructor_id, ts.id) not in occupied_instructors
                            for instructor_id in section_instructors)
                 ),
@@ -286,6 +304,7 @@ def construct_grasp_solution(
                 section, viable_rooms, valid_ts,
                 occupied_instructors, occupied_rooms,
                 valid_timeslot_cache=valid_timeslot_cache,
+                preference_tracker=preference_tracker,
             )
 
         item = ScheduleItem.from_section(
@@ -295,6 +314,7 @@ def construct_grasp_solution(
         )
 
         schedule.append(item)
+        preference_tracker.add(section, timeslot)
 
         # A roomless section still consumes its instructor's time, so book the
         # instructor whenever a timeslot was assigned -- not only when a room was.
@@ -391,12 +411,19 @@ def local_search(
     # double-booking for a handful of soft blemishes -- the flat conflict count
     # this used to run on made those exactly interchangeable.
     total_hard = count_hard_conflicts(best_schedule)
+    preference_config = current_preference_config()
+    preference_tracker = InstructorPreferenceTracker.from_config(timeslots, preference_config)
+    if preference_tracker.weight:
+        for item in best_schedule:
+            preference_tracker.add(item, timeslot_map.get(item.timeslot_id))
     total_soft = total_soft_penalty(best_schedule, rooms) + (
         count_timeslot_guideline_conflicts(
             best_schedule, sections, timeslots,
             valid_timeslot_cache=valid_timeslot_cache,
         ) * TIMESLOT_GUIDELINE_PENALTY
-    ) + total_time_penalty(best_schedule, timeslots)
+    ) + total_time_penalty(best_schedule, timeslots) + (
+        preference_tracker.weight * preference_tracker.total()
+    )
 
     def fitness_from(hard, soft):
         """Mirrors evaluation.calculate_fitness so the score GRASP optimizes is
@@ -483,6 +510,10 @@ def local_search(
                         timeslot_map,
                     )
                     soft_delta = new_local - old_local
+                    if preference_tracker.weight:
+                        soft_delta += preference_tracker.move_delta(
+                            item, timeslot_map[original_timeslot_id], timeslot
+                        )
                     hard_delta = 0
 
                     old_room_count = room_occupancy.overlapping((original_room_id, original_timeslot_id))
@@ -512,6 +543,9 @@ def local_search(
                         + soft_delta * SOFT_PENALTY_WEIGHT / SOFT_PENALTY_REFERENCE
                     )
 
+                    # Preference improvements must not introduce new hard conflicts.
+                    if preference_tracker.weight and total_hard + hard_delta > total_hard:
+                        continue
                     if delta < best_delta:
                         best_delta = delta
                         best_move = (room, timeslot, hard_delta, soft_delta)
@@ -535,6 +569,10 @@ def local_search(
                         ] -= 1
                         instructor_occupancy[(instructor_id, timeslot.id)] += 1
 
+                    if preference_tracker.weight:
+                        preference_tracker.move(
+                            item, timeslot_map[original_timeslot_id], timeslot
+                        )
                     item.room_id = room.id
                     item.timeslot_id = timeslot.id
 
@@ -633,18 +671,41 @@ def grasp_runs(sections, timeslots, rooms, num_runs=30, seeds=None):
         build_section_candidates(sections, rooms, timeslots)
     )
 
+    config = current_preference_config()
+    preference_on = config is not None and config.active
+    if preference_on:
+        from backend.Optimization.preference_refinement import refine_preferences
+
     for run in range(num_runs):
 
         # Shared benchmark seeds: run i uses the same seed for every algorithm.
         run_seed = seed_all(seed_for_run(run, seeds))
 
-        best_schedule, score = grasp_schedule(  # score already computed
-            sections,
-            timeslots,
-            rooms,
-            valid_timeslot_cache=valid_timeslot_cache,
-            section_candidates=section_candidates,
-        )
+        # Keep the original GRASP search identical to OFF, including its
+        # random stream; then apply a bounded, targeted preference refinement.
+        # This avoids the costly preference-aware GRASP construction/local-search
+        # path that previously stalled on the full dataset.
+        if preference_on:
+            with preference_run_context(None):
+                best_schedule, score = grasp_schedule(
+                    sections, timeslots, rooms,
+                    valid_timeslot_cache=valid_timeslot_cache,
+                    section_candidates=section_candidates,
+                )
+            best_schedule = refine_preferences(
+                best_schedule, sections, timeslots, rooms,
+                seed=run_seed or 1, label='GRASP',
+            )
+            score = calculate_fitness(
+                best_schedule, rooms, sections=sections, timeslots=timeslots,
+                valid_timeslot_cache=valid_timeslot_cache,
+            )
+        else:
+            best_schedule, score = grasp_schedule(
+                sections, timeslots, rooms,
+                valid_timeslot_cache=valid_timeslot_cache,
+                section_candidates=section_candidates,
+            )
 
         fitness_scores.append(score)
 

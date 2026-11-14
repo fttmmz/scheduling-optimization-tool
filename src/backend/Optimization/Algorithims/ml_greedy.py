@@ -30,6 +30,7 @@ Why it beats GRASP with the same score: GRASP scores only a random 15 rooms x
 15 timeslots per section and then picks at random among its top 3.
 """
 import csv
+import copy
 import os
 import random
 import statistics
@@ -44,12 +45,16 @@ from backend.Optimization.constraints import (
     room_soft_penalty,
     seats_needed,
     time_soft_penalty,
+    get_valid_timeslots,
 )
 from backend.Optimization.Algorithims import grasp
 from backend.Optimization.benchmark_seeds import seed_all, seed_for_run
+from backend.Optimization.instructor_preferences import current_preference_config, preference_penalty
 from backend.Optimization.evaluation import (
     build_timeslot_guideline_cache,
     calculate_fitness,
+    count_hard_conflicts,
+    count_scheduled_sections,
 )
 
 SOFT_SCORE_SCALE = grasp.SOFT_SCORE_SCALE              # 50 points per penalty unit
@@ -237,6 +242,65 @@ def construct_ml_greedy(section_candidates, room_scores, valid_timeslot_cache, r
     return schedule
 
 
+
+def _improve_instructor_preferences(schedule, sections, timeslots, rooms, seed):
+    """Conservative preference-only local refinement of the completed ML schedule.
+
+    Every accepted move preserves the exact number of scheduled sections and
+    the hard-conflict count. OFF never enters this routine.
+    """
+    config = current_preference_config()
+    if config is None or not config.active:
+        return schedule
+
+    original = copy.deepcopy(schedule)
+    working = copy.deepcopy(schedule)
+    baseline_hard = count_hard_conflicts(original, rooms)
+    baseline_scheduled = count_scheduled_sections(original, sections)
+    current_penalty = preference_penalty(working, timeslots, config)
+    start_penalty = current_penalty
+    section_map = {(sec.course.id, str(sec.no)): sec for sec in sections}
+    rng = random.Random(seed)
+    indexes = [i for i, item in enumerate(working)
+               if item.timeslot_id is not None
+               and any(str(inst) in config.by_instructor
+                       for inst in instructor_occupancy_ids(item))]
+    rng.shuffle(indexes)
+    accepted = 0
+    # Bounded local search avoids excessive repeated global penalty calculations.
+    for idx in indexes[:180]:
+        item = working[idx]
+        sec = section_map.get((item.course_id, str(item.section)))
+        if sec is None:
+            continue
+        candidate_slots = [ts for ts in get_valid_timeslots(sec, timeslots)
+                           if ts.id != item.timeslot_id]
+        rng.shuffle(candidate_slots)
+        old_slot = item.timeslot_id
+        for ts in candidate_slots[:12]:
+            item.timeslot_id = ts.id
+            if count_hard_conflicts(working, rooms) != baseline_hard:
+                item.timeslot_id = old_slot
+                continue
+            if count_scheduled_sections(working, sections) != baseline_scheduled:
+                item.timeslot_id = old_slot
+                continue
+            new_penalty = preference_penalty(working, timeslots, config)
+            if new_penalty + 1e-8 < current_penalty:
+                current_penalty = new_penalty
+                accepted += 1
+                break
+            item.timeslot_id = old_slot
+    if (count_hard_conflicts(working, rooms) > baseline_hard
+            or count_scheduled_sections(working, sections) < baseline_scheduled
+            or current_penalty >= start_penalty):
+        print('ML-Greedy preference safeguard: retaining original timetable')
+        return original
+    print(f'ML-Greedy preferences: accepted {accepted} timeslot moves; '
+          f'penalty {start_penalty:.2f} -> {current_penalty:.2f}')
+    return working
+
+
 def ml_greedy_schedule(sections, timeslots, rooms, seed=None, score_source=None,
                        valid_timeslot_cache=None, section_candidates=None):
     """One finalized schedule."""
@@ -249,7 +313,8 @@ def ml_greedy_schedule(sections, timeslots, rooms, seed=None, score_source=None,
     room_scores = load_room_scores(score_source or DEFAULT_SCORE_SOURCE)
     schedule = construct_ml_greedy(section_candidates, room_scores, valid_timeslot_cache,
                                    random.Random(seed))
-    return finalize_schedule(schedule, sections, timeslots, valid_timeslot_cache, rooms=rooms)
+    finalized = finalize_schedule(schedule, sections, timeslots, valid_timeslot_cache, rooms=rooms)
+    return _improve_instructor_preferences(finalized, sections, timeslots, rooms, seed)
 
 
 def ml_greedy_runs(sections, timeslots, rooms, num_runs=1, seeds=None, score_source=None):
