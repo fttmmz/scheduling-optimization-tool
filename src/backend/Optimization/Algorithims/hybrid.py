@@ -9,13 +9,13 @@ This implementation follows a simple two-stage hybrid design:
 
 References
 ----------
-- Al-Betar, M. A., Khader, A. T., & Zaman, M. (2016).
-  "A Utilization-based Genetic Algorithm for Solving the University
-  Timetabling Problem (UGA)."
-  Alexandria Engineering Journal, 55(2), 1395-1409.
-  https://doi.org/10.1016/j.aej.2016.02.017
-  -> Genetic Algorithm applied to university timetabling using population,
-     crossover, mutation, fitness evaluation, and scheduling constraints.
+ - Abdelhalim, E. A., & El Khayat, G. A. (2016).
+   "A Utilization-based Genetic Algorithm for Solving the University
+   Timetabling Problem (UGA)."
+   Alexandria Engineering Journal, 55(2), 1395-1409.
+   https://doi.org/10.1016/j.aej.2016.02.017
+   -> Genetic Algorithm for university timetabling using population,
+      crossover, mutation, fitness evaluation, and scheduling constraints.
 
 - Jat, S. N., & Yang, S. (2012).
   "Genetic Algorithm with Search Bank Strategies for University Course
@@ -59,6 +59,8 @@ from backend.Optimization.constraints import (
     time_soft_penalty,
 )
 from backend.Optimization.benchmark_seeds import seed_all, seed_for_run
+from backend.Optimization.instructor_preferences import current_preference_config
+from backend.Optimization.provisional_preference_penalty import InstructorPreferenceTracker
 from backend.Optimization.evaluation import (
     build_timeslot_guideline_cache,
     calculate_fitness,
@@ -373,7 +375,6 @@ class Occupancy:
 
 # ============================================================
 # GENETIC ALGORITHM
-# Holland (1975); Goldberg (1989)
 # ============================================================
 
 def create_population(size, sections, requirements, candidates):
@@ -561,7 +562,6 @@ def genetic_schedule(sections, timeslots, rooms, requirements, candidates, cache
 
 # ============================================================
 # TABU SEARCH
-# Glover (1989): neighborhood moves, tabu memory, tenure, aspiration.
 # ============================================================
 
 def tabu_search(schedule, sections, rooms, timeslots, requirements, candidates):
@@ -844,6 +844,126 @@ def tabu_search(schedule, sections, rooms, timeslots, requirements, candidates):
 
 
 # ============================================================
+# INSTRUCTOR PREFERENCES: ON-ONLY FINAL REFINEMENT
+# The original GA + Tabu Search code above remains unchanged.
+# ============================================================
+
+def refine_preferences_after_hybrid(schedule, sections, rooms, timeslots,
+                                    valid_timeslot_cache=None, passes=2,
+                                    candidate_limit=80):
+    """Improve teaching times only when instructor preferences are active.
+
+    Use the same temporary instructor-preference tracker as the other
+    algorithms. Keep rooms and scheduled/unscheduled status unchanged.
+    Evaluate only valid, conflict-free destination slots; revert the entire
+    refinement if hard conflicts, completeness, preference penalty, or
+    preference-aware fitness becomes worse.
+
+    The function deliberately does nothing for preferences OFF / lambda=0,
+    without consuming random numbers or touching the original GA/TS logic.
+    """
+    config = current_preference_config()
+    if not (config and config.active and schedule and timeslots
+            and passes > 0 and candidate_limit > 0):
+        return schedule
+
+    from backend.Optimization.constraints import instructor_occupancy_ids
+
+    initial_hard = count_hard_conflicts(schedule, rooms)
+    initial_scheduled = count_scheduled_sections(schedule, sections)
+    initial_preference = config.calculator(schedule, timeslots, config.by_instructor)
+    initial_fitness = calculate_fitness(
+        schedule, rooms, sections=sections, timeslots=timeslots,
+        valid_timeslot_cache=valid_timeslot_cache,
+    )
+    original_times = [item.timeslot_id for item in schedule]
+    slots_by_id = {ts.id: ts for ts in timeslots}
+    tracker = InstructorPreferenceTracker.from_config(timeslots, config)
+    occ = Occupancy(schedule)
+    eligible = []
+    for index, (item, section) in enumerate(zip(schedule, sections)):
+        if item.timeslot_id in slots_by_id:
+            tracker.add(item, slots_by_id[item.timeslot_id])
+            if classify_section(section) in (
+                NEEDS_ROOM_AND_TIME, NEEDS_TIME_ONLY
+            ) and any(str(inst) in config.by_instructor
+                      for inst in instructor_occupancy_ids(item)):
+                eligible.append(index)
+
+    # Cache the candidate list once per section, not once per pass.
+    candidates = {
+        index: list(get_valid_timeslots(sections[index], timeslots))
+        for index in eligible
+    }
+    moves = 0
+    for _ in range(passes):
+        changed = False
+        for index in eligible:
+            item = schedule[index]
+            old_slot = slots_by_id.get(item.timeslot_id)
+            if old_slot is None:
+                continue
+            old_time_cost = time_soft_penalty(sections[index], old_slot)
+            ranked = []
+            for new_slot in candidates[index]:
+                if new_slot.id == old_slot.id:
+                    continue
+                preference_delta = tracker.move_delta(item, old_slot, new_slot)
+                if preference_delta >= -1e-9:
+                    continue
+                combined_delta = (
+                    preference_delta
+                    + time_soft_penalty(sections[index], new_slot)
+                    - old_time_cost
+                )
+                if combined_delta < -1e-9:
+                    ranked.append((combined_delta, preference_delta,
+                                   new_slot.id, new_slot))
+            if not ranked:
+                continue
+            ranked.sort(key=lambda row: (row[0], row[1], row[2]))
+
+            # Remove this section from the occupancy index while testing.
+            # The room stays unchanged; only its teaching time can move.
+            occ.remove(index)
+            chosen = None
+            for _, _, _, new_slot in ranked[:candidate_limit]:
+                if occ.hard_cost(index, item.room_id, new_slot.id) == 0:
+                    chosen = new_slot
+                    break
+            if chosen is not None:
+                tracker.move(item, old_slot, chosen)
+                item.timeslot_id = chosen.id
+                changed = True
+                moves += 1
+            occ.add(index)
+        if not changed:
+            break
+
+    if moves:
+        final_hard = count_hard_conflicts(schedule, rooms)
+        final_scheduled = count_scheduled_sections(schedule, sections)
+        final_preference = config.calculator(
+            schedule, timeslots, config.by_instructor
+        )
+        final_fitness = calculate_fitness(
+            schedule, rooms, sections=sections, timeslots=timeslots,
+            valid_timeslot_cache=valid_timeslot_cache,
+        )
+        if (final_hard > initial_hard
+                or final_scheduled != initial_scheduled
+                or final_preference > initial_preference + 1e-8
+                or final_fitness + 1e-8 < initial_fitness):
+            for item, original in zip(schedule, original_times):
+                item.timeslot_id = original
+            print('[GA+TS preferences] Refinement rolled back after safety check')
+        else:
+            print(f'[GA+TS preferences] Accepted {moves} timeslot moves; '
+                  f'penalty {initial_preference:.2f} -> {final_preference:.2f}')
+    return schedule
+
+
+# ============================================================
 # MAIN GA + TS FUNCTIONS
 # ============================================================
 
@@ -892,7 +1012,16 @@ def hybrid_schedule(sections, timeslots, rooms, cache=None):
     # per-item with no cross-block state. finalize_schedule repairs both, and
     # only ever moves a block into a slot/room that is genuinely free, so it
     # can improve the schedule but never break it.
-    return finalize_schedule(best, sections, timeslots, cache, rooms=rooms)
+    finalized = finalize_schedule(best, sections, timeslots, cache, rooms=rooms)
+    # Only the preference-enabled path performs the additional improvement.
+    # OFF still returns the exact same finalized schedule as before.
+    config = current_preference_config()
+    if config and config.active:
+        return refine_preferences_after_hybrid(
+            finalized, sections, rooms, timeslots,
+            valid_timeslot_cache=cache,
+        )
+    return finalized
 
 
 def genetic_runs(sections, timeslots, rooms, num_runs=1, seeds=None):
@@ -942,7 +1071,14 @@ def genetic_runs(sections, timeslots, rooms, num_runs=1, seeds=None):
             valid_timeslot_cache=cache,
         )
 
-        key = (unscheduled, hard, soft, -fitness)
+        # Keep the original multi-run ranking exactly when preferences are OFF.
+        # When ON, compare runs by completeness, hard feasibility, and the
+        # shared preference-aware fitness rather than the old soft score alone.
+        config = current_preference_config()
+        if config and config.active:
+            key = (unscheduled, hard, -fitness)
+        else:
+            key = (unscheduled, hard, soft, -fitness)
 
         print(
             f"[GA+TS] run={run + 1} seed={run_seed} runtime={runtime:.2f}s "

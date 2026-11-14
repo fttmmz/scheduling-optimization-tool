@@ -1,6 +1,10 @@
 # CONFLICT COUNTING  (for schedule scoring / comparison)
 from collections import Counter, defaultdict
 
+from backend.Optimization.instructor_preferences import (
+    current_preference_config, preference_penalty,
+)
+
 from backend.Optimization.constraints import (
     registrar_guideline_ids,
     classify_section,
@@ -23,13 +27,14 @@ from backend.Optimization.constraints import (
 
 # ── Scoring tiers ────────────────────────────────────────────────────────────
 
-HARD_CONFLICT_WEIGHT = 3.0    # room/instructor double-booking: never acceptable
-UNSCHEDULED_WEIGHT = 2.0      # a missing class is worse than a compromised one
-SOFT_PENALTY_WEIGHT = 0.5     # bent soft rules: real, but recoverable
+HARD_CONFLICT_WEIGHT = 3.0  # room/instructor double-booking: never acceptable
+UNSCHEDULED_WEIGHT = 2.0  # a missing class is worse than a compromised one
+SOFT_PENALTY_WEIGHT = 0.5  # bent soft rules: real, but recoverable
 
 # Divisor that maps the average per-section soft penalty into roughly [0, 1].
 # ~10 penalty units is a section that breaks essentially every soft rule.
 SOFT_PENALTY_REFERENCE = 10.0
+
 
 def _count_occupants(items) -> int:
     """How many distinct CLASSES occupy one (room|instructor, timeslot) slot.
@@ -170,6 +175,7 @@ def count_room_type_conflicts(schedule: list, rooms: list) -> int:
             conflicts += 1
     return conflicts
 
+
 def count_department_conflicts(schedule: list, rooms: list) -> int:
     room_map = {room.id: room for room in rooms}
     conflicts = 0
@@ -180,6 +186,7 @@ def count_department_conflicts(schedule: list, rooms: list) -> int:
         if room.dept_id and item.course_dept != room.dept_id:
             conflicts += 1
     return conflicts
+
 
 def count_capacity_conflicts(schedule: list, rooms: list) -> int:
     room_map = {room.id: room for room in rooms}
@@ -232,9 +239,9 @@ def count_hard_conflicts(schedule: list, rooms: list = None) -> int:
     not checked.
     """
     total = (
-        count_instructor_conflicts(schedule)
-        + count_room_conflicts(schedule)
-        + count_sibling_conflicts(schedule)
+            count_instructor_conflicts(schedule)
+            + count_room_conflicts(schedule)
+            + count_sibling_conflicts(schedule)
     )
     if rooms is not None:
         total += count_room_rule_violations(schedule, rooms)
@@ -322,53 +329,53 @@ def build_timeslot_guideline_cache(sections: list, timeslots: list) -> dict:
 
 
 def count_timeslot_guideline_conflicts(
-    schedule: list,
-    sections: list,
-    timeslots: list,
-    valid_timeslot_cache: dict = None,
+        schedule: list,
+        sections: list,
+        timeslots: list,
+        valid_timeslot_cache: dict = None,
 ) -> int:
     """
     Count sections assigned to timeslots that violate course-type guidelines.
-    
+
     Each course type has specific timeslot requirements (e.g. lectures on MW/TR,
     labs on single days, etc.). This function checks if each scheduled section's
     assigned timeslot matches the guidelines for its course type.
-    
+
     Returns the count of sections violating timeslot guidelines.
     """
     # Build lookup maps for fast access
     section_map = {(sec.course.id, str(sec.no)): sec for sec in sections}
     timeslot_map = {ts.id: ts for ts in timeslots}
-    
+
     if valid_timeslot_cache is None:
         valid_timeslot_cache = build_timeslot_guideline_cache(sections, timeslots)
-    
+
     conflicts = 0
     for item in schedule:
         # Skip if section has no timeslot assigned
         if item.timeslot_id is None:
             continue
-        
+
         # Get the section object and assigned timeslot
         section = section_map.get((item.course_id, item.section))
         timeslot = timeslot_map.get(item.timeslot_id)
-        
+
         if not section or not timeslot:
             continue
-        
+
         valid_ids = valid_timeslot_cache.get((item.course_id, item.section), set())
         if item.timeslot_id not in valid_ids:
             conflicts += 1
-    
+
     return conflicts
 
 
 def count_all_violations_flat(
-    schedule: list,
-    rooms: list,
-    sections: list = None,
-    timeslots: list = None,
-    valid_timeslot_cache: dict = None,
+        schedule: list,
+        rooms: list,
+        sections: list = None,
+        timeslots: list = None,
+        valid_timeslot_cache: dict = None,
 ) -> int:
     """
     Flat count of ALL rule violations, hard and soft alike, one point each.
@@ -389,14 +396,14 @@ def count_all_violations_flat(
     violations.
     """
     total = (
-        count_instructor_conflicts(schedule)
-        + count_room_conflicts(schedule)
-        + count_campus_conflicts(schedule, rooms)
-        + count_room_type_conflicts(schedule, rooms)
-        + count_department_conflicts(schedule, rooms)
-        + count_capacity_conflicts(schedule, rooms)
+            count_instructor_conflicts(schedule)
+            + count_room_conflicts(schedule)
+            + count_campus_conflicts(schedule, rooms)
+            + count_room_type_conflicts(schedule, rooms)
+            + count_department_conflicts(schedule, rooms)
+            + count_capacity_conflicts(schedule, rooms)
     )
-    
+
     # Add timeslot guideline conflicts if data provided
     if sections is not None and timeslots is not None:
         total += count_timeslot_guideline_conflicts(
@@ -405,7 +412,7 @@ def count_all_violations_flat(
             timeslots,
             valid_timeslot_cache=valid_timeslot_cache,
         )
-    
+
     return total
 
 
@@ -425,12 +432,13 @@ def count_scheduled_sections(schedule: list, sections: list) -> int:
 
 
 def calculate_fitness(
-    schedule: list,
-    rooms: list,
-    sections: list = None,
-    total_sections: int = None,
-    timeslots: list = None,
-    valid_timeslot_cache: dict = None,
+        schedule: list,
+        rooms: list,
+        sections: list = None,
+        total_sections: int = None,
+        timeslots: list = None,
+        valid_timeslot_cache: dict = None,
+        preference_config=None,
 ) -> float:
     """
     Tiered, normalized weighted-penalty fitness.
@@ -458,7 +466,7 @@ def calculate_fitness(
     # --- Setup ---
     if sections is not None:
         scheduled_count = count_scheduled_sections(schedule, sections)
-        total_sections  = len(sections)
+        total_sections = len(sections)
     else:
         scheduled_count = sum(
             1 for item in schedule
@@ -471,8 +479,8 @@ def calculate_fitness(
         return 0.0
 
     hard_conflicts = count_hard_conflicts(schedule, rooms)
-    unscheduled    = max(0, total_sections - scheduled_count)
-    soft_penalty   = total_soft_penalty(schedule, rooms)
+    unscheduled = max(0, total_sections - scheduled_count)
+    soft_penalty = total_soft_penalty(schedule, rooms)
 
     # Timeslot-guideline (duration/day) violations are a soft rule on the time
     # axis, so they join the soft tier rather than counting as hard conflicts.
@@ -484,23 +492,30 @@ def calculate_fitness(
             valid_timeslot_cache=valid_timeslot_cache,
         )
 
-    
     if timeslots is not None:
         soft_penalty += total_time_penalty(schedule, timeslots)
 
+    # Add the weighted instructor preference penalty when it is enabled.
+    # Otherwise, this contributes zero and preserves the original fitness.
+    # The run context supplies settings to existing algorithm calls.
+    if preference_config is None:
+        preference_config = current_preference_config()
+    soft_penalty += preference_penalty(schedule, timeslots, preference_config)
+
     # --- Normalize each tier by total sections ---
-    hard_rate        = hard_conflicts / total_sections
+    hard_rate = hard_conflicts / total_sections
     unscheduled_rate = unscheduled / total_sections
-    soft_rate        = soft_penalty / (total_sections * SOFT_PENALTY_REFERENCE)
+    soft_rate = soft_penalty / (total_sections * SOFT_PENALTY_REFERENCE)
 
     total_penalty = (
-        hard_rate * HARD_CONFLICT_WEIGHT
-        + unscheduled_rate * UNSCHEDULED_WEIGHT
-        + soft_rate * SOFT_PENALTY_WEIGHT
+            hard_rate * HARD_CONFLICT_WEIGHT
+            + unscheduled_rate * UNSCHEDULED_WEIGHT
+            + soft_rate * SOFT_PENALTY_WEIGHT
     )
 
     # --- Convert to fitness in (0, 1] ---
     return round(1.0 / (1.0 + total_penalty), 4)
+
 
 def debug_conflicts_ui(schedule, rooms, sections=None, timeslots=None, valid_timeslot_cache=None):
     try:
@@ -510,14 +525,14 @@ def debug_conflicts_ui(schedule, rooms, sections=None, timeslots=None, valid_tim
 
     st.subheader("Conflict Breakdown")
 
-    instructor  = count_instructor_conflicts(schedule)
-    room        = count_room_conflicts(schedule)
-    campus      = count_campus_conflicts(schedule, rooms)
-    room_type   = count_room_type_conflicts(schedule, rooms)
-    department  = count_department_conflicts(schedule, rooms)
-    capacity    = count_capacity_conflicts(schedule, rooms)
+    instructor = count_instructor_conflicts(schedule)
+    room = count_room_conflicts(schedule)
+    campus = count_campus_conflicts(schedule, rooms)
+    room_type = count_room_type_conflicts(schedule, rooms)
+    department = count_department_conflicts(schedule, rooms)
+    capacity = count_capacity_conflicts(schedule, rooms)
     timeslot_violations = 0
-    
+
     # Include timeslot guideline conflicts if data available
     if sections is not None and timeslots is not None:
         timeslot_violations = count_timeslot_guideline_conflicts(
@@ -526,20 +541,20 @@ def debug_conflicts_ui(schedule, rooms, sections=None, timeslots=None, valid_tim
             timeslots,
             valid_timeslot_cache=valid_timeslot_cache,
         )
-    
+
     total = instructor + room + campus + room_type + department + capacity + timeslot_violations
 
     col1, col2 = st.columns(2)
 
     with col1:
         st.metric("Instructor Conflicts", instructor)
-        st.metric("Room Conflicts",       room)
-        st.metric("Campus Conflicts",     campus)
+        st.metric("Room Conflicts", room)
+        st.metric("Campus Conflicts", campus)
 
     with col2:
-        st.metric("Room Type Conflicts",  room_type)
+        st.metric("Room Type Conflicts", room_type)
         st.metric("Department Conflicts", department)
-        st.metric("Capacity Conflicts",   capacity)
+        st.metric("Capacity Conflicts", capacity)
 
     # Show timeslot conflicts if applicable
     if timeslot_violations > 0 or (sections is not None and timeslots is not None):
@@ -558,11 +573,11 @@ def debug_conflicts_ui(schedule, rooms, sections=None, timeslots=None, valid_tim
         # show which constraint is the worst offender
         breakdown = {
             "Instructor": instructor,
-            "Room":       room,
-            "Campus":     campus,
-            "Room Type":  room_type,
+            "Room": room,
+            "Campus": campus,
+            "Room Type": room_type,
             "Department": department,
-            "Capacity":   capacity,
+            "Capacity": capacity,
         }
         if timeslot_violations > 0:
             breakdown["Timeslot Guidelines"] = timeslot_violations

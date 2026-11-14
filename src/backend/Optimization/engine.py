@@ -8,6 +8,9 @@ from backend.Optimization.Algorithims.rl_scheduler import rl_runs
 from backend.Optimization.Algorithims.alns import alns_runs
 from backend.Optimization.Algorithims.simulated_annealing import simulated_annealing_runs
 from backend.Optimization.evaluation import count_scheduled_sections
+from backend.Optimization.instructor_preferences import (
+    PreferenceRunConfig, preference_run_context,
+)
 
 ALGORITHM_REGISTRY = {
     "greedy": greedy_schedule,
@@ -23,7 +26,8 @@ ALGORITHM_REGISTRY = {
 
 
 class SchedulingEngine:
-    def __init__(self, algorithm_name: str, num_runs: int = 1, seeds=None):
+    def __init__(self, algorithm_name: str, num_runs: int = 1, seeds=None,
+                 preference_config: PreferenceRunConfig = None):
         if algorithm_name not in ALGORITHM_REGISTRY:
             raise ValueError(
                 f"Unknown algorithm '{algorithm_name}'. "
@@ -35,6 +39,7 @@ class SchedulingEngine:
         # Benchmarking only. Left None by the API, which does not need reproducible output;
         # pass benchmark_seeds.SEEDS when producing numbers for the paper (ALGORITHM_GUIDE 9).
         self.seeds = seeds
+        self.preference_config = preference_config
 
     def run(self, data: dict) -> list:
         if data is None:
@@ -53,14 +58,15 @@ class SchedulingEngine:
             f"(num_runs={self.num_runs}) on {len(sections)} sections, "
             f"{len(timeslots)} timeslots, {len(rooms)} rooms"
         )
-        if self.algorithm_name in ("genetic", "hybrid", "grasp", "pso", "alns", "simulated_annealing","ml_greedy", "rl"):
-            kwargs = {"num_runs": self.num_runs}
-            if self.seeds is not None:
-                kwargs["seeds"] = self.seeds
-            result = self.algorithm(sections, timeslots, rooms, **kwargs)
-        else:
-            result = self.algorithm(sections, timeslots, rooms)
-
+        # Run-local settings: do not leak one user's preferences into another job.
+        with preference_run_context(self.preference_config):
+            if self.algorithm_name in ("genetic", "hybrid", "grasp", "pso", "alns", "simulated_annealing","ml_greedy", "rl"):
+                kwargs = {"num_runs": self.num_runs}
+                if self.seeds is not None:
+                    kwargs["seeds"] = self.seeds
+                result = self.algorithm(sections, timeslots, rooms, **kwargs)
+            else:
+                result = self.algorithm(sections, timeslots, rooms)
         scheduled = count_scheduled_sections(result, sections)
         unscheduled = len(result) - scheduled
         print(f"[SchedulingEngine] Done — {scheduled} scheduled, {unscheduled} unscheduled")
