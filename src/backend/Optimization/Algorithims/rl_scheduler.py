@@ -55,6 +55,8 @@ import json
 import math
 import os
 import statistics
+import random
+import copy
 from collections import Counter
 from pathlib import Path
 
@@ -71,12 +73,15 @@ from backend.Optimization.constraints import (
 )
 from backend.Optimization.Algorithims import grasp, ml_greedy
 from backend.Optimization.benchmark_seeds import seed_all, seed_for_run
+from backend.Optimization.instructor_preferences import current_preference_config, preference_penalty
 from backend.Optimization.evaluation import (
     SOFT_PENALTY_REFERENCE,
     SOFT_PENALTY_WEIGHT,
     UNSCHEDULED_WEIGHT,
     build_timeslot_guideline_cache,
     calculate_fitness,
+    count_hard_conflicts,
+    count_scheduled_sections,
 )
 
 # Candidates the Q-function chooses among, per decision. A trained model
@@ -609,6 +614,75 @@ def rl_schedule(sections, timeslots, rooms, seed=1, model=None, local_search=Fal
     return schedule, fitness
 
 
+def _refine_instructor_preferences(schedule, sections, timeslots, rooms, seed):
+    """Bounded, feasibility-preserving timeslot moves after the original RL policy.
+
+    This is post-processing, NOT Q-model retraining. The same learned policy
+    produces the baseline schedule in both modes.
+    """
+    config = current_preference_config()
+    if config is None or not config.active:
+        return schedule
+
+    baseline = copy.deepcopy(schedule)
+    baseline_hard = count_hard_conflicts(schedule, rooms)
+    baseline_scheduled = count_scheduled_sections(schedule, sections)
+    initial_penalty = preference_penalty(schedule, timeslots, config)
+    best_penalty = initial_penalty
+    valid_cache = build_timeslot_guideline_cache(sections, timeslots)
+    ts_by_id = {ts.id: ts for ts in timeslots}
+    rng = random.Random(seed)
+    # Bounded runtime: evaluate up to 120 sections, at most 8 alternate slots.
+    eligible = [i for i, item in enumerate(schedule) if item.timeslot_id is not None]
+    rng.shuffle(eligible)
+    accepted = 0
+    for idx in eligible[:120]:
+        item = schedule[idx]
+        original = item.timeslot_id
+        allowed = valid_cache.get((item.course_id, str(item.section)), set())
+        alternatives = [ts_id for ts_id in allowed if ts_id in ts_by_id and ts_id != original]
+        rng.shuffle(alternatives)
+        if not alternatives:
+            continue
+
+        # Rebuild overlap-aware occupancy excluding the moving class.
+        occupied_rooms = OverlapSet()
+        occupied_teachers = OverlapSet()
+        for j, other in enumerate(schedule):
+            if j == idx or other.timeslot_id is None:
+                continue
+            if other.room_id is not None:
+                occupied_rooms.add((other.room_id, other.timeslot_id))
+            for teacher in instructor_occupancy_ids(other):
+                occupied_teachers.add((teacher, other.timeslot_id))
+        teachers = instructor_occupancy_ids(item)
+        for ts_id in alternatives[:8]:
+            if item.room_id is not None and (item.room_id, ts_id) in occupied_rooms:
+                continue
+            if any((teacher, ts_id) in occupied_teachers for teacher in teachers):
+                continue
+            item.timeslot_id = ts_id
+            # The full checker also enforces sibling conflicts and room rules.
+            if count_hard_conflicts(schedule, rooms) <= baseline_hard and \
+                    count_scheduled_sections(schedule, sections) >= baseline_scheduled:
+                candidate_penalty = preference_penalty(schedule, timeslots, config)
+                if candidate_penalty < best_penalty - 1e-9:
+                    best_penalty = candidate_penalty
+                    accepted += 1
+                    break
+            item.timeslot_id = original
+        # A successful move remains in place; an unsuccessful one is restored.
+
+    if (count_hard_conflicts(schedule, rooms) > baseline_hard or
+            count_scheduled_sections(schedule, sections) < baseline_scheduled or
+            best_penalty > initial_penalty):
+        print('RL preference safeguard: retaining original timetable.')
+        return baseline
+    print(f'[RL preferences] Accepted {accepted} timeslot moves; '
+          f'penalty {initial_penalty:.2f} -> {best_penalty:.2f}')
+    return schedule
+
+
 def rl_runs(sections, timeslots, rooms, num_runs=1, seeds=None, model=None,
             local_search=None):
     """Best of num_runs schedules. The policy is deterministic; runs differ only
@@ -631,6 +705,14 @@ def rl_runs(sections, timeslots, rooms, num_runs=1, seeds=None, model=None,
             sections, timeslots, rooms, seed=run_seed or 0, local_search=local_search,
             valid_timeslot_cache=valid_timeslot_cache, env=env, policy=policy,
         )
+        if current_preference_config() is not None and current_preference_config().active:
+            schedule = _refine_instructor_preferences(
+                schedule, sections, timeslots, rooms, run_seed or 0,
+            )
+            fitness = calculate_fitness(
+                schedule, rooms, sections=sections, timeslots=timeslots,
+                valid_timeslot_cache=valid_timeslot_cache,
+            )
         scores.append(fitness)
         print(f"Run {run + 1:2d} (seed {run_seed}): Fitness = {fitness:.4f}")
         if fitness > best_fitness:

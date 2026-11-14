@@ -38,7 +38,11 @@ from backend.Optimization.constraints import (
 from backend.Optimization.evaluation import (
     build_timeslot_guideline_cache,
     calculate_fitness,
+    count_hard_conflicts,
+    count_scheduled_sections,
 )
+from backend.Optimization.instructor_preferences import current_preference_config
+from backend.Optimization.provisional_preference_penalty import InstructorPreferenceTracker
 from backend.models.models import ScheduleItem
 
 
@@ -169,7 +173,20 @@ class TimetableState:
                 timeslots=self.timeslots,
                 valid_timeslot_cache=self.valid_timeslot_cache,
             )
-            self._objective = 1.0 - fitness
+            config = current_preference_config()
+            if config is not None and config.active:
+                # Keep hard conflicts and unscheduled sections ahead of all
+                # soft costs, including instructor preferences. The fitness
+                # term only breaks ties within the same feasibility tier.
+                hard = count_hard_conflicts(self.to_schedule(), self.rooms)
+                missing = len(self.unassigned_indices())
+                self._objective = (
+                    2.0 * (hard * (len(self.sections) + 1) + missing)
+                    + (1.0 - fitness)
+                )
+            else:
+                # Preserve the original ALNS objective when preferences are OFF.
+                self._objective = 1.0 - fitness
         return self._objective
 
 
@@ -183,6 +200,11 @@ def repair(state, rng, randomized=False):
     occupied_rooms = OverlapSet()
     occupied_instructors = OverlapSet()
     sibling_times = {}
+    config = current_preference_config()
+    preference_enabled = config is not None and config.active
+    preference_tracker = InstructorPreferenceTracker.from_config(
+        repaired.timeslots, config
+    )
 
     # Rebuild occupancy from assignments that remain after destruction.
     for section, (room, timeslot) in zip(
@@ -192,6 +214,7 @@ def repair(state, rng, randomized=False):
             occupied_rooms.add((room.id, timeslot.id))
 
         if timeslot is not None:
+            preference_tracker.add(section, timeslot)
             for instructor_id in instructor_occupancy_ids(section):
                 occupied_instructors.add((instructor_id, timeslot.id))
 
@@ -208,6 +231,9 @@ def repair(state, rng, randomized=False):
         section = repaired.sections[index]
         sibling_key = getattr(section, "sibling_key", None)
         candidates = []
+        # Cache preference-aware scores only when preferences are enabled.
+        # The disabled path keeps the original candidate-scoring operations.
+        time_cost_cache = {} if preference_enabled else None
 
         for room in repaired.candidate_rooms(index):
             for timeslot in repaired.candidate_timeslots(index):
@@ -234,7 +260,17 @@ def repair(state, rng, randomized=False):
                 if room is not None:
                     cost += room_soft_penalty(section, room)
                 if timeslot is not None:
-                    cost += time_soft_penalty(section, timeslot)
+                    if preference_enabled:
+                        if timeslot.id not in time_cost_cache:
+                            time_cost_cache[timeslot.id] = (
+                                time_soft_penalty(section, timeslot)
+                                + preference_tracker.delta(section, timeslot)
+                            )
+                        cost += time_cost_cache[timeslot.id]
+                    else:
+                        # Keep the original scoring path for benchmark runs.
+                        cost += time_soft_penalty(section, timeslot)
+                        cost += preference_tracker.delta(section, timeslot)
                 candidates.append((cost, room, timeslot))
 
         choices = nsmallest(
@@ -256,6 +292,7 @@ def repair(state, rng, randomized=False):
             occupied_rooms.add((room.id, timeslot.id))
 
         if timeslot is not None:
+            preference_tracker.add(section, timeslot)
             for instructor_id in instructor_occupancy_ids(section):
                 occupied_instructors.add((instructor_id, timeslot.id))
 
@@ -377,10 +414,18 @@ def alns_schedule(
     )
 
     # Allow limited worsening early, then reduce the allowed gap to zero.
+    initial_obj = max(initial.objective(), 1e-6)
+    config = current_preference_config()
+    if config is not None and config.active:
+        # A feasibility tier differs by at least one objective unit. Keep
+        # the acceptance gap below that boundary so the search cannot accept
+        # an extra hard conflict or unscheduled section to improve preferences.
+        start_gap = min(0.05, 0.49 / initial_obj)
+    else:
+        start_gap = 0.05
     acceptance = RecordToRecordTravel.autofit(
-        # Prevent a zero objective from producing a zero acceptance gap.
-        init_obj=max(initial.objective(), 1e-6),
-        start_gap=0.05,
+        init_obj=initial_obj,
+        start_gap=start_gap,
         end_gap=0.0,
         num_iters=max_iterations,
     )
@@ -431,7 +476,21 @@ def alns_runs(sections, timeslots, rooms, num_runs=1, seeds=None):
             valid_timeslot_cache=valid_cache,
         )
 
-        if fitness > best_fitness:
+        config = current_preference_config()
+        if config is not None and config.active:
+            # Select the best run lexicographically when preferences are ON.
+            # Finalized schedules are checked because finalization may move
+            # sibling blocks after the ALNS search has finished.
+            rank = (
+                count_hard_conflicts(schedule, rooms),
+                len(sections) - count_scheduled_sections(schedule, sections),
+                -fitness,
+            )
+            if best_schedule is None or rank < best_rank:
+                best_rank = rank
+                best_fitness = fitness
+                best_schedule = schedule
+        elif fitness > best_fitness:
             best_fitness = fitness
             best_schedule = schedule
 

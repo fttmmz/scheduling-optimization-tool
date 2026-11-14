@@ -1,7 +1,8 @@
-﻿
-import networkx as nx
+﻿import networkx as nx
 from collections import defaultdict
 
+from backend.Optimization.instructor_preferences import current_preference_config, preference_run_context
+from backend.Optimization.provisional_preference_penalty import InstructorPreferenceTracker
 from backend.models.models import ScheduleItem
 from backend.Optimization.constraints.rooms import PRACTICAL_LECTURE_COURSE_IDS
 from backend.Optimization.constraints import (
@@ -66,13 +67,13 @@ def _greedy_room_penalty(room, room_type, course_dept, campus) -> float:
 
 
 def _viable_rooms(
-    dept_typed,
-    open_typed,
-    room_type,
-    course_dept,
-    campus,
-    all_rooms=None,
-    limit=DEFAULT_ROOM_CANDIDATES,
+        dept_typed,
+        open_typed,
+        room_type,
+        course_dept,
+        campus,
+        all_rooms=None,
+        limit=DEFAULT_ROOM_CANDIDATES,
 ):
     """Yield rooms best-fit first for a given (type, dept, campus) triple.
 
@@ -143,43 +144,40 @@ def build_conflict_graph(sections):
     return G
 
 
-
 # Greedy scheduler
 
-def greedy_schedule(sections, timeslots, rooms):
-    
+def _greedy_schedule_impl(sections, timeslots, rooms):
     G = build_conflict_graph(sections)
 
-    
-    occupied_rooms = OverlapSet() 
-    occupied_instructors = OverlapSet() 
-    assigned_timeslots = {} 
+    occupied_rooms = OverlapSet()
+    occupied_instructors = OverlapSet()
+    assigned_timeslots = {}
 
     room_list_cache: dict = {}
-    def cached_viable_rooms(section, room_type, course_dept, campus):
-            # Everything the hard room rules read: course type, department,
-            # campus identity, whether a registrar campus code is known, and
-            # whether the course is a practical one allowed into its labs.
-            key = (room_type, section.course.type, course_dept, campus, registrar_room_cache_key(section),
-                   getattr(section, "campus", None) is not None,
-                   section.course.id in PRACTICAL_LECTURE_COURSE_IDS)
-            if key not in room_list_cache:
-                # Forbidden rooms are removed BEFORE the lookup is built, so no
-                # tier -- not even the soft fallback -- can hand one out.
-                allowed = [room for room in rooms if is_room_allowed(section, room)]
-                dept_typed, open_typed, allowed = _build_room_lookup(allowed)
-                room_list_cache[key] = list(
-                    _viable_rooms(
-                        dept_typed,
-                        open_typed,
-                        room_type,
-                        course_dept,
-                        campus,
-                        all_rooms=allowed,
-                    )
-                )
-            return room_list_cache[key]
 
+    def cached_viable_rooms(section, room_type, course_dept, campus):
+        # Everything the hard room rules read: course type, department,
+        # campus identity, whether a registrar campus code is known, and
+        # whether the course is a practical one allowed into its labs.
+        key = (room_type, section.course.type, course_dept, campus, registrar_room_cache_key(section),
+               getattr(section, "campus", None) is not None,
+               section.course.id in PRACTICAL_LECTURE_COURSE_IDS)
+        if key not in room_list_cache:
+            # Forbidden rooms are removed BEFORE the lookup is built, so no
+            # tier -- not even the soft fallback -- can hand one out.
+            allowed = [room for room in rooms if is_room_allowed(section, room)]
+            dept_typed, open_typed, allowed = _build_room_lookup(allowed)
+            room_list_cache[key] = list(
+                _viable_rooms(
+                    dept_typed,
+                    open_typed,
+                    room_type,
+                    course_dept,
+                    campus,
+                    all_rooms=allowed,
+                )
+            )
+        return room_list_cache[key]
 
     def order_by_capacity(viable, capacity_needed):
         """Rooms that seat the section first (in their existing best-fit order),
@@ -196,6 +194,9 @@ def greedy_schedule(sections, timeslots, rooms):
         overflows.sort(key=lambda room: -room.capacity)
         return fits + overflows
 
+    preference_tracker = InstructorPreferenceTracker.from_config(
+        timeslots, current_preference_config()
+    )
     schedule = []
     nodes_by_priority = sorted(G.nodes, key=lambda n: G.degree[n], reverse=True)
 
@@ -232,7 +233,10 @@ def greedy_schedule(sections, timeslots, rooms):
                 if nei in assigned_timeslots
             }
             chosen_ts = None
-            for timeslot in get_valid_timeslots(section, timeslots):
+            time_options = get_valid_timeslots(section, timeslots)
+            if preference_tracker.weight:
+                time_options = sorted(time_options, key=lambda ts: preference_tracker.delta(section, ts))
+            for timeslot in time_options:
                 ts_id = timeslot.id
                 if any((instructor_id, ts_id) in occupied_instructors
                        for instructor_id in occupying_instructors):
@@ -243,6 +247,7 @@ def greedy_schedule(sections, timeslots, rooms):
                 for instructor_id in occupying_instructors:
                     occupied_instructors.add((instructor_id, ts_id))
                 assigned_timeslots[node_id] = ts_id
+                preference_tracker.add(section, timeslot)
                 break
             schedule.append(make_item(None, chosen_ts))
             continue
@@ -263,8 +268,12 @@ def greedy_schedule(sections, timeslots, rooms):
 
         # NEEDS_ROOM_AND_TIME
         candidate_slots = get_valid_timeslots(section, timeslots)
+        if preference_tracker.weight:
+            candidate_slots = sorted(
+                candidate_slots, key=lambda ts: preference_tracker.delta(section, ts)
+            )
 
-        # Compute neighbour-blocked timeslot ids once per node 
+        # Compute neighbour-blocked timeslot ids once per node
         blocked_by_neighbors = {
             assigned_timeslots[nei]
             for nei in G.neighbors(node_id)
@@ -297,6 +306,7 @@ def greedy_schedule(sections, timeslots, rooms):
                 for instructor_id in occupying_instructors:
                     occupied_instructors.add((instructor_id, ts_id))
                 assigned_timeslots[node_id] = ts_id
+                preference_tracker.add(section, timeslot)
                 schedule.append(make_item(room.id, ts_id))
                 found = True
                 break
@@ -310,3 +320,15 @@ def greedy_schedule(sections, timeslots, rooms):
     # Meeting blocks of one section need their own hour, and share one room.
     # The placement loops have no cross-block state, so repair here.
     return finalize_schedule(schedule, sections, timeslots, rooms=rooms)
+
+
+def greedy_schedule(sections, timeslots, rooms):
+    """OFF construction plus feasibility-safe preference improvement when ON."""
+    config = current_preference_config()
+    if config is None or not config.active:
+        return _greedy_schedule_impl(sections, timeslots, rooms)
+    from backend.Optimization.preference_refinement import refine_preferences
+    with preference_run_context(None):
+        baseline = _greedy_schedule_impl(sections, timeslots, rooms)
+    return refine_preferences(baseline, sections, timeslots, rooms,
+                              seed=1, label='Greedy')
