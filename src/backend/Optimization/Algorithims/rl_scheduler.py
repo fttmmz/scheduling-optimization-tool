@@ -73,7 +73,10 @@ from backend.Optimization.constraints import (
 )
 from backend.Optimization.Algorithims import grasp, ml_greedy
 from backend.Optimization.benchmark_seeds import seed_all, seed_for_run
-from backend.Optimization.instructor_preferences import current_preference_config, preference_penalty
+from backend.Optimization.InstructorPreferences.preference_config import (
+    current_preference_config,
+    preference_penalty,
+)
 from backend.Optimization.evaluation import (
     SOFT_PENALTY_REFERENCE,
     SOFT_PENALTY_WEIGHT,

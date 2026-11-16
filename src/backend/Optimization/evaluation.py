@@ -1,8 +1,9 @@
 # CONFLICT COUNTING  (for schedule scoring / comparison)
 from collections import Counter, defaultdict
 
-from backend.Optimization.instructor_preferences import (
-    current_preference_config, preference_penalty,
+from backend.Optimization.InstructorPreferences.preference_config import (
+    current_preference_config,
+    preference_penalty,
 )
 
 from backend.Optimization.constraints import (
