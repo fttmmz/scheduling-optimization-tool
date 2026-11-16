@@ -32,8 +32,11 @@ from backend.Optimization.evaluation import (
     count_scheduled_sections,
 )
 from backend.Optimization.benchmark_seeds import seed_all, seed_for_run
-from backend.Optimization.instructor_preferences import (
-    current_preference_config, preference_penalty, preference_run_context, PreferenceRunConfig,
+from backend.Optimization.InstructorPreferences.preference_config import (
+    current_preference_config,
+    preference_penalty,
+    preference_run_context,
+    PreferenceRunConfig,
 )
 from backend.models.models import ScheduleItem
 
