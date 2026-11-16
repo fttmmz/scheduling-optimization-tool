@@ -1,9 +1,4 @@
-"""Shared instructor preference refinement for PSO, RL, and ML-Greedy.
-
-Runs only when instructor preferences are enabled.
-Uses a limited refinement budget to control runtime.
-Preserves the initial number of hard conflicts and scheduled sections.
-"""
+"""Refine PSO, RL and ML-Greedy schedules to reduce preference penalties while preserving hard-conflict and scheduled-section counts."""
 import copy
 import random
 
@@ -13,7 +8,7 @@ from backend.Optimization.constraints import (
 from backend.Optimization.evaluation import (
     count_hard_conflicts, count_scheduled_sections,
 )
-from backend.Optimization.instructor_preferences import preference_penalty
+from backend.Optimization.InstructorPreferences.preference_config import preference_penalty
 
 
 def refine_preferences_shared(schedule, sections, timeslots, rooms, config, *,
