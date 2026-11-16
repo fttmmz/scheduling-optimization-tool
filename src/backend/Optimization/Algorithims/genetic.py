@@ -23,8 +23,12 @@ from backend.Optimization.evaluation import (
     count_scheduled_sections,
 )
 from backend.Optimization.benchmark_seeds import seed_all, seed_for_run
-from backend.Optimization.instructor_preferences import current_preference_config
-from backend.Optimization.provisional_preference_penalty import InstructorPreferenceTracker
+from backend.Optimization.InstructorPreferences.preference_config import (
+    current_preference_config,
+)
+from backend.Optimization.InstructorPreferences.preference_penalty import (
+    InstructorPreferenceTracker,
+)
 
 
 def _free_timeslot(section, timeslots, occupied_instructors):

@@ -8,7 +8,7 @@ from backend.Optimization.Algorithims.rl_scheduler import rl_runs
 from backend.Optimization.Algorithims.alns import alns_runs
 from backend.Optimization.Algorithims.simulated_annealing import simulated_annealing_runs
 from backend.Optimization.evaluation import count_scheduled_sections
-from backend.Optimization.instructor_preferences import (
+from backend.Optimization.InstructorPreferences.preference_config import (
     PreferenceRunConfig, preference_run_context,
 )
 

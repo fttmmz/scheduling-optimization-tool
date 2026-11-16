@@ -1,12 +1,4 @@
-"""Manage instructor preference settings for individual scheduling runs.
-
-Saved preferences are loaded from the database and passed to the shared
-fitness calculation. A configurable penalty calculator supplies the instructor preference cost
-without changing the original fitness when preferences are disabled.
-
-A context variable keeps each run's settings isolated and is reset when the
-run finishes. Algorithm-specific candidate scoring is handled separately.
-"""
+"""Load saved instructor preferences and configure preference scoring for scheduling runs. Controls whether preference penalties are enabled and the scoring weight."""
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -82,7 +74,7 @@ def preference_penalty(schedule, timeslots, config: Optional[PreferenceRunConfig
     return config.weight * value
 
 
-def load_all_instructor_preferences(client, page_size: int = 1000) -> dict:
+def load_all_preference_config(client, page_size: int = 1000) -> dict:
     """Load and validate all saved instructor preferences from Supabase.
 
     Read rows in pages and normalize instructor IDs to strings so they match
@@ -114,8 +106,12 @@ def load_all_instructor_preferences(client, page_size: int = 1000) -> dict:
 
 
 def get_preference_calculator() -> PreferencePenaltyCalculator:
-    """Return the instructor preference penalty calculator used by the optimizer."""
-    from backend.Optimization.provisional_preference_penalty import (
+    """Return the temporary penalty calculator used by the optimizer.
+
+    This can later be replaced by the final implementation without changing
+    the API, engine, or fitness function.
+    """
+    from backend.Optimization.InstructorPreferences.preference_penalty import (
         calculate_instructor_preference_penalty,
     )
     return calculate_instructor_preference_penalty
