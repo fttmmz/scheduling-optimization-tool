@@ -1,8 +1,14 @@
 ﻿import networkx as nx
 from collections import defaultdict
 
-from backend.Optimization.instructor_preferences import current_preference_config, preference_run_context
-from backend.Optimization.provisional_preference_penalty import InstructorPreferenceTracker
+from backend.Optimization.InstructorPreferences.preference_config import (
+    current_preference_config,
+    preference_run_context,
+)
+
+from backend.Optimization.InstructorPreferences.preference_penalty import (
+    InstructorPreferenceTracker,
+)
 from backend.models.models import ScheduleItem
 from backend.Optimization.constraints.rooms import PRACTICAL_LECTURE_COURSE_IDS
 from backend.Optimization.constraints import (
@@ -327,7 +333,7 @@ def greedy_schedule(sections, timeslots, rooms):
     config = current_preference_config()
     if config is None or not config.active:
         return _greedy_schedule_impl(sections, timeslots, rooms)
-    from backend.Optimization.preference_refinement import refine_preferences
+    from backend.Optimization.InstructorPreferences.greedy_grasp_refinement import refine_preferences
     with preference_run_context(None):
         baseline = _greedy_schedule_impl(sections, timeslots, rooms)
     return refine_preferences(baseline, sections, timeslots, rooms,
