@@ -16,6 +16,7 @@ timetabling problem used in this project.
 """
 
 from heapq import nsmallest
+import copy
 
 import numpy as np
 from alns import ALNS
@@ -41,8 +42,16 @@ from backend.Optimization.evaluation import (
     count_hard_conflicts,
     count_scheduled_sections,
 )
-from backend.Optimization.instructor_preferences import current_preference_config
-from backend.Optimization.provisional_preference_penalty import InstructorPreferenceTracker
+from backend.Optimization.InstructorPreferences.preference_config import (
+    current_preference_config,
+    preference_run_context,
+    PreferenceRunConfig,
+    preference_penalty,
+)
+
+from backend.Optimization.InstructorPreferences.preference_penalty import (
+    InstructorPreferenceTracker,
+)
 from backend.models.models import ScheduleItem
 
 
@@ -59,6 +68,11 @@ MAX_ITERATIONS = 100
 # Greedy repair uses the best choice. Randomized repair selects from the
 # three best choices to give the search some variety.
 TOP_REPAIR_CHOICES = 3
+
+# ON only: smaller neighbourhoods preserve more of the OFF timetable.
+PREFERENCE_DESTROY_FRACTION = 0.012
+PREFERENCE_LOCAL_TRIALS = 500
+PREFERENCE_LOCAL_ACCEPTS = 90
 
 
 # ---------------------------------------------------------------------------
@@ -327,7 +341,7 @@ def random_removal(state, rng):
 
     if assigned:
         number_to_remove = max(
-            1, int(len(assigned) * DESTROY_FRACTION)
+            1, int(len(assigned) * (PREFERENCE_DESTROY_FRACTION if _preferences_active() else DESTROY_FRACTION))
         )
         selected = rng.choice(
             assigned,
@@ -362,11 +376,102 @@ def worst_removal(state, rng):
 
     # Remove the highest-cost assignments so repair can improve them.
     scored.sort(reverse=True)
-    number_to_remove = max(1, int(len(scored) * DESTROY_FRACTION))
+    number_to_remove = max(1, int(len(scored) * (PREFERENCE_DESTROY_FRACTION if _preferences_active() else DESTROY_FRACTION)))
     for _, index in scored[:number_to_remove]:
         destroyed.assignments[index] = (None, None)
 
     return destroyed
+
+
+# ---------------------------------------------------------------------------
+# Preference ON helpers. OFF operators, objective and initialization are intact.
+# ---------------------------------------------------------------------------
+
+def _preferences_active():
+    config = current_preference_config()
+    return config is not None and config.active
+
+
+def _feasibility(schedule, sections, rooms):
+    return (count_hard_conflicts(schedule, rooms),
+            len(sections) - count_scheduled_sections(schedule, sections))
+
+
+def _warm_start(sections, timeslots, rooms, baseline, valid_cache):
+    """Reconstruct ALNS state from the finalized, matched-seed OFF schedule."""
+    if len(baseline) != len(sections):
+        raise ValueError("ALNS baseline size differs from sections")
+    room_by_id = {room.id: room for room in rooms}
+    time_by_id = {slot.id: slot for slot in timeslots}
+    assignments = []
+    for section, item in zip(sections, baseline):
+        expected = make_schedule_item(section)
+        for attr in ("course_id", "section", "pattern_index"):
+            if getattr(expected, attr, None) != getattr(item, attr, None):
+                raise ValueError("ALNS baseline ordering differs from sections")
+        if item.room_id is not None and item.room_id not in room_by_id:
+            raise ValueError("Unknown room in ALNS baseline")
+        if item.timeslot_id is not None and item.timeslot_id not in time_by_id:
+            raise ValueError("Unknown timeslot in ALNS baseline")
+        assignments.append((room_by_id.get(item.room_id),
+                            time_by_id.get(item.timeslot_id)))
+    return TimetableState(sections, timeslots, rooms, assignments=assignments,
+                          valid_timeslot_cache=valid_cache)
+
+
+def _safe_preference_local_search(baseline, sections, timeslots, rooms,
+                                  config, seed):
+    """PSO-style safe single-meeting moves, without deleting any assignments.
+
+    Each accepted move must lower the complete preference penalty while
+    preserving both feasibility metrics. This is ON-only and never mutates OFF.
+    """
+    working = copy.deepcopy(baseline)
+    baseline_rank = _feasibility(baseline, sections, rooms)
+    current_penalty = preference_penalty(working, timeslots, config)
+    first_penalty = current_penalty
+    section_by_key = {}
+    for section in sections:
+        expected = make_schedule_item(section)
+        key = (str(expected.course_id), str(expected.section),
+               getattr(expected, "pattern_index", 0))
+        section_by_key[key] = section
+
+    eligible = []
+    for i, item in enumerate(working):
+        if item.timeslot_id is None:
+            continue
+        key = (str(item.course_id), str(item.section),
+               getattr(item, "pattern_index", 0))
+        section = section_by_key.get(key)
+        if section is None or not section_needs(section).time:
+            continue
+        alternatives = [ts.id for ts in get_valid_timeslots_for_section(section, timeslots)
+                        if ts.id != item.timeslot_id]
+        if alternatives:
+            eligible.append((i, alternatives))
+
+    rng = np.random.default_rng(seed)
+    accepted = 0
+    for _ in range(PREFERENCE_LOCAL_TRIALS):
+        if not eligible or accepted >= PREFERENCE_LOCAL_ACCEPTS:
+            break
+        i, alternatives = eligible[int(rng.integers(len(eligible)))]
+        previous = working[i].timeslot_id
+        working[i].timeslot_id = alternatives[int(rng.integers(len(alternatives)))]
+        # Preserve each metric separately, not only their lexicographic rank.
+        hard, missing = _feasibility(working, sections, rooms)
+        if hard <= baseline_rank[0] and missing <= baseline_rank[1]:
+            candidate_penalty = preference_penalty(working, timeslots, config)
+            if candidate_penalty < current_penalty - 1e-9:
+                current_penalty = candidate_penalty
+                accepted += 1
+                continue
+        working[i].timeslot_id = previous
+    print(f"[ALNS local search] seed={seed}: accepted {accepted} safe moves; "
+          f"preference penalty {first_penalty:.3f} -> {current_penalty:.3f}",
+          flush=True)
+    return working
 
 
 # ---------------------------------------------------------------------------
@@ -380,6 +485,7 @@ def alns_schedule(
     valid_timeslot_cache=None,
     seed=None,
     max_iterations=MAX_ITERATIONS,
+    initial_schedule=None,
 ):
     """Run one ALNS search and return its best timetable."""
     if valid_timeslot_cache is None:
@@ -397,7 +503,9 @@ def alns_schedule(
         rooms,
         valid_timeslot_cache=valid_timeslot_cache,
     )
-    initial = randomized_repair(empty, rng)
+    initial = (_warm_start(sections, timeslots, rooms, initial_schedule,
+                           valid_timeslot_cache)
+               if initial_schedule is not None else randomized_repair(empty, rng))
 
     search = ALNS(rng)
     search.add_destroy_operator(random_removal)
@@ -461,13 +569,66 @@ def alns_runs(sections, timeslots, rooms, num_runs=1, seeds=None):
     for run in range(num_runs):
         # Use the same benchmark-seed protocol as the other algorithms.
         run_seed = seed_for_run(run, seeds)
+        config = current_preference_config()
+        baseline_schedule = None
+        if config is not None and config.active:
+            # Reproduce the matched-seed OFF run as a feasibility baseline.
+            # OFF uses its original objective and repair operators unchanged.
+            with preference_run_context(PreferenceRunConfig(requested=False)):
+                baseline_schedule = alns_schedule(
+                    sections, timeslots, rooms,
+                    valid_timeslot_cache=valid_cache, seed=run_seed,
+                )
+
         schedule = alns_schedule(
             sections,
             timeslots,
             rooms,
             valid_timeslot_cache=valid_cache,
             seed=run_seed,
+            initial_schedule=baseline_schedule,
         )
+        if baseline_schedule is not None:
+            # ALNS explores neighbourhoods of the OFF timetable; a separate
+            # PSO-style local search guarantees a useful alternative even if
+            # destroy-and-repair cannot preserve all assignments.
+            local_schedule = _safe_preference_local_search(
+                baseline_schedule, sections, timeslots, rooms, config, run_seed
+            )
+            baseline_rank = _feasibility(baseline_schedule, sections, rooms)
+            baseline_penalty = preference_penalty(
+                baseline_schedule, timeslots, config
+            )
+            chosen = baseline_schedule
+            chosen_rank = baseline_rank
+            chosen_penalty = baseline_penalty
+            chosen_source = "OFF baseline"
+            for source, candidate in (("ALNS warm start", schedule),
+                                      ("safe local search", local_schedule)):
+                candidate_rank = _feasibility(candidate, sections, rooms)
+                # Independent hard/unscheduled limits are mandatory.
+                if (candidate_rank[0] > baseline_rank[0] or
+                        candidate_rank[1] > baseline_rank[1]):
+                    continue
+                candidate_penalty = preference_penalty(
+                    candidate, timeslots, config
+                )
+                # Prefer greater completeness; for equal feasibility prefer
+                # lower preference penalty. Never replace with a worse penalty
+                # unless the candidate actually schedules more sections.
+                if (candidate_rank < chosen_rank or
+                        (candidate_rank == chosen_rank and
+                         candidate_penalty < chosen_penalty - 1e-9)):
+                    chosen = candidate
+                    chosen_rank = candidate_rank
+                    chosen_penalty = candidate_penalty
+                    chosen_source = source
+            schedule = chosen
+            print(f"[ALNS ON selection] seed={run_seed}: {chosen_source}; "
+                  f"hard={chosen_rank[0]}, unscheduled={chosen_rank[1]}, "
+                  f"preference penalty={chosen_penalty:.3f} "
+                  f"(OFF={baseline_penalty:.3f})", flush=True)
+
         fitness = calculate_fitness(
             schedule,
             rooms,
@@ -478,7 +639,8 @@ def alns_runs(sections, timeslots, rooms, num_runs=1, seeds=None):
 
         config = current_preference_config()
         if config is not None and config.active:
-            # Select the best run lexicographically when preferences are ON.
+            # When preferences are ON, select the best run by prioritizing
+            # fewer hard conflicts, fewer unscheduled sections, and higher fitness.
             # Finalized schedules are checked because finalization may move
             # sibling blocks after the ALNS search has finished.
             rank = (

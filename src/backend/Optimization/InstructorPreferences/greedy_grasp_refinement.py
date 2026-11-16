@@ -1,16 +1,12 @@
-"""Feasibility-preserving instructor preference refinement shared by Greedy and GRASP.
-
-Only valid single-section timeslot relocations are considered. A final exact
-feasibility check protects against sibling constraints and other global rules.
-"""
+"""Improve Greedy and GRASP schedules by testing valid timeslot changes that reduce instructor preference penalties."""
 import copy
 import random
 from backend.Optimization.constraints import (
     OverlapSet, get_valid_timeslots, instructor_occupancy_ids, section_needs,
 )
 from backend.Optimization.evaluation import count_hard_conflicts, count_scheduled_sections
-from backend.Optimization.instructor_preferences import current_preference_config, preference_penalty
-from backend.Optimization.provisional_preference_penalty import InstructorPreferenceTracker
+from backend.Optimization.InstructorPreferences.preference_config import current_preference_config, preference_penalty
+from backend.Optimization.InstructorPreferences.preference_penalty import InstructorPreferenceTracker
 
 
 def refine_preferences(schedule, sections, timeslots, rooms, seed=1, max_items=450,

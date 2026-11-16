@@ -1,11 +1,4 @@
-"""Instructor preference penalty calculation for timetable optimization.
-
-The same penalty function is used by the shared fitness function and
-incremental candidate ranking. It evaluates only classes with an
-assigned teaching time.
-
-All preference penalties are soft and do not affect hard-constraint checks.
-"""
+"""Calculate weighted instructor preference penalties for a timetable. Uses preference priorities to score violations without changing hard constraints."""
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Mapping

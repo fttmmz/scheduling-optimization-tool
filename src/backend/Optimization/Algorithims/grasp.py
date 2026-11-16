@@ -3,8 +3,14 @@ import copy
 import statistics
 from collections import Counter
 
-from backend.Optimization.instructor_preferences import current_preference_config, preference_run_context
-from backend.Optimization.provisional_preference_penalty import InstructorPreferenceTracker
+from backend.Optimization.InstructorPreferences.preference_config import (
+    current_preference_config,
+    preference_run_context,
+)
+
+from backend.Optimization.InstructorPreferences.preference_penalty import (
+    InstructorPreferenceTracker,
+)
 from backend.models.models import ScheduleItem
 from backend.Optimization.constraints import (
     OverlapCounter,
@@ -674,7 +680,7 @@ def grasp_runs(sections, timeslots, rooms, num_runs=30, seeds=None):
     config = current_preference_config()
     preference_on = config is not None and config.active
     if preference_on:
-        from backend.Optimization.preference_refinement import refine_preferences
+        from backend.Optimization.InstructorPreferences.greedy_grasp_refinement import refine_preferences
 
     for run in range(num_runs):
 
