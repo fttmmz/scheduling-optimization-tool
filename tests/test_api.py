@@ -288,6 +288,62 @@ def test_sync_greedy_returns_a_runnable_measured_timetable(client, scheduling_da
         assert key in row
 
 
+SAVED_PREFERENCE = {
+    "inst_id": 1551, "preferred_days": [], "avoid_days": [], "days_priority": None,
+    "preferred_times": ["evening"], "time_priority": "high", "gaps_priority": None,
+    "fewer_days_priority": None, "max_classes_per_day": None, "max_classes_priority": None,
+}
+
+
+def _spy_engine(monkeypatch):
+    seen = {}
+    real_engine = main.SchedulingEngine
+
+    def spy(*args, **kwargs):
+        seen["config"] = kwargs.get("preference_config")
+        return real_engine(*args, **kwargs)
+
+    monkeypatch.setattr(main, "SchedulingEngine", spy)
+    return seen
+
+
+def test_preferences_on_reach_the_engine_and_the_run_reports_them(client, fake, monkeypatch):
+    fake.tables["preference"] = [dict(SAVED_PREFERENCE)]
+    fake.tables["instructor"] = [{"inst_id": 1551, "name": "Dr. Test"}]
+    seen = _spy_engine(monkeypatch)
+    t = client.post("/api/optimize", headers=ADMIN,
+                    json={"algorithm": "greedy", "use_preferences": True}).json()["timetable"]
+    assert seen["config"].active and set(seen["config"].by_instructor) == {"1551"}
+    assert t["preferences_applied"] is True
+    assert t["preference_status"] == "fitness_hook_active"
+    row = t["preference_report"]["instructors"][0]
+    assert (row["inst_id"], row["name"]) == ("1551", "Dr. Test")
+    assert row["checks"][0]["key"] == "time"
+
+
+def test_preferences_off_runs_without_them_but_still_reports(client, fake, monkeypatch):
+    fake.tables["preference"] = [dict(SAVED_PREFERENCE)]
+    seen = _spy_engine(monkeypatch)
+    t = client.post("/api/optimize", headers=ADMIN, json={"algorithm": "greedy"}).json()["timetable"]
+    assert seen["config"] is None
+    assert (t["preferences_applied"], t["preference_status"]) == (False, "off")
+    assert t["preference_report"]["summary"]["with_preferences"] == 1
+
+
+def test_preferences_on_with_none_saved_says_so(client):
+    t = client.post("/api/optimize", headers=ADMIN,
+                    json={"algorithm": "greedy", "use_preferences": True}).json()["timetable"]
+    assert (t["preferences_applied"], t["preference_status"]) == (False, "no_saved_preferences")
+
+
+def test_saved_schedule_preference_report_follows_schedule_ownership(client, fake):
+    fake.tables["preference"] = [dict(SAVED_PREFERENCE)]
+    r = client.get("/api/schedules/20/preferences", headers=ADMIN)
+    assert r.status_code == 200
+    assert r.json()["summary"]["with_preferences"] == 1
+    assert client.get("/api/schedules/21/preferences", headers=ADMIN).status_code == 403
+
+
 def test_unknown_algorithm_is_a_400(client):
     r = client.post("/api/optimize", headers=ADMIN, json={"algorithm": "quantum"})
     assert r.status_code == 400 and "Available" in r.json()["detail"]
