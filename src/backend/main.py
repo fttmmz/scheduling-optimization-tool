@@ -28,8 +28,14 @@ from backend.Optimization.evaluation import (
     total_soft_penalty,
     total_time_penalty,
 )
+from backend.Optimization.instructor_preferences import (
+    PreferenceRunConfig,
+    get_preference_calculator,
+    load_all_instructor_preferences,
+)
 from backend.database.db import supabase
 from backend.database.loader import get_scheduling_data, load_schedule, save_schedule
+from backend.preference_report import build_preference_report, load_instructor_names
 from backend.preferences import (
     PreferenceIn,
     find_instructor,
@@ -141,7 +147,7 @@ class TimetableRequest(BaseModel):
     )
     use_preferences: bool = Field(
         False,
-        description="Ask the optimizer to try to meet instructors' saved preferences. Not available for ml_greedy or rl.",
+        description="Ask the optimizer to try to meet instructors' saved preferences. Soft only: never at the cost of a hard rule or an unscheduled section.",
     )
 
 
@@ -311,11 +317,39 @@ def enrich_schedule_items(schedule_items, rooms, timeslots) -> List[Dict[str, An
     return enriched
 
 
+def load_preference_inputs():
+    """(saved preferences by inst_id, instructor names), or (None, None) when they can't be read.
+
+    A run must not fail because the preference table is unreadable: it goes ahead without
+    preferences and says so through preference_status.
+    """
+    try:
+        return load_all_instructor_preferences(supabase), load_instructor_names(supabase)
+    except Exception as exc:
+        print(f"[preferences] could not load saved preferences: {exc}")
+        return None, None
+
+
 def run_optimization(algorithm: str, num_runs: int = 1, use_preferences: bool = False) -> Dict[str, Any]:
     scheduling_data = load_scoring_data()
+    preferences, instructor_names = load_preference_inputs()
+
+    # OFF passes no config at all, so a run without preferences is exactly the run it was before.
+    preference_config = None
+    if use_preferences and preferences is not None:
+        preference_config = PreferenceRunConfig(
+            requested=True, weight=1.0, by_instructor=preferences,
+            calculator=get_preference_calculator(),
+        )
+    if not use_preferences:
+        preference_status = "off"
+    elif preference_config is None:
+        preference_status = "load_failed"
+    else:
+        preference_status = preference_config.status
 
     try:
-        engine = SchedulingEngine(algorithm, num_runs=num_runs)
+        engine = SchedulingEngine(algorithm, num_runs=num_runs, preference_config=preference_config)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -334,9 +368,15 @@ def run_optimization(algorithm: str, num_runs: int = 1, use_preferences: bool = 
         **evaluation,
         "exec_time": exec_time,
         "preferences_requested": use_preferences,
-        # The optimizer does not use preferences yet. Set this from the real outcome once the
-        # penalties are in; the frontend warns the user for as long as it stays False on a request.
-        "preferences_applied": False,
+        # True only when the preferences could change the search: requested, loaded, and not empty.
+        "preferences_applied": bool(preference_config and preference_config.active),
+        "preference_status": preference_status,
+        # How well the result meets the saved preferences, ON or OFF, so the two can be compared.
+        # Measured on the run's own items; hand edits made afterwards are measured once saved.
+        "preference_report": (
+            build_preference_report(schedule_items, scheduling_data["timeslots"], preferences, instructor_names)
+            if preferences is not None else None
+        ),
     }
 
 
@@ -977,6 +1017,20 @@ def review_schedule(schedule_id: int, request: ReviewRequest, user_id: int = Dep
         "evaluation": evaluation_breakdown(evaluation),
         "problems": find_problems(items, data["rooms"], data["sections"]),
     }
+
+
+@app.get("/api/schedules/{schedule_id}/preferences")
+def get_schedule_preference_report(schedule_id: int, user_id: int = Depends(get_current_user_id)):
+    """How well a saved schedule meets each instructor's preferences, as they are saved now.
+
+    Measured on request rather than stored with the schedule, because instructors can change
+    their preferences after it was made. A plain `def`: the preference and name reads block.
+    """
+    items = readable_schedule_items(schedule_id, user_id)
+    preferences, names = load_preference_inputs()
+    if preferences is None:
+        raise HTTPException(status_code=503, detail="Saved preferences could not be read")
+    return build_preference_report(items, cached_scoring_data()["timeslots"], preferences, names)
 
 
 @app.post("/api/schedules/{schedule_id}/placements")
