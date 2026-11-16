@@ -28,10 +28,10 @@ from backend.Optimization.evaluation import (
     total_soft_penalty,
     total_time_penalty,
 )
-from backend.Optimization.instructor_preferences import (
+from backend.Optimization.InstructorPreferences.preference_config import (
     PreferenceRunConfig,
     get_preference_calculator,
-    load_all_instructor_preferences,
+    load_all_preference_config,
 )
 from backend.database.db import supabase
 from backend.database.loader import get_scheduling_data, load_schedule, save_schedule
@@ -324,7 +324,7 @@ def load_preference_inputs():
     preferences and says so through preference_status.
     """
     try:
-        return load_all_instructor_preferences(supabase), load_instructor_names(supabase)
+        return load_all_preference_config(supabase), load_instructor_names(supabase)
     except Exception as exc:
         print(f"[preferences] could not load saved preferences: {exc}")
         return None, None

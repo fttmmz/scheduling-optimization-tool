@@ -1,7 +1,7 @@
 """How well a timetable met each instructor's saved preferences: the report the admin reads.
 
 The report judges a class the way the optimizer's penalty does
-(Optimization/provisional_preference_penalty.py), so the page and the search agree on what a miss is:
+(Optimization/InstructorPreferences/preference_penalty.py), so the page and the search agree on what a miss is:
 
   * a class's time band comes from its start: before 12:00 morning, before 17:00 afternoon, else evening;
   * days are M T W R (R = Thursday); an avoided day is a miss, and so is a day outside a preferred list;
@@ -18,7 +18,7 @@ not necessarily what they were when the schedule was made.
 from collections import defaultdict
 from typing import Dict, Iterable, List, Mapping, Optional
 
-from backend.Optimization.provisional_preference_penalty import InstructorPreferenceTracker, _cost
+from backend.Optimization.InstructorPreferences.preference_penalty import InstructorPreferenceTracker, _cost
 
 FEWER_DAYS_TARGET = 2
 GAP_TOLERANCE_MIN = 30
