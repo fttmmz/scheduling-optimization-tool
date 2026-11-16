@@ -1,4 +1,5 @@
 # main.py
+import ctypes
 import time
 import uuid
 import asyncio
@@ -37,12 +38,94 @@ from backend.preferences import (
     save_preference,
 )
 
+from backend.schedule_editing import apply_edits, find_placements, find_problems
+
 app = FastAPI()
 
-# In-memory job store for async optimization runs.
-# Keys are job_id strings; values are dicts with "status" and optionally "result"/"error".
+# In-memory job store for async optimization runs, keyed by job_id. Each job records its owner and
+# what was run, so any page can show its progress and the owner alone can read it. A finished result
+# is kept (not deleted on first read) until JOB_RESULT_TTL_S passes or MAX_FINISHED_JOBS newer ones
+# push it out: a browser that reloads, changes page or polls from two tabs must still find it.
+# A server restart still loses every job; the frontend reports that as "lost".
 _jobs: Dict[str, Dict[str, Any]] = {}
+_jobs_lock = threading.Lock()
 _executor = ThreadPoolExecutor(max_workers=2)
+JOB_RESULT_TTL_S = 6 * 3600
+MAX_FINISHED_JOBS = 6          # each result holds a full schedule; Render's free tier has 512 MB
+
+
+def _prune_jobs() -> None:
+    """Drop finished jobs past their TTL, then the oldest beyond MAX_FINISHED_JOBS. Caller holds the lock."""
+    now = time.time()
+    finished = sorted(
+        (j for j in _jobs.values() if j["status"] != "running"),
+        key=lambda j: j.get("finished_at") or 0,
+        reverse=True,
+    )
+    for n, job in enumerate(finished):
+        if n >= MAX_FINISHED_JOBS or now - (job.get("finished_at") or now) > JOB_RESULT_TTL_S:
+            _jobs.pop(job["job_id"], None)
+
+
+def job_summary(job: Dict[str, Any]) -> Dict[str, Any]:
+    """A job without its (large) result: what the navbar indicator polls."""
+    summary = {k: job.get(k) for k in ("job_id", "status", "algorithm", "num_runs", "started_at", "finished_at")}
+    # Waiting for a free worker (two runs at once at most): the page says so instead of a clock
+    # that seems to run for nothing.
+    summary["queued"] = job["status"] == "running" and not job.get("running_since")
+    summary["running_since"] = job.get("running_since")
+    result = job.get("result")
+    if result is not None:
+        summary["fitness"] = result.get("fitness")
+        summary["conflicts"] = result.get("conflicts")
+        summary["unscheduled"] = result.get("unscheduled")
+    if job["status"] == "error":
+        summary["error"] = job.get("error")
+    return summary
+
+
+# Rooms, timeslots and sections, loaded and tagged once and reused for SCORING only (opening, saving
+# and editing a schedule). Reloading them cost ~3 s per request. Any write through the data-management
+# endpoints clears it, and it expires after SCORING_DATA_TTL_S in case the tables were edited directly
+# in Supabase. run_optimization() never uses it: an algorithm gets a fresh copy it may modify.
+SCORING_DATA_TTL_S = 15 * 60
+_scoring_cache: Dict[str, Any] = {}
+_scoring_lock = threading.Lock()
+
+# A saved schedule never changes after it is saved (there is no update endpoint), so its loaded items
+# are reused; deleting one evicts it. Editing works on copies (schedule_editing.apply_edits).
+_items_cache: "Dict[int, list]" = {}
+_items_lock = threading.Lock()
+MAX_CACHED_SCHEDULES = 4
+
+
+def cached_scoring_data() -> Dict[str, Any]:
+    with _scoring_lock:
+        loaded_at = _scoring_cache.get("loaded_at")
+        if loaded_at is None or time.time() - loaded_at > SCORING_DATA_TTL_S:
+            data = load_scoring_data()
+            data["ts_cache"] = build_timeslot_guideline_cache(data["sections"], data["timeslots"])
+            _scoring_cache["data"] = data
+            _scoring_cache["loaded_at"] = time.time()
+        return _scoring_cache["data"]
+
+
+def invalidate_scoring_data() -> None:
+    with _scoring_lock:
+        _scoring_cache.clear()
+
+
+def cached_schedule_items(schedule_id: int) -> list:
+    with _items_lock:
+        if schedule_id in _items_cache:
+            _items_cache[schedule_id] = _items_cache.pop(schedule_id)     # most recent last
+            return _items_cache[schedule_id]
+    items = load_schedule(schedule_id)
+    with _items_lock:
+        _items_cache[schedule_id] = items
+        while len(_items_cache) > MAX_CACHED_SCHEDULES:
+            _items_cache.pop(next(iter(_items_cache)))
+    return items
 
 
 class TimetableRequest(BaseModel):
@@ -280,7 +363,8 @@ def evaluate_schedule(schedule_items, scheduling_data: Dict[str, Any]) -> Dict[s
     timeslots = scheduling_data["timeslots"]
     sections = scheduling_data["sections"]
 
-    ts_cache = build_timeslot_guideline_cache(sections, timeslots)
+    # Depends only on sections and timeslots (~3 s to build), so cached_scoring_data() keeps one.
+    ts_cache = scheduling_data.get("ts_cache") or build_timeslot_guideline_cache(sections, timeslots)
 
     # Reported in TIERS, mirroring the tier note in constraints/rooms.py and evaluation.py.
     # This used to be one flat dict in which `instructor` and `room` sat as
@@ -373,6 +457,7 @@ def crud_list(table: str, order_by: Optional[str] = None):
 def crud_insert(table: str, data: Dict[str, Any]):
     data = {k: v for k, v in data.items() if v is not None}
     res = supabase.table(table).insert(data).execute()
+    invalidate_scoring_data()
     if not res.data:
         raise HTTPException(status_code=400, detail=f"Failed to insert into {table}")
     return res.data[0]
@@ -381,6 +466,7 @@ def crud_insert(table: str, data: Dict[str, Any]):
 def crud_update(table: str, id_col: str, id_val: Any, data: Dict[str, Any]):
     data = {k: v for k, v in data.items() if k != id_col}
     res = supabase.table(table).update(data).eq(id_col, id_val).execute()
+    invalidate_scoring_data()
     if not res.data:
         raise HTTPException(status_code=404, detail=f"{table} row not found")
     return res.data[0]
@@ -388,6 +474,7 @@ def crud_update(table: str, id_col: str, id_val: Any, data: Dict[str, Any]):
 
 def crud_delete(table: str, id_col: str, id_val: Any):
     res = supabase.table(table).delete().eq(id_col, id_val).execute()
+    invalidate_scoring_data()
     if not res.data:
         raise HTTPException(status_code=404, detail=f"{table} row not found")
     return {"status": "deleted"}
@@ -518,13 +605,64 @@ async def optimize(
     return {"status": "success", "timetable": result}
 
 
+class JobCancelled(BaseException):
+    """Raised inside a job's worker thread to stop it (see cancel_job).
+
+    A BaseException, not an Exception, so the algorithms' own `except Exception` blocks can't
+    swallow it and carry on.
+    """
+
+
+def _interrupt_thread(thread_id: int) -> bool:
+    """Make *thread_id* raise JobCancelled at its next Python instruction (CPython only).
+
+    Python has no way to kill a thread. This is the standard workaround: the exception is
+    delivered the next time the thread runs Python code, so an algorithm stops within a moment,
+    and a long C call (a database read, an XGBoost prediction) is allowed to finish first.
+    `with` blocks and `finally` clauses still run on the way out, so locks are released.
+    """
+    hit = ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_ulong(thread_id), ctypes.py_object(JobCancelled))
+    if hit > 1:     # never expected: undo rather than interrupt threads we didn't mean to
+        ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_ulong(thread_id), None)
+        return False
+    return hit == 1
+
+
 def _run_job(job_id: str, algorithm: str, num_runs: int, use_preferences: bool = False) -> None:
-    """Worker function executed in a thread pool for async optimization jobs."""
+    """Worker function executed in a thread pool for async optimization jobs.
+
+    Cancellation safety: cancel_job() interrupts this thread only while job["thread_id"] is set,
+    and sets and reads it under job["lock"]. So an interrupt can only be pending while this
+    function is still running, and the loop at the end of the try block makes sure a pending
+    one is raised here, not later in the pool's own code where it would kill the worker.
+    """
+    job = _jobs[job_id]
     try:
-        result = run_optimization(algorithm, num_runs=num_runs, use_preferences=use_preferences)
-        _jobs[job_id] = {"status": "done", "result": result}
+        with job["lock"]:
+            if job.get("cancel_requested"):
+                raise JobCancelled
+            job["thread_id"] = threading.get_ident()
+            job["running_since"] = time.time()
+        try:
+            result = run_optimization(algorithm, num_runs=num_runs, use_preferences=use_preferences)
+        finally:
+            with job["lock"]:
+                job["thread_id"] = None
+        update = {"status": "done", "result": result}
+        for _ in range(64):     # backward jumps: CPython delivers any pending interrupt here
+            pass
+    except JobCancelled:
+        update = {"status": "cancelled"}
+    except HTTPException as exc:
+        update = {"status": "error", "error": str(exc.detail)}
     except Exception as exc:
-        _jobs[job_id] = {"status": "error", "error": str(exc)}
+        update = {"status": "error", "error": str(exc)}
+    if job.get("cancel_requested"):
+        # Cancelled while it was finishing: the person asked not to have it.
+        update = {"status": "cancelled"}
+    with _jobs_lock:
+        job.update(update, finished_at=time.time())
+        _prune_jobs()
 
 
 @app.post("/api/optimize/async")
@@ -535,31 +673,74 @@ async def optimize_async(
 ):
     """
     Async optimize — starts the job in a background thread and returns a job_id
-    immediately. Use GET /api/jobs/{job_id} to poll for the result.
-    Intended for multi-run genetic/hybrid experiments (num_runs up to 30).
+    immediately. Use GET /api/jobs/{job_id} to poll for the result, and
+    POST /api/jobs/{job_id}/cancel to stop it.
     """
     job_id = str(uuid.uuid4())
-    _jobs[job_id] = {"status": "running"}
-    loop = asyncio.get_event_loop()
-    loop.run_in_executor(
-        _executor, _run_job, job_id, request.algorithm, request.num_runs, request.use_preferences
-    )
+    with _jobs_lock:
+        _jobs[job_id] = {
+            "job_id": job_id, "status": "running", "user_id": user_id,
+            "algorithm": request.algorithm, "num_runs": request.num_runs,
+            "started_at": time.time(), "finished_at": None,
+            "lock": threading.Lock(), "thread_id": None, "running_since": None,
+        }
+        # Stored so a job still waiting for a free worker can be cancelled before it starts.
+        _jobs[job_id]["future"] = _executor.submit(
+            _run_job, job_id, request.algorithm, request.num_runs, request.use_preferences
+        )
     return {"job_id": job_id, "status": "running"}
+
+
+@app.get("/api/jobs")
+async def list_jobs(user_id: int = Depends(get_current_user_id)):
+    """This user's jobs, newest first, without their results: what the navbar indicator polls."""
+    with _jobs_lock:
+        _prune_jobs()
+        mine = [job_summary(j) for j in _jobs.values() if j.get("user_id") == user_id]
+    return sorted(mine, key=lambda j: j["started_at"] or 0, reverse=True)
+
+
+def _own_job(job_id: str, user_id: int) -> Dict[str, Any]:
+    job = _jobs.get(job_id)
+    # Someone else's job answers exactly like a missing one, so job ids can't be probed.
+    if job is None or job.get("user_id") != user_id:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return job
 
 
 @app.get("/api/jobs/{job_id}")
 async def get_job(job_id: str, user_id: int = Depends(get_current_user_id)):
-    """Poll the result of an async optimization job."""
-    job = _jobs.get(job_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail="Job not found")
-    if job["status"] == "running":
-        return {"status": "running"}
+    """Poll an async optimization job. The result stays readable until it expires (see _jobs)."""
+    job = _own_job(job_id, user_id)
+    if job["status"] in ("running", "cancelled"):
+        return job_summary(job)
     if job["status"] == "error":
         raise HTTPException(status_code=500, detail=job["error"])
-    result = job["result"]
-    del _jobs[job_id]
-    return {"status": "done", "timetable": result}
+    return {**job_summary(job), "timetable": job["result"]}
+
+
+@app.post("/api/jobs/{job_id}/cancel")
+async def cancel_job(job_id: str, user_id: int = Depends(get_current_user_id)):
+    """Stop a run. A queued one never starts; a running one is interrupted (see _interrupt_thread).
+
+    The job reads "cancelled" straight away. Its worker is free again as soon as the algorithm
+    reaches its next Python instruction, normally well under a second.
+    """
+    job = _own_job(job_id, user_id)
+    if job["status"] != "running":
+        raise HTTPException(status_code=409, detail=f"This run has already {job['status'] if job['status'] != 'done' else 'finished'}.")
+    with job["lock"]:
+        first_request = not job.get("cancel_requested")
+        job["cancel_requested"] = True
+        future = job.get("future")
+        if future is not None and future.cancel():
+            pass                                       # still queued: it will never run
+        elif first_request and job.get("thread_id") is not None:
+            _interrupt_thread(job["thread_id"])        # at most once per job
+    with _jobs_lock:
+        job.update(status="cancelled", finished_at=time.time())
+        job.pop("result", None)
+    return job_summary(job)
 
 
 def schedule_metrics_row(evaluation: Dict[str, Any]) -> Dict[str, Any]:
@@ -637,7 +818,7 @@ def create_schedule(
     # the database. The numbers saved are then the numbers a later reload gives.
     schedule_id = result["schedule"]["schedule_id"]
     try:
-        evaluation = evaluate_schedule(load_schedule(schedule_id), load_scoring_data())
+        evaluation = evaluate_schedule(cached_schedule_items(schedule_id), cached_scoring_data())
         metrics = schedule_metrics_row(evaluation)
     except Exception as exc:
         # The rows are saved; only the measurement failed. Say so rather than
@@ -688,10 +869,11 @@ def baseline() -> Dict[str, Any]:
             )
             if not res or not res.data:
                 raise HTTPException(status_code=404, detail="Base schedule not found")
-            items = load_schedule(BASE_SCHEDULE_ID)
-            data = load_scoring_data()
+            items = cached_schedule_items(BASE_SCHEDULE_ID)
+            data = cached_scoring_data()
             evaluation = evaluate_schedule(items, data)
             _baseline_cache["items"] = enrich_schedule_items(items, data["rooms"], data["timeslots"])
+            _baseline_cache["problems"] = find_problems(items, data["rooms"], data["sections"])
             _baseline_cache["row"] = {
                 **res.data,
                 **schedule_metrics_row(evaluation),
@@ -731,17 +913,95 @@ async def list_schedules(user_id: int = Depends(get_current_user_id)):
 def get_schedule(schedule_id: int, user_id: int = Depends(get_current_user_id)):
     # The manual schedule is readable by every signed-in user (Compare's side A)
     # though it belongs to another account; it is served from the cache, read-only.
+    # `problems` names the items behind the hard-conflict and unscheduled counts (by index into
+    # `schedule`), so the page can say which classes they are.
     if schedule_id == BASE_SCHEDULE_ID:
         cached = baseline()
-        return {"metadata": cached["row"], "schedule": cached["items"]}
+        return {"metadata": cached["row"], "schedule": cached["items"], "problems": cached["problems"]}
 
     metadata = get_schedule_for_user(schedule_id, user_id)
-    schedule_items = load_schedule(schedule_id)
+    schedule_items = cached_schedule_items(schedule_id)
 
-    scheduling_data = load_scoring_data()
-    enriched = enrich_schedule_items(schedule_items, scheduling_data["rooms"], scheduling_data["timeslots"])
+    data = cached_scoring_data()
+    enriched = enrich_schedule_items(schedule_items, data["rooms"], data["timeslots"])
 
-    return {"metadata": metadata, "schedule": enriched}
+    return {"metadata": metadata, "schedule": enriched,
+            "problems": find_problems(schedule_items, data["rooms"], data["sections"])}
+
+
+def readable_schedule_items(schedule_id: int, user_id: int) -> list:
+    """The saved items of a schedule this user may read: their own, or the manual base schedule."""
+    if schedule_id != BASE_SCHEDULE_ID:
+        get_schedule_for_user(schedule_id, user_id)
+    return cached_schedule_items(schedule_id)
+
+
+class ScheduleEdit(BaseModel):
+    idx: int = Field(..., ge=0)
+    room_id: Optional[int] = None
+    timeslot_id: Optional[int] = None
+
+
+class ReviewRequest(BaseModel):
+    edits: List[ScheduleEdit] = Field(default_factory=list, max_length=5000)
+
+
+class PlacementRequest(ReviewRequest):
+    idx: int = Field(..., ge=0)
+
+
+def _edited_items(schedule_id: int, user_id: int, edits: List[ScheduleEdit]) -> list:
+    try:
+        return apply_edits(readable_schedule_items(schedule_id, user_id), [e.model_dump() for e in edits])
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+# Plain `def`s: scoring takes a second or two and must not block the event loop.
+@app.post("/api/schedules/{schedule_id}/review")
+def review_schedule(schedule_id: int, request: ReviewRequest, user_id: int = Depends(get_current_user_id)):
+    """Score a saved schedule with unsaved hand edits applied, and list what is still wrong.
+
+    Nothing is written: the Edit page calls this after every change so its numbers are the
+    evaluator's, not the browser's guess. Saving still goes through POST /api/schedules.
+    """
+    items = _edited_items(schedule_id, user_id, request.edits)
+    data = cached_scoring_data()
+    evaluation = evaluate_schedule(items, data)
+    return {
+        "fitness": evaluation["fitness"],
+        "conflicts": evaluation["conflicts"],
+        "unscheduled": evaluation["unscheduled"],
+        "scheduled": evaluation["scheduled"],
+        "total_sections": evaluation["total_sections"],
+        "evaluation": evaluation_breakdown(evaluation),
+        "problems": find_problems(items, data["rooms"], data["sections"]),
+    }
+
+
+@app.post("/api/schedules/{schedule_id}/placements")
+def schedule_placements(schedule_id: int, request: PlacementRequest, user_id: int = Depends(get_current_user_id)):
+    """Every room and time where one class could go without a hard conflict, cheapest soft cost first.
+
+    Checked against the schedule as edited so far (request.edits), with the class itself left out,
+    so it works both for placing an unscheduled class and for moving a clashing one.
+    """
+    items = _edited_items(schedule_id, user_id, request.edits)
+    if request.idx >= len(items):
+        raise HTTPException(status_code=422, detail=f"No item {request.idx} in this schedule")
+    data = cached_scoring_data()
+    result = find_placements(items, request.idx, data["rooms"], data["timeslots"], data["sections"])
+    rooms = {r.id: r for r in data["rooms"]}
+    slots = {t.id: t for t in data["timeslots"]}
+    for time_option in result["candidates"]:
+        ts = slots[time_option["timeslot_id"]]
+        time_option.update(day=ts.day, start=ts.start, end=ts.end)
+        for option in time_option["rooms"]:
+            room = rooms.get(option["room_id"])
+            if room is not None:
+                option.update(room_no=room.no, room_building=room.building,
+                              room_type=room.type, room_capacity=room.capacity)
+    return result
 
 
 @app.delete("/api/schedules/{schedule_id}")
@@ -749,6 +1009,8 @@ async def delete_schedule(schedule_id: int, user_id: int = Depends(get_current_u
     get_schedule_for_user(schedule_id, user_id)
     supabase.table("schedule_detailes").delete().eq("schedule_id", schedule_id).execute()
     supabase.table("schedule").delete().eq("schedule_id", schedule_id).execute()
+    with _items_lock:
+        _items_cache.pop(schedule_id, None)
     return {"status": "deleted"}
 
 
@@ -885,6 +1147,12 @@ async def delete_prerequisite(course_id: int, req_course_id: int, user_id: int =
     if not res.data:
         raise HTTPException(status_code=404, detail="Prerequisite not found")
     return {"status": "deleted"}
+
+
+@app.get("/api/colleges")
+async def list_colleges(user_id: int = Depends(get_current_user_id)):
+    """college_id -> name. department.college_id points here; the timetable colours classes by college."""
+    return crud_list("college", order_by="college_id")
 
 
 @app.get("/api/departments")

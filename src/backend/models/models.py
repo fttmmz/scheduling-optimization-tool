@@ -2,8 +2,31 @@
 
 
 def pattern_key(row):
-    """Identity of one meeting block, ignoring which instructor filed the row."""
-    return (row["room_id"], row["timeslot_id"], row["sec_capacity"])
+    """Identity of one meeting block, ignoring which instructor filed the row.
+
+    `block` tells apart two meetings of one section that sit in the SAME room at the SAME time
+    (a clash, or two meetings both left unplaced). Without it they read back as one meeting: the
+    clash vanished and a meeting was lost. Saved schedules write it (see meeting_blocks); the
+    registrar's rows have none, which reads as 0, so their grouping is unchanged.
+    """
+    block = row.get("block") or 0
+    key = (row["room_id"], row["timeslot_id"], row["sec_capacity"])
+    return key + (block,) if block else key
+
+
+def meeting_blocks(items):
+    """For each item, how many earlier items of its section have the same room, time and capacity.
+
+    0 for almost every item; 1, 2, ... only for repeats. Saving this as `block` lets
+    group_rows_by_pattern() keep identical meetings apart on reload.
+    """
+    seen = {}
+    blocks = []
+    for item in items:
+        key = (item.course_id, str(item.section), item.room_id, item.timeslot_id, item.capacity)
+        blocks.append(seen.get(key, 0))
+        seen[key] = blocks[-1] + 1
+    return blocks
 
 
 SCHEDULE_ROW_ORDER = ("course_id", "section", "room_id", "timeslot_id", "instructor_id", "sec_capacity")
