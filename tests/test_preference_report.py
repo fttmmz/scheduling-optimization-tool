@@ -2,7 +2,7 @@
 from datetime import time
 from types import SimpleNamespace
 
-from backend.Optimization.provisional_preference_penalty import calculate_instructor_preference_penalty
+from backend.Optimization.InstructorPreferences.preference_penalty import calculate_instructor_preference_penalty
 from backend.preference_report import build_preference_report, load_instructor_names
 
 SLOTS = [
