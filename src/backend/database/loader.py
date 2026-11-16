@@ -1,5 +1,6 @@
 from backend.models.models import (
-    Room, Timeslot, build_sections, group_rows_by_pattern, schedule_row_sort_key, section_info_index,
+    Room, Timeslot, build_sections, group_rows_by_pattern, meeting_blocks, schedule_row_sort_key,
+    section_info_index,
 )
 from backend.database.db import supabase
 from backend.Optimization.constraints import (
@@ -172,29 +173,51 @@ def save_schedule(schedule_items, schedule_detailes):
     # collapses the rows of one meeting block back into a single item carrying every
     # instructor, so a team-taught class keeps all its teachers through a save/load.
     # Writing only item.instructor_id kept the first and lost the rest.
+    #
+    # `block` keeps apart two meetings of one section that sit in the same room at the same
+    # time (see models.pattern_key). It is written only when the schedule has such a pair, so a
+    # database without the column still saves every other schedule.
+    blocks = meeting_blocks(schedule_items)
+    with_blocks = any(blocks)
     detail_records = []
-    for item in schedule_items:
+    for item, block in zip(schedule_items, blocks):
         instructor_ids = list(getattr(item, "instructor_ids", None) or [item.instructor_id])
         for instructor_id in instructor_ids:
-            detail_records.append(
-                {
-                    "schedule_id": schedule_id,
-                    "course_id": item.course_id,
-                    "section": item.section,
-                    "instructor_id": instructor_id,
-                    "room_id": item.room_id,
-                    "timeslot_id": item.timeslot_id,
-                    "sec_capacity": item.capacity,
-                }
-            )
+            record = {
+                "schedule_id": schedule_id,
+                "course_id": item.course_id,
+                "section": item.section,
+                "instructor_id": instructor_id,
+                "room_id": item.room_id,
+                "timeslot_id": item.timeslot_id,
+                "sec_capacity": item.capacity,
+            }
+            if with_blocks:
+                record["block"] = block
+            detail_records.append(record)
 
-    detail_res = supabase.table("schedule_detailes").insert(detail_records).execute()
+    blocks_saved = with_blocks
+    try:
+        detail_res = supabase.table("schedule_detailes").insert(detail_records).execute()
+    except Exception:
+        if not with_blocks:
+            raise
+        # No `block` column yet (alter table public.schedule_detailes add column block smallint
+        # not null default 0). Save without it: identical meetings will merge on reload, as before.
+        print("[save_schedule] WARNING: schedule_detailes has no `block` column; "
+              "identical meetings of one section will read back as one.")
+        for record in detail_records:
+            record.pop("block", None)
+        blocks_saved = False
+        detail_res = supabase.table("schedule_detailes").insert(detail_records).execute()
     if not getattr(detail_res, "data", None):
         raise RuntimeError("Failed to save schedule rows: no data returned")
 
     return {
         "schedule": saved_schedule,
         "details_saved": len(detail_records),
+        # False when identical meetings had to be saved without their block number.
+        "blocks_saved": blocks_saved or not with_blocks,
     }
 
 
