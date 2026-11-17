@@ -16,6 +16,7 @@ from backend.Optimization.evaluation import (
     count_hard_conflicts,
     count_instructor_conflicts,
     count_room_conflicts,
+    count_sibling_conflicts,
     count_room_rule_violations,
     soft_violation_counts,
     total_soft_penalty,
@@ -106,6 +107,48 @@ def test_null_timeslot_never_conflicts():
     schedule = [item(course_id=i, instructor_id="1556", timeslot_id=None)
                 for i in range(10)]
     assert count_instructor_conflicts(schedule) == 0
+
+
+TBA_TS, ZERO_TS, REAL_TS = 9701, 9702, 9703      # ids no other test uses: Timeslot() registers them globally
+
+
+def _placeholder_slots():
+    from backend.models.models import Timeslot
+    Timeslot({"timeslot_id": TBA_TS, "day": None, "start_time": None, "end_time": None})
+    Timeslot({"timeslot_id": ZERO_TS, "day": "S", "start_time": "08:00:00", "end_time": "08:00:00"})
+    Timeslot({"timeslot_id": REAL_TS, "day": "S", "start_time": "08:00:00", "end_time": "09:15:00"})
+
+
+@pytest.mark.parametrize("slot", [TBA_TS, ZERO_TS])
+def test_classes_on_a_placeholder_slot_never_clash(slot):
+    """The registrar parks hundreds of internships and theses on the TBA slot, several under one
+    instructor. They meet at no fixed hour, so they are not in two places at once. Counting them gave
+    the manual schedule 153 hard conflicts instead of 111."""
+    _placeholder_slots()
+    one_instructor = [item(course_id=i, instructor_id="1556", timeslot_id=slot) for i in range(5)]
+    one_room = [item(course_id=i, room_id=7, timeslot_id=slot) for i in range(5)]
+    one_section = [item(course_id=1, section="61", timeslot_id=slot) for _ in range(2)]
+    assert count_instructor_conflicts(one_instructor) == 0
+    assert count_room_conflicts(one_room) == 0
+    assert count_sibling_conflicts(one_section) == 0
+    assert count_hard_conflicts(one_instructor + one_room) == 0
+
+
+def test_the_placeholder_rule_does_not_hide_a_real_clash():
+    _placeholder_slots()
+    schedule = [item(course_id=i, instructor_id="1556", room_id=7, timeslot_id=REAL_TS) for i in range(2)]
+    assert count_instructor_conflicts(schedule) == 1
+    assert count_room_conflicts(schedule) == 1
+    # A slot that was never loaded keeps the slot-id rule (the tests above rely on it, with TS).
+    assert count_instructor_conflicts([item(course_id=i, instructor_id="1556", timeslot_id=TS) for i in range(2)]) == 1
+
+
+def test_the_editor_lists_no_clash_on_a_placeholder_slot():
+    """The Fix schedule page's problem list must agree with the evaluator's count."""
+    from backend.schedule_editing import find_problems
+    _placeholder_slots()
+    on_tba = [item(course_id=i, instructor_id="1556", room_id=7, timeslot_id=TBA_TS) for i in range(3)]
+    assert find_problems(on_tba, [room(room_id=7)], sections=[])["hard_by_kind"] == {}
 
 
 # ── Cross-listed collapse, and its limits ────────────────────────────────────
