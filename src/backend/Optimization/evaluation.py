@@ -16,6 +16,7 @@ from backend.Optimization.constraints import (
     get_valid_timeslots_for_section,
     group_siblings,
     instructor_occupancy_ids,
+    is_placeholder_slot,
     occupancy_key,
     room_rule_violations,
     room_soft_penalty,
@@ -80,6 +81,13 @@ def _count_slot_conflicts(schedule: list, slot_of) -> int:
     )
 
 
+def _has_time(item) -> bool:
+    """Placed at a real hour. No slot, and the placeholder slots (TBA, zero-length), are no hour at all:
+    two classes there are not in two places at once. Counting them made the manual schedule score 153 hard
+    conflicts instead of 111 -- 42 "instructor clashes" between internships and theses parked on TBA."""
+    return item.timeslot_id is not None and not is_placeholder_slot(item.timeslot_id)
+
+
 # Real-time clashes. The counts below are by slot ID (two classes on the same slot); each also adds the
 # pairs on DIFFERENT slots that overlap in real time (constraints/overlap.py), which the slot-ID count
 # cannot see: a room at M 09:30-10:45 and MW 09:30-10:45 is double-booked on Monday.
@@ -100,7 +108,7 @@ def count_instructor_conflicts(schedule: list) -> int:
     slots = defaultdict(list)
     by_instructor = defaultdict(list)
     for item in schedule:
-        if item.timeslot_id is None:
+        if not _has_time(item):
             continue
         for instructor_id in instructor_occupancy_ids(item):
             slots[(instructor_id, item.timeslot_id)].append(item)
@@ -126,11 +134,11 @@ def count_sibling_conflicts(schedule: list) -> int:
     groups = group_siblings(schedule).values()
     for group in groups:
         counts = Counter(
-            item.timeslot_id for item in group if item.timeslot_id is not None
+            item.timeslot_id for item in group if _has_time(item)
         )
         conflicts += sum(max(0, n - 1) for n in counts.values())
     return conflicts + cross_slot_pairs(
-        [item for item in group if item.timeslot_id is not None] for group in groups
+        [item for item in group if _has_time(item)] for group in groups
     )
 
 
@@ -138,13 +146,13 @@ def count_room_conflicts(schedule: list) -> int:
     """HARD: one room hosting two classes at once."""
     by_room = defaultdict(list)
     for item in schedule:
-        if item.room_id is not None and item.timeslot_id is not None:
+        if item.room_id is not None and _has_time(item):
             by_room[item.room_id].append(item)
     return _count_slot_conflicts(
         schedule,
         lambda item: (
             None
-            if item.room_id is None or item.timeslot_id is None
+            if item.room_id is None or not _has_time(item)
             else (item.room_id, item.timeslot_id)
         ),
     ) + cross_slot_pairs(by_room.values(), same_class)

@@ -23,6 +23,7 @@ from backend.Optimization.constraints import (
     classify_section,
     group_siblings,
     instructor_occupancy_ids,
+    is_placeholder_slot,
     item_needs,
     get_valid_timeslots_for_section,
     rank_rooms,
@@ -111,7 +112,9 @@ def find_problems(items, rooms, sections, max_hard=400, max_unscheduled=1000):
 
 
 def _all_problems(items, rooms, sections):
-    timed = [(i, it) for i, it in enumerate(items) if it.timeslot_id is not None]
+    # Placeholder slots (TBA) are no hour, so classes there can't clash: the same rule as the evaluator.
+    timed = [(i, it) for i, it in enumerate(items)
+             if it.timeslot_id is not None and not is_placeholder_slot(it.timeslot_id)]
     hard = []
 
     by_room = defaultdict(list)
