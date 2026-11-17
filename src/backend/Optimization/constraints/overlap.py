@@ -58,6 +58,24 @@ def overlap_minutes(slot_a, slot_b):
     return max(0, min(a[2], b[2]) - max(a[1], b[1]))
 
 
+def is_placeholder_slot(slot_id):
+    """True for a slot that means "no fixed time": the TBA bucket (no day) or a slot with no length.
+
+    The same rule as timeslots.is_placeholder_timeslot(), for callers that hold only an id. A class
+    parked there does not meet at any hour, so it cannot be in two places at once: the registrar puts
+    hundreds of internships and theses on the TBA slot, often several under one instructor. An id that
+    was never loaded is not a placeholder; it keeps the slot-ID rule.
+    """
+    times = SLOT_TIMES.get(slot_id)
+    if times is None:
+        return False
+    day, start, end = times
+    if not day:
+        return True
+    start, end = _parse_time_to_minutes(start), _parse_time_to_minutes(end)
+    return start is None or end is None or end <= start
+
+
 def slots_clash(slot_a, slot_b):
     """True when the two slots are the same slot or overlap in real time."""
     if slot_a is None or slot_b is None:
