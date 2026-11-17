@@ -4,6 +4,7 @@ import time
 import uuid
 import asyncio
 import threading
+from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional
 
@@ -1092,6 +1093,31 @@ async def delete_schedule(schedule_id: int, user_id: int = Depends(get_current_u
     return {"status": "deleted"}
 
 
+# --- The schedule instructors see ---
+# At most one schedule is published at a time (a partial unique index on is_published
+# enforces it in the database). Publishing another one takes the flag off the old one
+# first. Only the schedule's owner can publish or withdraw it; instructors own none.
+
+@app.put("/api/schedules/{schedule_id}/publish")
+def publish_schedule(schedule_id: int, user_id: int = Depends(get_current_user_id)):
+    get_schedule_for_user(schedule_id, user_id)
+    supabase.table("schedule").update({"is_published": False, "published_at": None}).eq("is_published", True).execute()
+    res = (
+        supabase.table("schedule")
+        .update({"is_published": True, "published_at": datetime.now(timezone.utc).isoformat()})
+        .eq("schedule_id", schedule_id)
+        .execute()
+    )
+    return res.data[0] if res.data else {"schedule_id": schedule_id, "is_published": True}
+
+
+@app.delete("/api/schedules/{schedule_id}/publish")
+def unpublish_schedule(schedule_id: int, user_id: int = Depends(get_current_user_id)):
+    get_schedule_for_user(schedule_id, user_id)
+    supabase.table("schedule").update({"is_published": False, "published_at": None}).eq("schedule_id", schedule_id).execute()
+    return {"schedule_id": schedule_id, "is_published": False}
+
+
 # --- Courses ---
 
 @app.get("/api/courses")
@@ -1155,6 +1181,49 @@ async def save_my_preferences(
         "instructor": instructor,
         "preferences": save_preference(supabase, instructor["inst_id"], preference),
     }
+
+
+def my_preference_result(items, timeslots, instructor: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """This instructor's row of the preference report, or None if they saved none or it can't be read."""
+    try:
+        row = load_preference(supabase, instructor["inst_id"])
+        if not row:
+            return None
+        key = str(instructor["inst_id"])
+        pref = PreferenceIn.model_validate(row).model_dump()
+        report = build_preference_report(items, timeslots, {key: pref}, {key: instructor.get("name")})
+        return report["instructors"][0]
+    except Exception as exc:
+        print(f"[my schedule] could not judge preferences for {instructor.get('inst_id')}: {exc}")
+        return None
+
+
+@app.get("/api/my/schedule")
+def get_my_schedule(instructor: Dict[str, Any] = Depends(get_current_instructor)):
+    """The signed-in instructor's classes in the published schedule, and how their preferences fared.
+
+    Only their own classes: every item that lists them, co-taught ones included. `schedule`
+    is null while nothing is published. A plain `def`: the schedule and preference reads block.
+    """
+    res = (
+        supabase.table("schedule")
+        .select("schedule_id, name, published_at")
+        .eq("is_published", True)
+        .limit(1)
+        .execute()
+    )
+    published = res.data[0] if res.data else None
+    out = {"instructor": instructor, "schedule": published, "classes": [], "preferences": None}
+    if not published:
+        return out
+
+    me = str(instructor["inst_id"])
+    items = cached_schedule_items(published["schedule_id"])
+    mine = [item for item in items if me in {str(i) for i in (item.instructor_ids or ())}]
+    data = cached_scoring_data()
+    out["classes"] = enrich_schedule_items(mine, data["rooms"], data["timeslots"])
+    out["preferences"] = my_preference_result(mine, data["timeslots"], instructor)
+    return out
 
 
 # --- Rooms ---
