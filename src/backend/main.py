@@ -35,6 +35,7 @@ from backend.Optimization.InstructorPreferences.preference_config import (
 )
 from backend.database.db import supabase
 from backend.database.loader import get_scheduling_data, load_schedule, save_schedule
+from backend.fairness_report import build_fairness_report
 from backend.preference_report import build_preference_report, load_instructor_names
 from backend.preferences import (
     PreferenceIn,
@@ -377,7 +378,17 @@ def run_optimization(algorithm: str, num_runs: int = 1, use_preferences: bool = 
             build_preference_report(schedule_items, scheduling_data["timeslots"], preferences, instructor_names)
             if preferences is not None else None
         ),
+        "fairness": measure_fairness(schedule_items, scheduling_data["timeslots"], preferences, instructor_names),
     }
+
+
+def measure_fairness(schedule_items, timeslots, preferences, names):
+    """Workload and preference fairness, or None if measuring fails: an extra never fails a run."""
+    try:
+        return build_fairness_report(schedule_items, timeslots, preferences, names)
+    except Exception as exc:
+        print(f"[fairness] could not measure fairness: {exc}")
+        return None
 
 
 def load_scoring_data() -> Dict[str, Any]:
@@ -1031,6 +1042,19 @@ def get_schedule_preference_report(schedule_id: int, user_id: int = Depends(get_
     if preferences is None:
         raise HTTPException(status_code=503, detail="Saved preferences could not be read")
     return build_preference_report(items, cached_scoring_data()["timeslots"], preferences, names)
+
+
+@app.get("/api/schedules/{schedule_id}/fairness")
+def get_schedule_fairness(schedule_id: int, user_id: int = Depends(get_current_user_id)):
+    """How evenly a saved schedule spreads teaching load and preference results across instructors.
+
+    Readable for the user's own schedules and the manual one, like GET /api/schedules/{id}.
+    `preferences` is null when saved preferences can't be read or none exist; workload is
+    measured either way.
+    """
+    items = readable_schedule_items(schedule_id, user_id)
+    preferences, names = load_preference_inputs()
+    return build_fairness_report(items, cached_scoring_data()["timeslots"], preferences, names)
 
 
 @app.post("/api/schedules/{schedule_id}/placements")

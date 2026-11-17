@@ -344,6 +344,28 @@ def test_saved_schedule_preference_report_follows_schedule_ownership(client, fak
     assert client.get("/api/schedules/21/preferences", headers=ADMIN).status_code == 403
 
 
+def test_a_run_reports_workload_and_preference_fairness(client, fake):
+    fake.tables["preference"] = [dict(SAVED_PREFERENCE)]
+    t = client.post("/api/optimize", headers=ADMIN, json={"algorithm": "greedy"}).json()["timetable"]
+    workload = t["fairness"]["workload"]
+    assert workload["instructors"] > 0
+    assert 0 <= workload["hours"]["fairness_score"] <= 100
+    assert t["fairness"]["preferences"]["instructors"] in (0, 1)
+
+
+def test_fairness_without_saved_preferences_still_measures_workload(client):
+    t = client.post("/api/optimize", headers=ADMIN, json={"algorithm": "greedy"}).json()["timetable"]
+    assert t["fairness"]["preferences"] is None
+    assert t["fairness"]["workload"]["instructors"] > 0
+
+
+def test_saved_schedule_fairness_follows_schedule_ownership(client, fake):
+    r = client.get("/api/schedules/20/fairness", headers=ADMIN)
+    assert r.status_code == 200 and r.json()["workload"]["instructors"] > 0
+    assert client.get("/api/schedules/10/fairness", headers=ADMIN).status_code == 200    # the manual schedule
+    assert client.get("/api/schedules/21/fairness", headers=ADMIN).status_code == 403
+
+
 def test_unknown_algorithm_is_a_400(client):
     r = client.post("/api/optimize", headers=ADMIN, json={"algorithm": "quantum"})
     assert r.status_code == 400 and "Available" in r.json()["detail"]
