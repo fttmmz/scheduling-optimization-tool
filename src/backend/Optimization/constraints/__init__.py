@@ -61,6 +61,7 @@ from .overlap import (
     OwnerMap,
     clashing_slots,
     cross_slot_pairs,
+    is_placeholder_slot,
     overlap_minutes,
     same_class,
     single_owner,
