@@ -366,6 +366,65 @@ def test_saved_schedule_fairness_follows_schedule_ownership(client, fake):
     assert client.get("/api/schedules/21/fairness", headers=ADMIN).status_code == 403
 
 
+# ── The published schedule and an instructor's view of it ────────────────────
+
+def _a_teaching_instructor(greedy_items):
+    return next(str(i) for item in greedy_items if item.timeslot_id is not None for i in item.instructor_ids)
+
+
+def test_publishing_clears_the_old_one_then_flags_the_new_one(client, fake):
+    r = client.put("/api/schedules/20/publish", headers=ADMIN)
+    assert r.status_code == 200
+    updates = [(payload, filters) for op, table, payload, filters in fake.writes if op == "update" and table == "schedule"]
+    assert updates[0] == ({"is_published": False, "published_at": None}, [("is_published", True)])
+    assert updates[1][0]["is_published"] is True and updates[1][0]["published_at"]
+    assert updates[1][1] == [("schedule_id", 20)]
+
+
+def test_only_the_owner_can_publish_or_withdraw_a_schedule(client, fake):
+    assert client.put("/api/schedules/21/publish", headers=ADMIN).status_code == 403
+    assert client.put("/api/schedules/10/publish", headers=INSTRUCTOR).status_code == 403
+    assert client.delete("/api/schedules/21/publish", headers=ADMIN).status_code == 403
+    assert client.put("/api/schedules/404/publish", headers=ADMIN).status_code == 404
+    assert not [w for w in fake.writes if w[0] == "update"]
+    assert client.delete("/api/schedules/20/publish", headers=ADMIN).json() == {"schedule_id": 20, "is_published": False}
+
+
+def test_an_instructor_sees_nothing_until_a_schedule_is_published(client, fake):
+    fake.tables["instructor"] = [{"inst_id": 1551, "name": "Dr. Test", "dept_id": 1, "user_id": 2}]
+    body = client.get("/api/my/schedule", headers=INSTRUCTOR).json()
+    assert body["schedule"] is None and body["classes"] == [] and body["preferences"] is None
+    assert body["instructor"]["inst_id"] == 1551
+
+
+def test_an_instructor_sees_only_their_own_classes_in_the_published_schedule(client, fake, greedy_items):
+    me = _a_teaching_instructor(greedy_items)
+    fake.tables["instructor"] = [{"inst_id": int(me), "name": "Dr. Test", "dept_id": 1, "user_id": 2}]
+    fake.tables["preference"] = [dict(SAVED_PREFERENCE, inst_id=int(me))]
+    fake.tables["schedule"][1].update(is_published=True, published_at="2026-11-17T09:00:00+00:00")
+
+    body = client.get("/api/my/schedule", headers=INSTRUCTOR).json()
+    assert body["schedule"]["schedule_id"] == 20
+    expected = sum(me in {str(i) for i in item.instructor_ids} for item in greedy_items)
+    assert len(body["classes"]) == expected > 0
+    assert all(me in {str(i) for i in c["instructor_ids"]} for c in body["classes"])
+    assert body["preferences"]["inst_id"] == me
+    assert body["preferences"]["checks"][0]["key"] == "time"
+
+
+def test_an_unreadable_preference_does_not_break_the_schedule(client, fake, greedy_items):
+    me = _a_teaching_instructor(greedy_items)
+    fake.tables["instructor"] = [{"inst_id": int(me), "name": "Dr. Test", "dept_id": 1, "user_id": 2}]
+    fake.tables["preference"] = [dict(SAVED_PREFERENCE, inst_id=int(me), time_priority=None)]   # breaks a rule
+    fake.tables["schedule"][1].update(is_published=True)
+    body = client.get("/api/my/schedule", headers=INSTRUCTOR).json()
+    assert body["classes"] and body["preferences"] is None
+
+
+def test_an_account_without_an_instructor_has_no_schedule_page(client):
+    assert client.get("/api/my/schedule", headers=ADMIN).status_code == 403
+
+
 def test_unknown_algorithm_is_a_400(client):
     r = client.post("/api/optimize", headers=ADMIN, json={"algorithm": "quantum"})
     assert r.status_code == 400 and "Available" in r.json()["detail"]
