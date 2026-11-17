@@ -157,6 +157,11 @@ def _greedy_schedule_impl(sections, timeslots, rooms):
 
     occupied_rooms = OverlapSet()
     occupied_instructors = OverlapSet()
+    # (section, slot): the hours one section's students already hold. Two meeting blocks of a section
+    # must not overlap, and a section with no instructor has nothing else to keep them apart. Leaving it
+    # to finalize_schedule was not enough: that repair only moves a block within its own room, and left
+    # a clash whenever that room was full at every other valid hour.
+    occupied_siblings = OverlapSet()
     assigned_timeslots = {}
 
     room_list_cache: dict = {}
@@ -220,6 +225,7 @@ def _greedy_schedule_impl(sections, timeslots, rooms):
         # and for sections with no instructor. `instructor_id` above stays the
         # real recorded value, because the item still has to REPORT it.
         occupying_instructors = instructor_occupancy_ids(section)
+        students = section.sibling_key
 
         def make_item(room_id, timeslot_id):
             return ScheduleItem.from_section(section, room_id, timeslot_id)
@@ -249,9 +255,12 @@ def _greedy_schedule_impl(sections, timeslots, rooms):
                     continue
                 if ts_id in blocked_by_neighbors:
                     continue
+                if (students, ts_id) in occupied_siblings:
+                    continue
                 chosen_ts = ts_id
                 for instructor_id in occupying_instructors:
                     occupied_instructors.add((instructor_id, ts_id))
+                occupied_siblings.add((students, ts_id))
                 assigned_timeslots[node_id] = ts_id
                 preference_tracker.add(section, timeslot)
                 break
@@ -299,6 +308,10 @@ def _greedy_schedule_impl(sections, timeslots, rooms):
             if ts_id in blocked_by_neighbors:
                 continue
 
+            # check another block of this section already at an overlapping hour
+            if (students, ts_id) in occupied_siblings:
+                continue
+
             for room in viable:
                 # check room double-booked -- the only hard reason to skip a
                 # room. Capacity/type/dept/campus are soft and already reflected
@@ -311,6 +324,7 @@ def _greedy_schedule_impl(sections, timeslots, rooms):
                 occupied_rooms.add((room.id, ts_id))
                 for instructor_id in occupying_instructors:
                     occupied_instructors.add((instructor_id, ts_id))
+                occupied_siblings.add((students, ts_id))
                 assigned_timeslots[node_id] = ts_id
                 preference_tracker.add(section, timeslot)
                 schedule.append(make_item(room.id, ts_id))
