@@ -299,6 +299,21 @@ def test_greedy_produces_no_hard_conflicts(dataset):
     assert count_hard_conflicts(greedy_schedule(sections, timeslots, rooms)) == 0
 
 
+def test_greedy_keeps_meeting_blocks_apart_without_the_repair(dataset, monkeypatch):
+    """Greedy must not give two blocks of one section the same hour and leave it to finalize_schedule.
+
+    The repair can only move a block to another hour in the SAME room. On the real data (16 Nov) both
+    blocks of 404421 sec 61S, which has no instructor, took W 11:00 in two rooms; room 8 was busy at
+    the section's 38 other hours, so the repair gave up and the run kept a sibling clash (1 hard).
+    """
+    import backend.Optimization.Algorithims.greedy as greedy
+    from backend.Optimization.evaluation import count_sibling_conflicts
+
+    monkeypatch.setattr(greedy, "finalize_schedule", lambda schedule, *a, **k: schedule)
+    sections, timeslots, rooms = dataset
+    assert count_sibling_conflicts(greedy.greedy_schedule(sections, timeslots, rooms)) == 0
+
+
 def test_supervision_does_not_consume_a_room_it_does_not_need(dataset):
     """The thesis section needs neither room nor time."""
     from backend.Optimization.Algorithims.greedy import greedy_schedule
