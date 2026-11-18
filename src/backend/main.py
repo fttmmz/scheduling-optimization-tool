@@ -1,5 +1,8 @@
 # main.py
 import ctypes
+import os
+import sqlite3
+import tempfile
 import time
 import uuid
 import asyncio
@@ -8,7 +11,7 @@ from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional
 
-from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -37,6 +40,7 @@ from backend.Optimization.InstructorPreferences.preference_config import (
 from backend.database.db import supabase
 from backend.database.loader import get_scheduling_data, load_schedule, save_schedule
 from backend.fairness_report import build_fairness_report
+from backend.login_limit import release_attempt, reserve_attempt
 from backend.preference_report import build_preference_report, load_instructor_names
 from backend.preferences import (
     PreferenceIn,
@@ -543,17 +547,50 @@ app.add_middleware(
 )
 
 
+LOGIN_LIMIT_DB = os.environ.get(
+    "LOGIN_LIMIT_DB", os.path.join(tempfile.gettempdir(), "timetable-login-limit.sqlite3")
+)
+LOGIN_LIMIT_MESSAGE = "Too many login attempts. Try again in a few minutes."
+
+
 @app.post("/api/auth/login")
-async def login(request: LoginRequest):
+def login(request: LoginRequest, http_request: Request):
+    email = login_email(request.email)
+    client_ip = http_request.client.host if http_request.client else ""
+    try:
+        reservation, retry_after = reserve_attempt(LOGIN_LIMIT_DB, email, client_ip)
+    except sqlite3.Error:
+        raise HTTPException(status_code=503, detail="Login temporarily unavailable") from None
+    if retry_after is not None:
+        raise HTTPException(
+            status_code=429,
+            detail=LOGIN_LIMIT_MESSAGE,
+            headers={"Retry-After": str(retry_after)},
+        )
+
+    keep_attempt = False
     try:
         auth_response = supabase.auth.sign_in_with_password(
-            {"email": login_email(request.email), "password": request.password}
+            {"email": email, "password": request.password}
         )
-    except Exception:
-        raise HTTPException(status_code=401, detail="Invalid login or password")
-
-    if not auth_response.user:
-        raise HTTPException(status_code=401, detail="Invalid login or password")
+        if not auth_response.user:
+            keep_attempt = True
+            raise HTTPException(status_code=401, detail="Invalid login or password")
+    except HTTPException:
+        raise
+    except Exception as error:
+        code = getattr(error, "code", None)
+        status = getattr(error, "status", None)
+        if status == 429 or code == "over_request_rate_limit":
+            raise HTTPException(status_code=429, detail=LOGIN_LIMIT_MESSAGE) from None
+        keep_attempt = code == "invalid_credentials"
+        raise HTTPException(status_code=401, detail="Invalid login or password") from None
+    finally:
+        if not keep_attempt:
+            try:
+                release_attempt(LOGIN_LIMIT_DB, reservation)
+            except sqlite3.Error:
+                raise HTTPException(status_code=503, detail="Login temporarily unavailable") from None
 
     auth_id = str(auth_response.user.id)
     profile_res = (
