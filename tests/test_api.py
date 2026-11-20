@@ -185,6 +185,7 @@ def greedy_items(scheduling_data):
 def fake(monkeypatch, scheduling_data, greedy_items):
     db = FakeSupabase()
     monkeypatch.setattr(main, "supabase", db)
+    monkeypatch.setattr(main, "make_auth_client", lambda: db)
     monkeypatch.setattr(main, "load_scoring_data", lambda: scheduling_data)
     monkeypatch.setattr(main, "load_schedule", lambda schedule_id: list(greedy_items))
 
@@ -225,6 +226,19 @@ def _protected_routes():
 @pytest.mark.parametrize("method,path", _protected_routes())
 def test_every_protected_route_rejects_a_request_without_a_token(client, method, path):
     assert client.request(method, path).status_code == 401
+
+
+@pytest.mark.parametrize("method,path", [
+    ("POST", "/api/optimize"),
+    ("POST", "/api/schedules"),
+    ("PUT", "/api/schedules/20/publish"),
+    ("DELETE", "/api/courses/1"),
+    ("DELETE", "/api/instructors/1"),
+])
+def test_instructors_cannot_use_admin_actions(client, fake, method, path):
+    response = client.request(method, path, headers={"Authorization": "Bearer tok-inst"}, json={})
+    assert response.status_code == 403
+    assert not fake.writes
 
 
 @pytest.mark.parametrize("header", ["tok-admin", "Basic tok-admin", "Bearer ", "Bearer not-a-real-token"])

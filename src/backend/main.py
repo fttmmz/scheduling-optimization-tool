@@ -37,7 +37,7 @@ from backend.Optimization.InstructorPreferences.preference_config import (
     get_preference_calculator,
     load_all_preference_config,
 )
-from backend.database.db import supabase
+from backend.database.db import make_auth_client, supabase
 from backend.database.loader import get_scheduling_data, load_schedule, save_schedule
 from backend.fairness_report import build_fairness_report
 from backend.login_limit import release_attempt, reserve_attempt
@@ -247,9 +247,9 @@ def get_schedule_for_user(schedule_id: int, user_id: int):
     return res.data
 
 
-async def get_current_user_id(
+async def get_current_profile(
     authorization: Optional[str] = Header(default=None),
-) -> int:
+) -> Dict[str, Any]:
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(
             status_code=401,
@@ -259,7 +259,7 @@ async def get_current_user_id(
     token = authorization.removeprefix("Bearer ").strip()
 
     try:
-        user_response = supabase.auth.get_user(token)
+        user_response = make_auth_client().auth.get_user(token)
     except Exception as exc:
         raise HTTPException(status_code=401, detail="Invalid or expired token") from exc
 
@@ -269,7 +269,7 @@ async def get_current_user_id(
     auth_id = str(user_response.user.id)
     profile_res = (
         supabase.table("user")
-        .select("user_id")
+        .select("user_id, role")
         .eq("auth_id", auth_id)
         .maybe_single()
         .execute()
@@ -278,7 +278,17 @@ async def get_current_user_id(
     if not profile_res.data:
         raise HTTPException(status_code=404, detail="User profile not found")
 
-    return profile_res.data["user_id"]
+    return profile_res.data
+
+
+async def get_current_user_id(profile: Dict[str, Any] = Depends(get_current_profile)) -> int:
+    return profile["user_id"]
+
+
+async def get_current_admin_id(profile: Dict[str, Any] = Depends(get_current_profile)) -> int:
+    if profile["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+    return profile["user_id"]
 
 
 async def get_current_instructor(user_id: int = Depends(get_current_user_id)) -> Dict[str, Any]:
@@ -570,7 +580,7 @@ def login(request: LoginRequest, http_request: Request):
 
     keep_attempt = False
     try:
-        auth_response = supabase.auth.sign_in_with_password(
+        auth_response = make_auth_client().auth.sign_in_with_password(
             {"email": email, "password": request.password}
         )
         if not auth_response.user:
@@ -616,7 +626,7 @@ def login(request: LoginRequest, http_request: Request):
 @app.post("/api/auth/signup")
 async def signup(request: SignupRequest):
     try:
-        auth_response = supabase.auth.sign_up(
+        auth_response = make_auth_client().auth.sign_up(
             {"email": request.email, "password": request.password}
         )
     except Exception as exc:
@@ -669,7 +679,7 @@ async def refresh_token(request: RefreshRequest):
     logged in instead of being kicked out mid-run.
     """
     try:
-        auth_response = supabase.auth.refresh_session(request.refresh_token)
+        auth_response = make_auth_client().auth.refresh_session(request.refresh_token)
     except Exception:
         raise HTTPException(status_code=401, detail="Invalid or expired refresh token")
 
@@ -685,7 +695,7 @@ async def refresh_token(request: RefreshRequest):
 @app.post("/api/optimize")
 async def optimize(
     request: TimetableRequest,
-    user_id: int = Depends(get_current_user_id),
+    user_id: int = Depends(get_current_admin_id),
 ):
     """Synchronous optimize — fine for greedy and quick single-run genetic/hybrid."""
     result = run_optimization(
@@ -758,7 +768,7 @@ def _run_job(job_id: str, algorithm: str, num_runs: int, use_preferences: bool =
 async def optimize_async(
     request: TimetableRequest,
     background_tasks: BackgroundTasks,
-    user_id: int = Depends(get_current_user_id),
+    user_id: int = Depends(get_current_admin_id),
 ):
     """
     Async optimize — starts the job in a background thread and returns a job_id
@@ -809,7 +819,7 @@ async def get_job(job_id: str, user_id: int = Depends(get_current_user_id)):
 
 
 @app.post("/api/jobs/{job_id}/cancel")
-async def cancel_job(job_id: str, user_id: int = Depends(get_current_user_id)):
+async def cancel_job(job_id: str, user_id: int = Depends(get_current_admin_id)):
     """Stop a run. A queued one never starts; a running one is interrupted (see _interrupt_thread).
 
     The job reads "cancelled" straight away. Its worker is free again as soon as the algorithm
@@ -862,7 +872,7 @@ def evaluation_breakdown(evaluation: Dict[str, Any]) -> Dict[str, Any]:
 @app.post("/api/schedules")
 def create_schedule(
     request: ScheduleSaveRequest,
-    user_id: int = Depends(get_current_user_id),
+    user_id: int = Depends(get_current_admin_id),
 ):
     # fitness / conflicts / scheduled / unscheduled from the request are ignored:
     # after a hand edit they are the browser's guess, not a measurement. The
@@ -1048,7 +1058,7 @@ def _edited_items(schedule_id: int, user_id: int, edits: List[ScheduleEdit]) -> 
 
 # Plain `def`s: scoring takes a second or two and must not block the event loop.
 @app.post("/api/schedules/{schedule_id}/review")
-def review_schedule(schedule_id: int, request: ReviewRequest, user_id: int = Depends(get_current_user_id)):
+def review_schedule(schedule_id: int, request: ReviewRequest, user_id: int = Depends(get_current_admin_id)):
     """Score a saved schedule with unsaved hand edits applied, and list what is still wrong.
 
     Nothing is written: the Edit page calls this after every change so its numbers are the
@@ -1096,7 +1106,7 @@ def get_schedule_fairness(schedule_id: int, user_id: int = Depends(get_current_u
 
 
 @app.post("/api/schedules/{schedule_id}/placements")
-def schedule_placements(schedule_id: int, request: PlacementRequest, user_id: int = Depends(get_current_user_id)):
+def schedule_placements(schedule_id: int, request: PlacementRequest, user_id: int = Depends(get_current_admin_id)):
     """Every room and time where one class could go without a hard conflict, cheapest soft cost first.
 
     Checked against the schedule as edited so far (request.edits), with the class itself left out,
@@ -1121,7 +1131,7 @@ def schedule_placements(schedule_id: int, request: PlacementRequest, user_id: in
 
 
 @app.delete("/api/schedules/{schedule_id}")
-async def delete_schedule(schedule_id: int, user_id: int = Depends(get_current_user_id)):
+async def delete_schedule(schedule_id: int, user_id: int = Depends(get_current_admin_id)):
     get_schedule_for_user(schedule_id, user_id)
     supabase.table("schedule_detailes").delete().eq("schedule_id", schedule_id).execute()
     supabase.table("schedule").delete().eq("schedule_id", schedule_id).execute()
@@ -1136,7 +1146,7 @@ async def delete_schedule(schedule_id: int, user_id: int = Depends(get_current_u
 # first. Only the schedule's owner can publish or withdraw it; instructors own none.
 
 @app.put("/api/schedules/{schedule_id}/publish")
-def publish_schedule(schedule_id: int, user_id: int = Depends(get_current_user_id)):
+def publish_schedule(schedule_id: int, user_id: int = Depends(get_current_admin_id)):
     get_schedule_for_user(schedule_id, user_id)
     supabase.table("schedule").update({"is_published": False, "published_at": None}).eq("is_published", True).execute()
     res = (
@@ -1149,7 +1159,7 @@ def publish_schedule(schedule_id: int, user_id: int = Depends(get_current_user_i
 
 
 @app.delete("/api/schedules/{schedule_id}/publish")
-def unpublish_schedule(schedule_id: int, user_id: int = Depends(get_current_user_id)):
+def unpublish_schedule(schedule_id: int, user_id: int = Depends(get_current_admin_id)):
     get_schedule_for_user(schedule_id, user_id)
     supabase.table("schedule").update({"is_published": False, "published_at": None}).eq("schedule_id", schedule_id).execute()
     return {"schedule_id": schedule_id, "is_published": False}
@@ -1163,17 +1173,17 @@ async def list_courses(user_id: int = Depends(get_current_user_id)):
 
 
 @app.post("/api/courses")
-async def create_course(course: CourseIn, user_id: int = Depends(get_current_user_id)):
+async def create_course(course: CourseIn, user_id: int = Depends(get_current_admin_id)):
     return crud_insert("courses", course.model_dump())
 
 
 @app.put("/api/courses/{course_id}")
-async def update_course(course_id: int, course: CourseIn, user_id: int = Depends(get_current_user_id)):
+async def update_course(course_id: int, course: CourseIn, user_id: int = Depends(get_current_admin_id)):
     return crud_update("courses", "course_id", course_id, course.model_dump())
 
 
 @app.delete("/api/courses/{course_id}")
-async def delete_course(course_id: int, user_id: int = Depends(get_current_user_id)):
+async def delete_course(course_id: int, user_id: int = Depends(get_current_admin_id)):
     return crud_delete("courses", "course_id", course_id)
 
 
@@ -1185,17 +1195,17 @@ async def list_instructors(user_id: int = Depends(get_current_user_id)):
 
 
 @app.post("/api/instructors")
-async def create_instructor(instructor: InstructorIn, user_id: int = Depends(get_current_user_id)):
+async def create_instructor(instructor: InstructorIn, user_id: int = Depends(get_current_admin_id)):
     return crud_insert("instructor", instructor.model_dump())
 
 
 @app.put("/api/instructors/{inst_id}")
-async def update_instructor(inst_id: int, instructor: InstructorIn, user_id: int = Depends(get_current_user_id)):
+async def update_instructor(inst_id: int, instructor: InstructorIn, user_id: int = Depends(get_current_admin_id)):
     return crud_update("instructor", "inst_id", inst_id, instructor.model_dump())
 
 
 @app.delete("/api/instructors/{inst_id}")
-async def delete_instructor(inst_id: int, user_id: int = Depends(get_current_user_id)):
+async def delete_instructor(inst_id: int, user_id: int = Depends(get_current_admin_id)):
     return crud_delete("instructor", "inst_id", inst_id)
 
 
@@ -1271,17 +1281,17 @@ async def list_rooms(user_id: int = Depends(get_current_user_id)):
 
 
 @app.post("/api/rooms")
-async def create_room(room: RoomIn, user_id: int = Depends(get_current_user_id)):
+async def create_room(room: RoomIn, user_id: int = Depends(get_current_admin_id)):
     return crud_insert("room", room.model_dump())
 
 
 @app.put("/api/rooms/{room_id}")
-async def update_room(room_id: int, room: RoomIn, user_id: int = Depends(get_current_user_id)):
+async def update_room(room_id: int, room: RoomIn, user_id: int = Depends(get_current_admin_id)):
     return crud_update("room", "room_id", room_id, room.model_dump())
 
 
 @app.delete("/api/rooms/{room_id}")
-async def delete_room(room_id: int, user_id: int = Depends(get_current_user_id)):
+async def delete_room(room_id: int, user_id: int = Depends(get_current_admin_id)):
     return crud_delete("room", "room_id", room_id)
 
 
@@ -1293,17 +1303,17 @@ async def list_timeslots(user_id: int = Depends(get_current_user_id)):
 
 
 @app.post("/api/timeslots")
-async def create_timeslot(timeslot: TimeslotIn, user_id: int = Depends(get_current_user_id)):
+async def create_timeslot(timeslot: TimeslotIn, user_id: int = Depends(get_current_admin_id)):
     return crud_insert("timeslot", timeslot.model_dump())
 
 
 @app.put("/api/timeslots/{timeslot_id}")
-async def update_timeslot(timeslot_id: int, timeslot: TimeslotIn, user_id: int = Depends(get_current_user_id)):
+async def update_timeslot(timeslot_id: int, timeslot: TimeslotIn, user_id: int = Depends(get_current_admin_id)):
     return crud_update("timeslot", "timeslot_id", timeslot_id, timeslot.model_dump())
 
 
 @app.delete("/api/timeslots/{timeslot_id}")
-async def delete_timeslot(timeslot_id: int, user_id: int = Depends(get_current_user_id)):
+async def delete_timeslot(timeslot_id: int, user_id: int = Depends(get_current_admin_id)):
     return crud_delete("timeslot", "timeslot_id", timeslot_id)
 
 
@@ -1315,12 +1325,12 @@ async def list_prerequisites(user_id: int = Depends(get_current_user_id)):
 
 
 @app.post("/api/prerequisites")
-async def create_prerequisite(prereq: PrerequisiteIn, user_id: int = Depends(get_current_user_id)):
+async def create_prerequisite(prereq: PrerequisiteIn, user_id: int = Depends(get_current_admin_id)):
     return crud_insert("course_req", prereq.model_dump())
 
 
 @app.delete("/api/prerequisites/{course_id}/{req_course_id}")
-async def delete_prerequisite(course_id: int, req_course_id: int, user_id: int = Depends(get_current_user_id)):
+async def delete_prerequisite(course_id: int, req_course_id: int, user_id: int = Depends(get_current_admin_id)):
     res = (
         supabase.table("course_req")
         .delete()
@@ -1347,17 +1357,17 @@ async def list_departments(user_id: int = Depends(get_current_user_id)):
 
 
 @app.post("/api/departments")
-async def create_department(dept: DeptIn, user_id: int = Depends(get_current_user_id)):
+async def create_department(dept: DeptIn, user_id: int = Depends(get_current_admin_id)):
     return crud_insert("department", dept.model_dump())
 
 
 @app.put("/api/departments/{dept_id}")
-async def update_department(dept_id: int, dept: DeptIn, user_id: int = Depends(get_current_user_id)):
+async def update_department(dept_id: int, dept: DeptIn, user_id: int = Depends(get_current_admin_id)):
     return crud_update("department", "dept_id", dept_id, dept.model_dump())
 
 
 @app.delete("/api/departments/{dept_id}")
-async def delete_department(dept_id: int, user_id: int = Depends(get_current_user_id)):
+async def delete_department(dept_id: int, user_id: int = Depends(get_current_admin_id)):
     return crud_delete("department", "dept_id", dept_id)
 
 
