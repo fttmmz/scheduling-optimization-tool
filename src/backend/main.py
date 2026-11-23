@@ -36,6 +36,7 @@ from backend.Optimization.InstructorPreferences.preference_config import (
     PreferenceRunConfig,
     get_preference_calculator,
     load_all_preference_config,
+    preference_penalty,
 )
 from backend.database.db import make_auth_client, supabase
 from backend.database.loader import get_scheduling_data, load_schedule, save_schedule
@@ -91,6 +92,7 @@ def job_summary(job: Dict[str, Any]) -> Dict[str, Any]:
         summary["fitness"] = result.get("fitness")
         summary["conflicts"] = result.get("conflicts")
         summary["unscheduled"] = result.get("unscheduled")
+        summary["fitness_with_preferences"] = bool((result.get("preferences") or {}).get("included"))
     if job["status"] == "error":
         summary["error"] = job.get("error")
     return summary
@@ -181,6 +183,10 @@ class ScheduleSaveRequest(BaseModel):
     exec_time: Optional[float] = None
     scheduled: Optional[int] = None
     unscheduled: Optional[int] = None
+    # The run had instructor preferences ON (its preferences_applied), or the schedule
+    # being re-saved from the editor was scored with them. The saved fitness then
+    # includes the preference penalty, and schedule.evaluation.preferences says so.
+    preferences_applied: bool = False
 
 
 class CourseIn(BaseModel):
@@ -346,6 +352,22 @@ def load_preference_inputs():
         return None, None
 
 
+def saved_preference_config() -> Optional[PreferenceRunConfig]:
+    """Today's saved preferences as a scoring config, or None when none are saved or they can't be read.
+
+    Used to score a schedule whose run had preferences ON, so the number shown matches what
+    the run optimized. Same weight (1.0) as run_optimization() gives the engine.
+    """
+    try:
+        preferences = load_all_preference_config(supabase)
+    except Exception as exc:
+        print(f"[preferences] could not load saved preferences: {exc}")
+        return None
+    config = PreferenceRunConfig(requested=True, weight=1.0, by_instructor=preferences,
+                                 calculator=get_preference_calculator())
+    return config if config.active else None
+
+
 def run_optimization(algorithm: str, num_runs: int = 1, use_preferences: bool = False) -> Dict[str, Any]:
     scheduling_data = load_scoring_data()
     preferences, instructor_names = load_preference_inputs()
@@ -373,7 +395,11 @@ def run_optimization(algorithm: str, num_runs: int = 1, use_preferences: bool = 
     schedule_items, scheduled, unscheduled_count = engine.run(scheduling_data)
     exec_time = time.perf_counter() - t0
 
-    evaluation = evaluate_schedule(schedule_items, scheduling_data)
+    # A run that used preferences is scored with them, the same as it will be once saved.
+    evaluation = evaluate_schedule(
+        schedule_items, scheduling_data,
+        preference_config=preference_config if preference_config and preference_config.active else None,
+    )
     # The engine counts with the same count_scheduled_sections(); its figures are kept
     # so this response cannot drift from what the engine printed for the run.
     evaluation["scheduled"] = scheduled
@@ -416,7 +442,8 @@ def load_scoring_data() -> Dict[str, Any]:
     return scheduling_data
 
 
-def evaluate_schedule(schedule_items, scheduling_data: Dict[str, Any]) -> Dict[str, Any]:
+def evaluate_schedule(schedule_items, scheduling_data: Dict[str, Any],
+                      preference_config: Optional[PreferenceRunConfig] = None) -> Dict[str, Any]:
     """Every number the frontend shows about a schedule, measured by the backend's evaluator.
 
     The one place a schedule is scored, whether it was just generated, saved after
@@ -424,6 +451,11 @@ def evaluate_schedule(schedule_items, scheduling_data: Dict[str, Any]) -> Dict[s
     ScheduleItems (level, course_class, campus, enrolment, instructor_ids): items built
     from what a browser posts lack those and would be judged by the fallback rules,
     which is why a save is scored on the rows reloaded with load_schedule().
+
+    *preference_config* (active, from a run with preferences ON) adds the instructor
+    preference penalty to the soft tier of `fitness`, as the run's own fitness did.
+    `preferences` in the result says whether it was included, so the number is never
+    read as comparable to a schedule scored without them.
     """
     rooms = scheduling_data["rooms"]
     timeslots = scheduling_data["timeslots"]
@@ -474,7 +506,17 @@ def evaluate_schedule(schedule_items, scheduling_data: Dict[str, Any]) -> Dict[s
 
     fitness_score = calculate_fitness(
         schedule_items, rooms, sections=sections, timeslots=timeslots, valid_timeslot_cache=ts_cache,
+        preference_config=preference_config,
     )
+    if preference_config is not None and preference_config.active:
+        preference_note = {
+            "included": True,
+            "penalty": round(preference_penalty(schedule_items, timeslots, preference_config), 2),
+            # Measured against the preferences saved at this moment; they can change later.
+            "measured_at": datetime.now(timezone.utc).isoformat(),
+        }
+    else:
+        preference_note = {"included": False}
 
     # Same formula as SchedulingEngine.run().
     scheduled = count_scheduled_sections(schedule_items, sections)
@@ -497,6 +539,7 @@ def evaluate_schedule(schedule_items, scheduling_data: Dict[str, Any]) -> Dict[s
             "total": round(room_penalty + time_penalty, 3),
         },
         "fitness": fitness_score,
+        "preferences": preference_note,
         "total_sections": len(sections),
     }
 
@@ -864,6 +907,8 @@ def evaluation_breakdown(evaluation: Dict[str, Any]) -> Dict[str, Any]:
         "soft": detail.get("soft", {}),
         "soft_penalty": evaluation.get("soft_penalty"),
         "total_sections": evaluation.get("total_sections"),
+        # {"included": bool, ...}: whether fitness_score carries the preference penalty.
+        "preferences": evaluation.get("preferences") or {"included": False},
     }
 
 
@@ -916,8 +961,12 @@ def create_schedule(
     # read, so each item regains level, course_class, campus and enrolment from
     # the database. The numbers saved are then the numbers a later reload gives.
     schedule_id = result["schedule"]["schedule_id"]
+    # Preferences that can't be read (or none saved) score it without them; the
+    # stored `preferences.included: false` then says what the number means.
+    preference_config = saved_preference_config() if request.preferences_applied else None
     try:
-        evaluation = evaluate_schedule(cached_schedule_items(schedule_id), cached_scoring_data())
+        evaluation = evaluate_schedule(cached_schedule_items(schedule_id), cached_scoring_data(),
+                                       preference_config=preference_config)
         metrics = schedule_metrics_row(evaluation)
     except Exception as exc:
         # The rows are saved; only the measurement failed. Say so rather than
@@ -996,8 +1045,25 @@ def get_baseline_schedule(user_id: int = Depends(get_current_user_id)):
     return baseline()["row"]
 
 
+# The stored `schedule` row for the manual schedule holds numbers from an older evaluator
+# (and may hold none at all). Its numbers always come from baseline() instead, so the list,
+# the Dashboard and Compare agree with what opening the schedule shows.
+BASELINE_ROW_FIELDS = ("fitness_score", "conflicts_count", "Scheduled", "unscheduled", "evaluation", "exec_time")
+
+
+def with_current_baseline_numbers(rows: list) -> list:
+    if not any(row.get("schedule_id") == BASE_SCHEDULE_ID for row in rows):
+        return rows
+    fresh = baseline()["row"]
+    return [{**row, **{k: fresh.get(k) for k in BASELINE_ROW_FIELDS}, "baseline": True}
+            if row.get("schedule_id") == BASE_SCHEDULE_ID else row
+            for row in rows]
+
+
+# A plain `def`: when the manual schedule is in the list and not yet scored, baseline()
+# takes several seconds and must not block the event loop.
 @app.get("/api/schedules")
-async def list_schedules(user_id: int = Depends(get_current_user_id)):
+def list_schedules(user_id: int = Depends(get_current_user_id)):
     res = (
         supabase.table("schedule")
         .select("*")
@@ -1005,7 +1071,19 @@ async def list_schedules(user_id: int = Depends(get_current_user_id)):
         .order("created_at", desc=True)
         .execute()
     )
-    return res.data
+    return with_current_baseline_numbers(res.data or [])
+
+
+@app.on_event("startup")
+def warm_baseline() -> None:
+    """Score the manual schedule in the background, so the first list or Compare after a
+    restart doesn't wait for it. A failure here only means the first request scores it."""
+    def run():
+        try:
+            baseline()
+        except Exception as exc:  # noqa: BLE001 - logged, the request path retries
+            print(f"[baseline] warm-up failed: {exc}")
+    threading.Thread(target=run, name="baseline-warmup", daemon=True).start()
 
 
 @app.get("/api/schedules/{schedule_id}")
@@ -1049,6 +1127,15 @@ class PlacementRequest(ReviewRequest):
     idx: int = Field(..., ge=0)
 
 
+def scored_with_preferences(schedule_id: int) -> bool:
+    """True when the saved schedule's fitness includes instructor preferences (never the manual one)."""
+    if schedule_id == BASE_SCHEDULE_ID:
+        return False
+    res = supabase.table("schedule").select("evaluation").eq("schedule_id", schedule_id).maybe_single().execute()
+    evaluation = (res.data or {}).get("evaluation") if res else None
+    return bool(((evaluation or {}).get("preferences") or {}).get("included"))
+
+
 def _edited_items(schedule_id: int, user_id: int, edits: List[ScheduleEdit]) -> list:
     try:
         return apply_edits(readable_schedule_items(schedule_id, user_id), [e.model_dump() for e in edits])
@@ -1066,7 +1153,9 @@ def review_schedule(schedule_id: int, request: ReviewRequest, user_id: int = Dep
     """
     items = _edited_items(schedule_id, user_id, request.edits)
     data = cached_scoring_data()
-    evaluation = evaluate_schedule(items, data)
+    # Scored the way the saved schedule was, so a hand edit doesn't jump between the two scales.
+    preference_config = saved_preference_config() if scored_with_preferences(schedule_id) else None
+    evaluation = evaluate_schedule(items, data, preference_config=preference_config)
     return {
         "fitness": evaluation["fitness"],
         "conflicts": evaluation["conflicts"],
