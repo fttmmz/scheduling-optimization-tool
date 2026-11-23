@@ -104,7 +104,8 @@ class _Query:
 
 
 class _Auth:
-    TOKENS = {"tok-admin": "auth-admin", "tok-inst": "auth-inst", "tok-orphan": "auth-orphan"}
+    TOKENS = {"tok-admin": "auth-admin", "tok-admin2": "auth-admin2", "tok-inst": "auth-inst",
+              "tok-orphan": "auth-orphan"}
     PASSWORDS = {"admin@uni.test": "right-password"}
 
     def __init__(self, db):
@@ -142,6 +143,8 @@ class FakeSupabase:
             "user": [
                 {"user_id": 1, "auth_id": "auth-admin", "email": "admin@uni.test", "role": "admin"},
                 {"user_id": 2, "auth_id": "auth-inst", "email": "inst@uni.test", "role": "instructor"},
+                # A second admin: only admins run, list and cancel jobs, so "not your job" needs two.
+                {"user_id": 4, "auth_id": "auth-admin2", "email": "admin2@uni.test", "role": "admin"},
             ],
             "schedule": [
                 {"schedule_id": 10, "user_id": 3, "name": "Base Schedule", "alg_name": "base",
@@ -167,6 +170,7 @@ class FakeSupabase:
 
 ADMIN = {"Authorization": "Bearer tok-admin"}
 INSTRUCTOR = {"Authorization": "Bearer tok-inst"}
+OTHER_ADMIN = {"Authorization": "Bearer tok-admin2"}
 
 
 @pytest.fixture(scope="module")
@@ -221,6 +225,31 @@ def _protected_routes():
             concrete = re.sub(r"\{[^}]+\}", "1", path)
             out.append((method, concrete))
     return out
+
+
+def test_signing_in_never_happens_on_the_shared_data_client():
+    # supabase-py switches a client's Authorization header to whoever signs in on it.
+    # On the shared data client that would make every later query run as the last
+    # person who logged in (42501 on `user` when that role has no grants).
+    import inspect
+    from backend.database import db
+
+    first, second = db.make_auth_client(), db.make_auth_client()
+    assert first is not db.supabase and second is not db.supabase
+    assert first is not second, "each sign-in must get its own client"
+    source = inspect.getsource(main)
+    assert "supabase.auth." not in source, "sign-in calls must go through make_auth_client()"
+
+
+def test_a_sign_in_event_leaves_the_data_clients_header_alone():
+    from types import SimpleNamespace
+    from backend.database import db
+
+    before = db.supabase.options.headers.get("Authorization")
+    auth = db.make_auth_client()
+    auth._listen_to_auth_events("SIGNED_IN", SimpleNamespace(access_token="user-jwt"))
+    assert db.supabase.options.headers.get("Authorization") == before
+    assert auth.options.headers.get("Authorization") == "Bearer user-jwt"
 
 
 @pytest.mark.parametrize("method,path", _protected_routes())
@@ -481,7 +510,7 @@ def test_a_finished_job_can_be_read_again_after_a_refresh(client):
 
 def test_job_list_shows_only_the_callers_jobs_without_their_results(client):
     mine = client.post("/api/optimize/async", headers=ADMIN, json={"algorithm": "greedy", "num_runs": 2}).json()["job_id"]
-    theirs = client.post("/api/optimize/async", headers=INSTRUCTOR, json={"algorithm": "greedy"}).json()["job_id"]
+    theirs = client.post("/api/optimize/async", headers=OTHER_ADMIN, json={"algorithm": "greedy"}).json()["job_id"]
     _poll(client, mine)
     listed = client.get("/api/jobs", headers=ADMIN).json()
     assert [j["job_id"] for j in listed] == [mine]
@@ -579,7 +608,8 @@ def test_a_queued_job_can_be_cancelled_before_it_starts(client, monkeypatch):
 def test_only_the_owner_can_cancel_and_only_while_it_runs(client, monkeypatch):
     monkeypatch.setattr(main, "run_optimization", _slow_run(0.2))
     job_id = client.post("/api/optimize/async", headers=ADMIN, json={"algorithm": "ga"}).json()["job_id"]
-    assert client.post(f"/api/jobs/{job_id}/cancel", headers=INSTRUCTOR).status_code == 404
+    assert client.post(f"/api/jobs/{job_id}/cancel", headers=OTHER_ADMIN).status_code == 404
+    assert client.post(f"/api/jobs/{job_id}/cancel", headers=INSTRUCTOR).status_code == 403
     _poll(client, job_id)
     assert client.post(f"/api/jobs/{job_id}/cancel", headers=ADMIN).status_code == 409
     assert client.post("/api/jobs/nope/cancel", headers=ADMIN).status_code == 404
@@ -590,6 +620,24 @@ def test_only_the_owner_can_cancel_and_only_while_it_runs(client, monkeypatch):
 def test_list_shows_only_the_callers_own_schedules(client):
     ids = {row["schedule_id"] for row in client.get("/api/schedules", headers=ADMIN).json()}
     assert ids == {20}
+
+
+def test_the_listed_manual_schedule_carries_the_evaluators_numbers_not_the_stored_ones(client, fake):
+    # The real row for schedule 10 still holds numbers from an older evaluator.
+    fake.tables["user"].append({"user_id": 3, "auth_id": "auth-owner", "email": "owner@uni.test", "role": "admin"})
+    _Auth.TOKENS["tok-owner"] = "auth-owner"
+    try:
+        row10 = next(r for r in fake.tables["schedule"] if r["schedule_id"] == 10)
+        row10.update(fitness_score=0.5333, conflicts_count=4112, Scheduled=4698)
+        owner = {"Authorization": "Bearer tok-owner"}
+        listed = {r["schedule_id"]: r for r in client.get("/api/schedules", headers=owner).json()}[10]
+        fresh = client.get("/api/schedules/baseline", headers=owner).json()
+        for key in ("fitness_score", "conflicts_count", "Scheduled", "unscheduled"):
+            assert listed[key] == fresh[key]
+        assert listed["fitness_score"] != 0.5333 and listed["conflicts_count"] != 4112
+        assert listed["baseline"] is True
+    finally:
+        _Auth.TOKENS.pop("tok-owner", None)
 
 
 def test_reading_another_users_schedule_is_403_and_a_missing_one_404(client):
@@ -628,6 +676,48 @@ def test_save_ignores_the_browsers_metrics_and_stores_the_evaluators(client, fak
     assert "hard" in update["evaluation"] and "soft" in update["evaluation"]
     saved = [w for w in fake.writes if w[0] == "save_schedule"][0]
     assert saved[2]["user_id"] == 1 and saved[2]["exec_time"] == 4.2
+    assert update["evaluation"]["preferences"] == {"included": False}
+
+
+def _save(client, fake, rows, **extra):
+    r = client.post("/api/schedules", headers=ADMIN, json={"name": "t", "algorithm": "greedy", "schedule": rows, **extra})
+    assert r.status_code == 200 and r.json()["measured"] is True
+    return [w for w in fake.writes if w[0] == "update" and w[1] == "schedule"][-1][2]
+
+
+def test_a_run_with_preferences_on_is_saved_and_shown_with_them_and_says_so(client, fake):
+    # Avoids every teaching day: no timetable can meet it, so the penalty is never zero.
+    fake.tables["preference"] = [dict(SAVED_PREFERENCE, avoid_days=["M", "T", "W", "R"], days_priority="high")]
+    t = client.post("/api/optimize", headers=ADMIN,
+                    json={"algorithm": "greedy", "use_preferences": True}).json()["timetable"]
+    assert t["preferences"]["included"] is True and t["preferences"]["penalty"] > 0
+    off = _save(client, fake, t["schedule"])
+    on = _save(client, fake, t["schedule"], preferences_applied=True)
+    # (The fake load_schedule returns a fixed timetable, so the two saves are compared with
+    # each other, not with the run.)
+    assert on["evaluation"]["preferences"]["included"] is True
+    assert on["evaluation"]["preferences"]["penalty"] > 0 and on["evaluation"]["preferences"]["measured_at"]
+    assert on["fitness_score"] < off["fitness_score"]
+    assert off["evaluation"]["preferences"] == {"included": False}
+
+
+def test_preferences_on_with_none_saved_is_saved_without_them(client, fake):
+    rows = client.post("/api/optimize", headers=ADMIN, json={"algorithm": "greedy"}).json()["timetable"]["schedule"]
+    assert _save(client, fake, rows, preferences_applied=True)["evaluation"]["preferences"] == {"included": False}
+
+
+def test_review_scores_edits_on_the_same_scale_as_the_saved_schedule(client, fake):
+    fake.tables["preference"] = [dict(SAVED_PREFERENCE)]
+    plain = client.post("/api/schedules/20/review", headers=ADMIN, json={"edits": []}).json()
+    assert plain["evaluation"]["preferences"] == {"included": False}
+    row = next(r for r in fake.tables["schedule"] if r["schedule_id"] == 20)
+    row["evaluation"] = {"preferences": {"included": True}}
+    with_prefs = client.post("/api/schedules/20/review", headers=ADMIN, json={"edits": []}).json()
+    assert with_prefs["evaluation"]["preferences"]["included"] is True
+    assert with_prefs["fitness"] < plain["fitness"]
+    # The manual schedule never had preferences.
+    base = client.post("/api/schedules/10/review", headers=ADMIN, json={"edits": []}).json()
+    assert base["evaluation"]["preferences"] == {"included": False}
 
 
 # ── Problems and hand editing ─────────────────────────────────────────────────
@@ -689,7 +779,8 @@ def test_placements_never_suggest_a_taken_room_and_time(client):
 def test_editing_endpoints_respect_ownership_and_validate_indexes(client):
     for path in ("/api/schedules/21/review", "/api/schedules/21/placements"):
         assert client.post(path, headers=ADMIN, json={"idx": 0, "edits": []}).status_code == 403
-    assert client.post("/api/schedules/10/review", headers=INSTRUCTOR, json={"edits": []}).status_code == 200
+    assert client.post("/api/schedules/10/review", headers=ADMIN, json={"edits": []}).status_code == 200
+    assert client.post("/api/schedules/10/review", headers=INSTRUCTOR, json={"edits": []}).status_code == 403
     assert client.post("/api/schedules/20/placements", headers=ADMIN, json={"idx": 10**6}).status_code == 422
     bad = {"edits": [{"idx": 10**6, "room_id": 1, "timeslot_id": 1}]}
     assert client.post("/api/schedules/20/review", headers=ADMIN, json=bad).status_code == 422
@@ -717,14 +808,12 @@ ADMIN_WRITES = [
 ]
 
 
-@pytest.mark.xfail(strict=True, reason="KNOWN GAP: data-management endpoints never check the role")
 @pytest.mark.parametrize("method,path,body", ADMIN_WRITES)
 def test_an_instructor_cannot_change_university_data(client, method, path, body):
     r = client.request(method, path, headers=INSTRUCTOR, json=body)
     assert r.status_code == 403
 
 
-@pytest.mark.xfail(strict=True, reason="KNOWN GAP: an instructor can trigger optimisation runs")
 def test_an_instructor_cannot_start_an_optimisation_run(client):
     r = client.post("/api/optimize/async", headers=INSTRUCTOR, json={"algorithm": "greedy"})
     assert r.status_code == 403
