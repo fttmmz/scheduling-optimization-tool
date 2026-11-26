@@ -48,7 +48,7 @@ Key objectives include:
 * Schedule generation and evaluation
 * Comparison of different optimization algorithms
 * Preference-based scheduling
-* Student-oriented schedule generation
+
 
 ---
 
@@ -70,7 +70,7 @@ Key objectives include:
 The repository contains work developed across two academic project phases:
 
 * **Junior Project** — Administrative course registration and timetable optimization
-* **Senior Project** — Student and instructor preferences, personalized scheduling, and algorithm comparison
+* **Senior Project** —  Instructor preferences, personalized scheduling, and algorithm comparison
 
 ---
 
